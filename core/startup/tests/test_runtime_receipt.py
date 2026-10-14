@@ -4302,3 +4302,17 @@ def test_importing_sessions_keeps_receipt_modules_lazy_and_cycle_free(
         "read_current_session_runtime_receipt",
         "",
     ]
+
+
+def test_t38_existing_copilot_frontend_remains_gated(tmp_path: Path) -> None:
+    from core.startup.host import FrontendLaunchState, prepare_frontend
+
+    executable = tmp_path / "copilot"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+
+    result = prepare_frontend("copilot", search_path=str(tmp_path))
+
+    assert result.launch_state is FrontendLaunchState.GATED
+    assert result.provider_usable is None
+    assert result.session_claim is None

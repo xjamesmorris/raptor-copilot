@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# raptor - launch RAPTOR via Claude Code
+# raptor - launch RAPTOR via an explicitly selected interactive frontend
 #
 # Install: add this directory to PATH, or symlink to a directory already on PATH.
 #
@@ -241,36 +241,6 @@ if [ -z "${RAPTOR_NO_LAUNCHER_HARDENING:-}" ]; then
     unset _scrubbed _rest _last _entry _shown _drop_reason _perm
     unset _wsl_drops _wsl_first_line _wsl_host _wsl_checked _interop_root
 
-    # Warn (don't drop) when claude resolves under a world-writable
-    # ANCESTOR — the per-entry check above can't see parents.
-    _claude_path="$(command -v claude 2>/dev/null || true)"
-    if [ -n "$_claude_path" ]; then
-        _dir="$(_rp dirname "$_claude_path")"
-        _hops=0
-        while [ -n "$_dir" ] && [ "$_dir" != "/" ] && [ "$_hops" -lt 64 ]; do
-            _perm="$(_rp stat -Lc '%a' "$_dir" 2>/dev/null \
-                     || _rp stat -Lf '%Lp' "$_dir" 2>/dev/null \
-                     || echo '')"
-            if [ -n "$_perm" ] && [ "$(( 0$_perm & 2 ))" -ne 0 ]; then
-                # claude resolved through the scrubbed PATH but may
-                # still live in an attacker-writable tree — strip
-                # before echoing, same discipline as the entry lanes.
-                _shown_cp="${_claude_path//[![:print:]]/}"
-                _shown_dir="${_dir//[![:print:]]/}"
-                echo "raptor: WARNING: claude resolves under a world-writable tree: ${_shown_cp:0:200} (writable ancestor: ${_shown_dir:0:200})" >&2
-                unset _shown_cp _shown_dir
-                break
-            fi
-            # Parameter expansion, not dirname(1) — no external
-            # command per hop.
-            _dir="${_dir%/*}"
-            [ -n "$_dir" ] || _dir="/"
-            _hops=$((_hops + 1))
-        done
-        unset _dir _hops _perm
-    fi
-    unset _claude_path
-
     # Per-session TMPDIR: <base>/raptor-<uid>/session-<pid>-<rand>
     # (0700; <base> = RAPTOR_WORK_DIR, else operator TMPDIR, else
     # /tmp). Keeps tool scratch private and sweepable, and gives
@@ -416,6 +386,8 @@ Arguments:
 
 Options:
   -c, --continue     Resume last RAPTOR session
+  --frontend HOST    Interactive frontend: claude (default) or copilot
+                     (Copilot selection is recognized but launch is disabled)
   -m, --model MODEL  Choose model (opus, sonnet, haiku)
   -p, --project NAME Set the active project
   -v, --verbose      Verbose output
@@ -435,7 +407,7 @@ Projects:
   raptor project none                  Clear the active project
   raptor project help                  Full subcommand list
 
-Any additional flags are passed through to Claude Code.
+Any additional flags are passed through to the selected supported frontend.
 USAGE
     exit 0
 fi
@@ -460,7 +432,7 @@ fi
 export RAPTOR_CALLER_DIR="$_caller_dir"
 unset _caller_dir
 
-# Route project subcommands directly (no Claude needed). Export the
+# Route project subcommands directly (no interactive frontend needed). Export the
 # trust marker + RAPTOR_DIR like the doctor/frida routes do — pre-fix
 # this route exported NOTHING, so every bare-shell `raptor project
 # <sub>` tripped the libexec trust preamble and exited 2 (the
@@ -561,7 +533,46 @@ _raptor_local_route() {
     return 1
 }
 
-if [[ -n "${RAPTOR_NO_CLAUDE:-}" ]]; then
+export RAPTOR_DIR
+# Trust marker - libexec scripts refuse to run without one of
+# CLAUDECODE or _RAPTOR_TRUSTED. We've just stripped the env, so
+# direct invocation through this launcher is the safe path.
+export _RAPTOR_TRUSTED=1
+
+# Strip the frontend selector before applying the legacy local-route
+# fallback. This keeps local-capable commands working when Claude is
+# unavailable while ensuring an explicit Copilot selection reaches the
+# deny-before-effects gate instead of being mistaken for a Claude launch.
+FRONTEND="claude"
+_route_args=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --frontend)
+            [[ $# -ge 2 ]] || {
+                echo "raptor: $1 requires a value" >&2
+                exit 1
+            }
+            FRONTEND="$2"
+            shift 2
+            ;;
+        --frontend=*)
+            FRONTEND="${1#--frontend=}"
+            if [ -z "$FRONTEND" ]; then
+                echo "raptor: --frontend= requires a value" >&2
+                exit 1
+            fi
+            shift
+            ;;
+        *)
+            _route_args+=("$1")
+            shift
+            ;;
+    esac
+done
+set -- "${_route_args[@]}"
+unset _route_args
+
+if [[ "$FRONTEND" == "claude" && -n "${RAPTOR_NO_CLAUDE:-}" ]]; then
     # `|| true`: _raptor_local_route execs on a match (never returns); a
     # non-match returns 1, which under `set -e` would abort before the
     # guidance below — tolerate it so the error message prints.
@@ -574,24 +585,19 @@ if [[ -n "${RAPTOR_NO_CLAUDE:-}" ]]; then
     exit 1
 fi
 
-# Claude required for the interactive session.
-if ! command -v claude >/dev/null 2>&1; then
-    _raptor_local_route "$@" || true
-    echo "raptor: claude not found. Install Claude Code:" >&2
-    echo "  https://docs.anthropic.com/en/docs/claude-code/overview" >&2
-    exit 1
+# Preserve the login-free local fallback for the default/Claude frontend.
+# Other frontend selections are resolved by core.startup.host below.
+if [[ "$FRONTEND" == "claude" ]]; then
+    if ! command -v claude >/dev/null 2>&1; then
+        _raptor_local_route "$@" || true
+    fi
 fi
 
-# RAPTOR_CALLER_DIR was exported before the direct routes above.
-export RAPTOR_DIR
-# Trust marker - libexec scripts refuse to run without one of
-# CLAUDECODE or _RAPTOR_TRUSTED. We've just stripped the env, so
-# direct invocation through this launcher is the safe path.
-export _RAPTOR_TRUSTED=1
-
-# Parse RAPTOR-specific args, collect Claude args
+# Parse RAPTOR-specific args, collect frontend args. Selection is an
+# operator argument only — no RAPTOR_HOST/COPILOT_* environment value
+# participates in host authority.
 STARTUP_ARGS=("--caller-dir" "$RAPTOR_CALLER_DIR")
-CLAUDE_ARGS=("-n" "RAPTOR")
+FRONTEND_ARGS=("-n" "RAPTOR")
 INITIAL_PROMPT="/raptor"
 TARGET=""
 TRUST_REPO_ARG=""
@@ -615,17 +621,17 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -c|--continue)
-            CLAUDE_ARGS+=("--continue")
+            FRONTEND_ARGS+=("--continue")
             INITIAL_PROMPT=""
             shift
             ;;
         -m|--model)
             [[ $# -ge 2 ]] || { echo "raptor: $1 requires a value" >&2; exit 1; }
-            CLAUDE_ARGS+=("--model" "$2")
+            FRONTEND_ARGS+=("--model" "$2")
             shift 2
             ;;
         -v|--verbose)
-            CLAUDE_ARGS+=("--verbose")
+            FRONTEND_ARGS+=("--verbose")
             shift
             ;;
         --trust-repo)
@@ -639,7 +645,7 @@ while [[ $# -gt 0 ]]; do
             exec "$0" -h
             ;;
         -*)
-            CLAUDE_ARGS+=("$1")
+            FRONTEND_ARGS+=("$1")
             shift
             ;;
         *)
@@ -691,6 +697,69 @@ elif [ -d "$RAPTOR_CALLER_DIR" ]; then
     CHECK_TARGET="$RAPTOR_CALLER_DIR"
 fi
 unset _target_clean
+
+# Resolve and gate the selected frontend only after the complete launcher
+# hardening and dangerous-environment strip, but before target trust checks,
+# project activation, or session-registry mutation. The helper reports
+# installed presence separately from launch support; Copilot is deliberately
+# installed-but-gated until its live host contract is verified.
+# RAPTOR_FRONTEND_GATE_BEGIN
+set +e
+_frontend_out="$(
+    cd "$RAPTOR_DIR" \
+        && python3 -m core.startup.host "$FRONTEND"
+)"
+_frontend_rc=$?
+set -e
+if [ "$_frontend_rc" -ne 0 ]; then
+    exit "$_frontend_rc"
+fi
+FRONTEND_EXECUTABLE=""
+_host_claim=""
+while IFS== read -r _key _value; do
+    case "$_key" in
+        launch_executable) FRONTEND_EXECUTABLE="$_value" ;;
+        host|host_*) printf -v _host_claim '%s%s=%s\n' \
+            "$_host_claim" "$_key" "$_value" ;;
+    esac
+done <<< "$_frontend_out"
+unset _frontend_out _frontend_rc _key _value
+if [ -z "$FRONTEND_EXECUTABLE" ]; then
+    echo "raptor: frontend preparation returned no executable" >&2
+    exit 1
+fi
+# The only launch-enabled frontend is Claude. Even a malformed helper response
+# must not fall through into Claude argv/prompt preparation.
+if [ "$FRONTEND" != "claude" ]; then
+    echo "raptor: frontend '$FRONTEND' is not launch-enabled" >&2
+    exit 78
+fi
+# RAPTOR_FRONTEND_GATE_END
+
+# Warn (don't drop) when the selected executable resolves under a
+# world-writable ANCESTOR — the per-PATH-entry check above can't see
+# parents.
+if [ -z "${RAPTOR_NO_LAUNCHER_HARDENING:-}" ]; then
+    _frontend_path="$FRONTEND_EXECUTABLE"
+    _dir="$(_rp dirname "$_frontend_path")"
+    _hops=0
+    while [ -n "$_dir" ] && [ "$_dir" != "/" ] && [ "$_hops" -lt 64 ]; do
+        _perm="$(_rp stat -Lc '%a' "$_dir" 2>/dev/null \
+                 || _rp stat -Lf '%Lp' "$_dir" 2>/dev/null \
+                 || echo '')"
+        if [ -n "$_perm" ] && [ "$(( 0$_perm & 2 ))" -ne 0 ]; then
+            _shown_fp="${_frontend_path//[![:print:]]/}"
+            _shown_dir="${_dir//[![:print:]]/}"
+            echo "raptor: WARNING: $FRONTEND resolves under a world-writable tree: ${_shown_fp:0:200} (writable ancestor: ${_shown_dir:0:200})" >&2
+            unset _shown_fp _shown_dir
+            break
+        fi
+        _dir="${_dir%/*}"
+        [ -n "$_dir" ] || _dir="/"
+        _hops=$((_hops + 1))
+    done
+    unset _frontend_path _dir _hops _perm
+fi
 
 # Clear the screen BEFORE the pre-flight checks so their stderr
 # (trust warnings, project-mismatch prompts) stays visible instead
@@ -771,9 +840,9 @@ fi
 
 # Session registry (AUTHORITATIVE v2): sessions.d/<pid>
 # carries this session's project binding, identity-stamped so a
-# recycled pid (even another claude) can never inherit it, and
+# recycled pid (even another supported host) can never inherit it, and
 # token-carrying so the env credential is unforgeable. $$ survives the
-# exec into claude; starttime is fork-time and survives too. The seed
+# exec into the frontend; starttime is fork-time and survives too. The seed
 # is MANDATORY — 'project=-' when nothing resolved — so an
 # empty-bookmark launch is insulated from later bookmark moves.
 # Format/keys shared with core/project/sessions.py (ENTRY_KEYS).
@@ -801,7 +870,7 @@ if _rp mkdir -p -m 700 "$_sessions_dir" 2>/dev/null; then
     # python reader's rules).
     _starttime="0"
     if [ -r "/proc/$$/stat" ]; then
-        _starttime="$(_rp awk '{match($0, /\) /); print substr($0, RSTART+2)}' "/proc/$$/stat" 2>/dev/null | _rp awk '{print $20}')"
+        _starttime="$(_rp awk '{match($0, /\) /); print substr($0, RSTART+2)}' "/proc/$$/stat" 2>/dev/null | _rp awk '{print $20}' || true)"
         [ -n "$_starttime" ] || _starttime="0"
     fi
     _bootid="none-$(uname -s 2>/dev/null | _rp tr 'A-Z' 'a-z' || echo unknown)"
@@ -818,48 +887,62 @@ if _rp mkdir -p -m 700 "$_sessions_dir" 2>/dev/null; then
     if [ -z "$RAPTOR_SESSION_TOKEN" ] && [ -r /dev/urandom ]; then
         RAPTOR_SESSION_TOKEN="$(_rp od -An -N16 -tx1 /dev/urandom 2>/dev/null | _rp tr -d ' \n')"
     fi
-
-    # Unconditional stale-state delete for $$ FIRST (a recycled pid
-    # must never expose a predecessor's binding or ledger). Under the
-    # per-pid ledger flock when flock(1) exists — a predecessor's
-    # straggling finisher may be mid-RMW; without the lock this rm
-    # raced it (python writers hold the same lock).
-    if command -v flock >/dev/null 2>&1; then
-        # exit 1 on flock timeout so the || fallback DELETES anyway:
-        # inheriting a predecessor's ledger (records + pin witnesses)
-        # is strictly worse than the unlocked-delete race the lock
-        # narrows. The lock file itself is removed only on the locked
-        # path (unlinking it under a live holder splits the lock for
-        # other bash writers; python verifies-after-lock).
-        (
-            flock -w 2 9 || exit 1
-            rm -f -- "$_sessions_dir/$$" "$_sessions_dir/$$.run" 2>/dev/null || true
-            rm -f -- "$_sessions_dir/$$.run.lock" 2>/dev/null || true
-        ) 9>"$_sessions_dir/$$.run.lock" 2>/dev/null ||             rm -f -- "$_sessions_dir/$$" "$_sessions_dir/$$.run" 2>/dev/null || true
-    else
-        rm -f -- "$_sessions_dir/$$" "$_sessions_dir/$$.run" "$_sessions_dir/$$.run.lock" 2>/dev/null || true
+    # Without a token, retain the legacy Claude-shaped record.
+    if [ -z "$RAPTOR_SESSION_TOKEN" ]; then
+        _host_claim=""
     fi
 
-    # Prune + awareness pass. Prune predicate: only
-    # same-boot, same-pidns entries with a positively dead pid are
-    # removed; stamped-mismatch pruning is left to the python readers
-    # (richer checks), foreign entries are never touched.
+    _old_receipt_sidecar=""
+    if [ -f "$_sessions_dir/$$" ]; then
+        _old_hostv="$(_rp awk -F= '$1=="host_v"{print substr($0,index($0,"=")+1); exit}' "$_sessions_dir/$$" 2>/dev/null || true)"
+        _old_receipt_sha="$(_rp awk -F= '$1=="host_receipt_sha256"{print substr($0,index($0,"=")+1); exit}' "$_sessions_dir/$$" 2>/dev/null || true)"
+        if [ "$_old_hostv" = "2" ] && [ "${#_old_receipt_sha}" -eq 64 ]; then
+            case "$_old_receipt_sha" in
+                *[!0-9a-f]*) ;;
+                *) _old_receipt_sidecar="$_sessions_dir/$$.receipt.$_old_receipt_sha.json" ;;
+            esac
+        fi
+    fi
+    if command -v flock >/dev/null 2>&1; then
+        (
+            flock -w 2 9 || exit 1
+            rm -f -- "$_sessions_dir/$$" 2>/dev/null || true
+            [ -z "$_old_receipt_sidecar" ] || rm -f -- "$_old_receipt_sidecar" 2>/dev/null || true
+            rm -f -- "$_sessions_dir/$$.run" "$_sessions_dir/$$.run.lock" 2>/dev/null || true
+        ) 9>"$_sessions_dir/$$.run.lock" 2>/dev/null || {
+            rm -f -- "$_sessions_dir/$$" 2>/dev/null || true
+            [ -z "$_old_receipt_sidecar" ] || rm -f -- "$_old_receipt_sidecar" 2>/dev/null || true
+            rm -f -- "$_sessions_dir/$$.run" 2>/dev/null || true
+        }
+    else
+        rm -f -- "$_sessions_dir/$$" 2>/dev/null || true
+        [ -z "$_old_receipt_sidecar" ] || rm -f -- "$_old_receipt_sidecar" 2>/dev/null || true
+        rm -f -- "$_sessions_dir/$$.run" "$_sessions_dir/$$.run.lock" 2>/dev/null || true
+    fi
+
     for _f in "$_sessions_dir"/*; do
         [ -f "$_f" ] || continue
         _fpid="${_f##*/}"
         case "$_fpid" in
             ''|*[!0-9]*) continue ;;  # not a pid-named entry — not ours
         esac
-        # One builtin read-loop per entry (first-key-wins, matching
-        # the python parser) — the sed|head pipelines spawned 4-6
-        # processes per entry, ~12ms each, paid on EVERY launch.
-        _fboot=""; _fns=""; _fproj=""; _fsince=""
+        _fboot=""; _fns=""; _fproj=""; _fsince=""; _fstart=""
+        _fhostv=""; _fhost=""; _fuid=""; _fexe=""; _fdev=""; _fino=""
+        _freceipt=""; _fhvseen=0; _frseen=0
         while IFS== read -r _k _v; do
             case "$_k" in
                 boot_id) [ -n "$_fboot" ] || _fboot="$_v" ;;
                 pidns)   [ -n "$_fns" ] || _fns="$_v" ;;
                 project) [ -n "$_fproj" ] || _fproj="$_v" ;;
                 since)   [ -n "$_fsince" ] || _fsince="$_v" ;;
+                starttime) [ -n "$_fstart" ] || _fstart="$_v" ;;
+                host_v) if [ "$_fhvseen" -eq 0 ]; then _fhostv="$_v"; _fhvseen=1; fi ;;
+                host) [ -n "$_fhost" ] || _fhost="$_v" ;;
+                host_uid) [ -n "$_fuid" ] || _fuid="$_v" ;;
+                host_exe) [ -n "$_fexe" ] || _fexe="$_v" ;;
+                host_exe_dev) [ -n "$_fdev" ] || _fdev="$_v" ;;
+                host_exe_ino) [ -n "$_fino" ] || _fino="$_v" ;;
+                host_receipt_sha256) if [ "$_frseen" -eq 0 ]; then _freceipt="$_v"; _frseen=1; fi ;;
             esac
         done < "$_f" 2>/dev/null || true
         if [ -n "$_fboot" ] && [ "$_fboot" != "$_bootid" ]; then
@@ -868,28 +951,73 @@ if _rp mkdir -p -m 700 "$_sessions_dir" 2>/dev/null; then
         if [ -n "$_fns" ] && [ -n "$_pidns" ] && [ "$_fns" != "$_pidns" ]; then
             continue  # foreign pid namespace — never prune here
         fi
+        _fsidecar=""
+        if [ "$_fhostv" = "2" ] && [ "${#_freceipt}" -eq 64 ]; then
+            case "$_freceipt" in *[!0-9a-f]*) ;; *) _fsidecar="$_sessions_dir/$_fpid.receipt.$_freceipt.json" ;; esac
+        fi
         if ! kill -0 "$_fpid" 2>/dev/null; then
-            rm -f -- "$_f" "$_sessions_dir/$_fpid.run" "$_sessions_dir/$_fpid.run.lock"
+            rm -f -- "$_f"
+            [ -z "$_fsidecar" ] || rm -f -- "$_fsidecar"
+            rm -f -- "$_sessions_dir/$_fpid.run" "$_sessions_dir/$_fpid.run.lock"
             continue
+        fi
+        [ "$_fhostv" = "2" ] && continue
+        if [ -n "$_fhostv$_fhost$_fuid$_fexe$_fdev$_fino" ]; then
+            _fclaim_ok=1
+            case "$_fhostv" in 1) ;; *) _fclaim_ok=0 ;; esac
+            case "$_fhost" in claude|copilot) ;; *) _fclaim_ok=0 ;; esac
+            case "$_fuid" in ''|*[!0-9]*) _fclaim_ok=0 ;; esac
+            case "$_fdev" in ''|*[!0-9]*) _fclaim_ok=0 ;; esac
+            case "$_fino" in ''|*[!0-9]*) _fclaim_ok=0 ;; esac
+            case "$_fstart" in ''|*[!0-9]*) _fclaim_ok=0 ;; esac
+            case "$_fexe" in /*) ;; *) _fclaim_ok=0 ;; esac
+            case "$_fexe" in *[[:cntrl:]]*) _fclaim_ok=0 ;; esac
+            if [ "$_fclaim_ok" -ne 1 ]; then
+                echo "raptor: WARNING: ignoring malformed host claim for session pid $_fpid" >&2
+                continue
+            fi
+            _flive_start=""
+            if [ -r "/proc/$_fpid/stat" ]; then
+                _flive_start="$(_rp awk '{match($0, /\) /); print substr($0, RSTART+2)}' "/proc/$_fpid/stat" 2>/dev/null | _rp awk '{print $20}' || true)"
+            fi
+            _flive_uid="$(_rp stat -Lc %u "/proc/$_fpid" 2>/dev/null || true)"
+            _flive_identity="$(_rp stat -Lc '%d %i' "/proc/$_fpid/exe" 2>/dev/null || true)"
+            _flive_dev="${_flive_identity%% *}"
+            _flive_ino="${_flive_identity#* }"
+            _fcomm=""
+            if [ -r "/proc/$_fpid/comm" ]; then
+                read -r _fcomm < "/proc/$_fpid/comm" || _fcomm=""
+            fi
+            case "$_fhost:$_fcomm" in
+                claude:claude|claude:claude-*|copilot:copilot|copilot:copilot-*) ;;
+                *) _fclaim_ok=0 ;;
+            esac
+            if [ "$_flive_start" != "$_fstart" ] \
+                    || [ "$_flive_uid" != "$_fuid" ] \
+                    || [ "$_flive_dev" != "$_fdev" ] \
+                    || [ "$_flive_ino" != "$_fino" ]; then
+                _fclaim_ok=0
+            fi
+            unset _flive_start _flive_uid _flive_identity \
+                _flive_dev _flive_ino _fcomm
+            [ "$_fclaim_ok" -eq 1 ] || continue
+            unset _fclaim_ok
         fi
         if [ "$_fpid" != "$$" ] && [ "$_seed_proj" != "-" ]; then
             if [ "$_fproj" = "$_seed_proj" ]; then
-                # Entry fields are file content: strip non-printables
-                # and bound length (builtins) before echoing.
                 _fsince="${_fsince//[![:print:]]/}"
                 _fsince="${_fsince:0:64}"
                 echo "raptor: project $_seed_proj is also active in session pid $_fpid (since ${_fsince:-unknown})" >&2
             fi
         fi
     done
-
-    # MANDATORY seed, atomic (tmp+rename): v2 entry keyed to $$.
     _tmp_entry="$_sessions_dir/.$$.tmp.$$"
     if {
         printf 'v=2\nproject=%s\nsince=%s\nstarttime=%s\nboot_id=%s\n' \
             "$_seed_proj" "$(date -u +%Y-%m-%dT%H:%M:%S+00:00)" \
             "$_starttime" "$_bootid"
         [ -n "$_pidns" ] && printf 'pidns=%s\n' "$_pidns"
+        [ -n "$_host_claim" ] && printf '%s' "$_host_claim"
         [ -n "$RAPTOR_SESSION_TOKEN" ] && printf 'token=%s\n' "$RAPTOR_SESSION_TOKEN"
         printf 'seeded_by=%s\n' "$_seed_by"
     } > "$_tmp_entry" 2>/dev/null && mv -f "$_tmp_entry" "$_sessions_dir/$$" 2>/dev/null; then
@@ -901,7 +1029,10 @@ if _rp mkdir -p -m 700 "$_sessions_dir" 2>/dev/null; then
         fi
         RAPTOR_SESSION_TOKEN=""
     fi
-    unset _f _fpid _fproj _fsince _fboot _fns _tmp_entry _starttime _bootid _pidns
+    unset _f _fpid _fproj _fsince _fboot _fns _fstart _fsidecar \
+        _fhostv _fhost _fuid _fexe _fdev _fino _fclaim_ok _freceipt \
+        _fhvseen _frseen _old_hostv _old_receipt_sha _old_receipt_sidecar \
+        _tmp_entry _starttime _bootid _pidns
 else
     echo "raptor: WARNING: could not create $_sessions_dir — no session binding recorded; this session follows the machine-wide default" >&2
 fi
@@ -913,9 +1044,10 @@ if [ -n "$RAPTOR_SESSION_TOKEN" ]; then
 else
     unset RAPTOR_SESSION_TOKEN
 fi
-unset _sessions_dir _startup_out _seed_proj _seed_by
+unset _sessions_dir _startup_out _seed_proj _seed_by _host_claim
 
-# Load coverage tracking plugin if available
+# Load the Claude coverage plugin if available. Copilot remains gated above;
+# its candidate event profile is offline and effect-disabled.
 PLUGIN_ARGS=()
 if [ -d "$RAPTOR_DIR/plugins/coverage" ]; then
     PLUGIN_ARGS+=(--plugin-dir "$RAPTOR_DIR/plugins/coverage")
@@ -936,10 +1068,14 @@ if [[ -n "${ANTHROPIC_MODEL:-}" && -z "${CLAUDE_CODE_SUBAGENT_MODEL:-}" ]]; then
     export CLAUDE_CODE_SUBAGENT_MODEL="$ANTHROPIC_MODEL"
 fi
 
+# RAPTOR_FRONTEND_EXEC_BEGIN
 if [[ -n "$INITIAL_PROMPT" ]]; then
     exec env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS \
-        claude "${PLUGIN_ARGS[@]}" "${CLAUDE_ARGS[@]}" "$INITIAL_PROMPT"
+        "$FRONTEND_EXECUTABLE" "${PLUGIN_ARGS[@]}" \
+        "${FRONTEND_ARGS[@]}" "$INITIAL_PROMPT"
 else
     exec env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS \
-        claude "${PLUGIN_ARGS[@]}" "${CLAUDE_ARGS[@]}"
+        "$FRONTEND_EXECUTABLE" "${PLUGIN_ARGS[@]}" \
+        "${FRONTEND_ARGS[@]}"
 fi
+# RAPTOR_FRONTEND_EXEC_END
