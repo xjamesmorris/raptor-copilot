@@ -1,0 +1,76 @@
+{
+  "profile_digest_basis": {
+    "live_evidence_id": null,
+    "live_evidence_sha256": null,
+    "lookup_key": {
+      "api_schema_sha256": "5835517c600d1661bb857aa74deeb2abd2cfb9ed1e69cdedd1402181ea9eca98",
+      "architecture": "x86_64",
+      "artifacts": [
+        {
+          "name": ".extraction-complete",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "name": "app.js",
+          "sha256": "7f2ebb0a5d308f74112029a67c76bce6d3b5280c4d2cdf195c617d94ac8788b1"
+        },
+        {
+          "name": "changelog.json",
+          "sha256": "1efc1db79661defa3d5ba3f3ca590a8c660bde9b4ad2daad5255b678fef234df"
+        },
+        {
+          "name": "index.js",
+          "sha256": "0631d4526d1492320478fc609d9fc1d06b0fcb0d4d6df2377c6a6b8dc2448c7e"
+        },
+        {
+          "name": "npm-loader.js",
+          "sha256": "0ea824a86be5757533fdb092eff7050871bd7a711a46babde0ffe0e44ac5ad88"
+        },
+        {
+          "name": "prebuilds/linux-x64/cli-native.node",
+          "sha256": "c6fabd15761ae556cf5fd5a4ef45bbfc8cf574967f6c8540eab216238f79c04a"
+        },
+        {
+          "name": "prebuilds/linux-x64/runtime.node",
+          "sha256": "db6e691277b20c0b54fca483021c543f8db78d6764505e14837d0a4967269891"
+        },
+        {
+          "name": "schemas/api.schema.json",
+          "sha256": "5835517c600d1661bb857aa74deeb2abd2cfb9ed1e69cdedd1402181ea9eca98"
+        },
+        {
+          "name": "schemas/session-events.schema.json",
+          "sha256": "fded8ae9faa212cc84adae273c8b107a450b90ab66a723ee03e9057d41f8e4c5"
+        },
+        {
+          "name": "sdk/index.js",
+          "sha256": "746688b8c406f8cd4f0bebbcf6ca167b33c3a3e2be5094de430378a5220a8341"
+        },
+        {
+          "name": "sea-loader.js",
+          "sha256": "992e4936d12004d2cc5285ce6b1e0115adaf37c976185e3aa9580fbdf24aaa0e"
+        }
+      ],
+      "cli_grammar_sha256": "98a0941afe15b03d3ed6397f1c30c77597fee46045902871710a6e6f47142b10",
+      "cli_version": "1.0.84-5",
+      "distribution_manifest_sha256": "13991c84e49bbf6da4cf095bf5f0c8d8c1fca95c7a732946dedf8e396a3fd400",
+      "distribution_source": "sealed_cache_snapshot",
+      "elf_class": "ELF64",
+      "elf_interpreter_sha256": "f0949392f14253241540dfeb152f5bd3cbd75f8a3e4f8d3fabc286a2daa27a68",
+      "frontend": "copilot",
+      "frontend_executable_sha256": "7ca6ac516ce309e49e1003331caeed0df1551b0f3db74cc4ba90738e5eebeb3b",
+      "help_contract_manifest_sha256": "a91b6df6cd711d1dfd03be95ad02738799df21ffe05417a8981be30408d5f375",
+      "launcher_sha256": "66656f5cdcbb50885b928e579e744460af00b3744367ad431d6220d5729b49e4",
+      "package_manifest_sha256": "fbc68130592ac9a1697e609c976ddf6962ae966d5721abbcdca5eed86c3b179c",
+      "platform_system": "linux",
+      "profile_id": "copilot-cli-1.0.84-5-linux-x86_64-static-candidate-v1",
+      "session_events_schema_sha256": "fded8ae9faa212cc84adae273c8b107a450b90ab66a723ee03e9057d41f8e4c5"
+    },
+    "profile_id": "copilot-cli-1.0.84-5-linux-x86_64-static-candidate-v1",
+    "profile_schema_version": 1,
+    "status": "static_candidate_not_authorized"
+  },
+  "profile_sha256": "43bdfd1726e846d7903005c84a06f66672239c92a13fdbfd56b22c71f78c84f0",
+  "schema": "raptor.runtime_receipt_profile/v1",
+  "schema_version": 1
+}
