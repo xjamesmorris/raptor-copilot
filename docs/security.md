@@ -197,6 +197,19 @@ Operators should know the honest residuals and compensate accordingly:
   and CPU time, but a crafted input maximising LLM token consumption is
   a slow denial-of-service against API budget, not a security bypass.
   Budget caps are the mitigation.
+- **Same-UID receipt-state tampering.** Receipt-backed session entries and
+  immutable content-addressed sidecars are owner-only and validated with
+  no-follow, single-link, exact-byte checks, but they do not defend against
+  a process already running as the same OS user. They are deny-only evidence:
+  pending, rejected, malformed, and statically verified records remain
+  projectless and never create a session owner. A run marker carrying either
+  reserved receipt key is an authoritative negative pin only: injected
+  `project`/`project_source` values are ignored, project writes are disabled,
+  containment fallback is blocked, and child bootstrap installs projectless
+  state without treating the marker as a ledger witness. Credential-less
+  coverage skips these markers during discovery and checks again through the
+  already-open run-directory fd before append. A matching or even exact
+  receipt is never a substitute for `SessionOwner`.
 
 ---
 

@@ -266,6 +266,40 @@ The coverage plugin (`plugins/coverage/`) records which source files the LLM
 reads during analysis via a `PostToolUse` hook.  It runs automatically when a
 run is active and has no run-side effect otherwise (the async hook
 still fires per Read and exits early when no run is active).
+The hook is a thin Claude-profile shim over the shared Python ingestion path in
+`core.coverage.track_read`; the unregistered Copilot hook profile is
+parse-only and cannot write coverage. A credentialed hook resolves the
+current verified Claude session owner and writes only when exactly one owned
+running run is eligible. Multiple concurrent runs are deliberately ambiguous
+and receive no attribution. The pre-series `.active` lookup remains only when
+both session credential variables are absent.
+
+For this coverage policy, an **absent** run `target_path` means unfiltered
+attribution (needed by targetless commands such as `cve-diff`/`cve-env`). Once
+the field is **present**, it must be a non-empty printable absolute path whose
+real path is an existing directory other than the filesystem root `/`;
+empty, relative, unresolvable, root, or control-containing values produce no
+attribution. Root refusal is an explicit restriction of this coverage policy,
+not a claim that every other RAPTOR target gate makes `/` unreachable. The
+same path validation uses Python's stricter `str.isprintable()` policy, so
+some Unicode separator/format characters are rejected in addition to
+NUL/CR/LF.
+
+Successful read attribution is silent. A credentialed session with no running
+run is also an ordinary idle state and is silent. Expected refusals emit one
+fixed, payload-free diagnostic. The hook's exit status remains 0 for all of
+these paths; exit 0 is the hook protocol, **not** proof that a read was
+recorded. The manifest is opened with `O_CREAT` before the final post-open
+status/owner recheck, so a run that changes state in that narrow window can
+retain an empty `.reads-manifest`, but never the refused path line.
+
+The hook's 1 MiB budget applies to the **whole hook payload**, including
+`tool_response` file content, not only `tool_input.file_path`. A very large
+successful Read can therefore lose coverage evidence when its event exceeds
+the budget. The `MAX+1` read is a byte bound, not a time or EOF guarantee: a
+producer that keeps stdin open can still block the waited hook child. A cold
+Python cache may create operator-owned `__pycache__/*.pyc` files in the RAPTOR
+repository before producing the same manifest effect.
 
 Coverage produces per-tool records (`coverage-read.json` for LLM reads,
 `coverage-<tool>.json` for scanners) in the run directory -- a manifest of
@@ -280,6 +314,12 @@ libexec/raptor-coverage-summary --gaps   # unreviewed functions
 
 Coverage is per-run.  Project-level coverage merges across all runs, so
 running `/scan` then `/codeql` on the same project gives a combined view.
+Read arguments retain their host-native key names; tool-name aliases do not
+rewrite arguments. Manifest writes are relative to an opened, owner-checked
+run directory and refuse symlinks, FIFOs, devices, hard links, and
+foreign-owned files. Duplicate read lines collapse when the coverage record
+is built. A whole-file `read` remains shallow evidence that a file was opened,
+not proof that any function was reviewed.
 
 
 ## Annotations
