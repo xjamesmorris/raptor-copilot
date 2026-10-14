@@ -1540,10 +1540,16 @@ def test_package_has_no_forbidden_runtime_imports_or_frozen_wiring() -> None:
                 imported.update(alias.name for alias in node.names)
             elif isinstance(node, ast.ImportFrom) and node.module is not None:
                 imported.add(node.module)
+        allowed = (
+            {"core.project.sessions", "core.startup.host"}
+            if path.name == "launch.py"
+            else set()
+        )
         assert not any(
             name == forbidden or name.startswith(forbidden + ".")
             for name in imported
             for forbidden in forbidden_imports
+            if forbidden not in allowed
         )
 
     repository_root = Path(__file__).parents[3]
@@ -1552,11 +1558,29 @@ def test_package_has_no_forbidden_runtime_imports_or_frozen_wiring() -> None:
         "core/coverage/track_read.py",
         "core/run/metadata.py",
         "core/run/pin.py",
+        "core/startup/host.py",
         "libexec/raptor-lifecycle-hook",
     ):
         assert "runtime_receipt" not in (repository_root / relative).read_text(
             encoding="utf-8"
         )
+    facade_source = (
+        repository_root / "core/startup/runtime_receipt/__init__.py"
+    ).read_text(encoding="utf-8")
+    launch_source = (
+        repository_root / "core/startup/runtime_receipt/launch.py"
+    ).read_text(encoding="utf-8")
+    host_source = (
+        repository_root / "core/startup/tests/fixtures/runtime_receipt/owned_host.c"
+    ).read_text(encoding="utf-8")
+    assert ".launch" not in facade_source
+    assert "OwnedFakeRuntimeCapability" not in facade_source
+    assert "_launch_owned_runtime_fake" not in facade_source
+    assert "__all__: tuple[str, ...] = ()" in launch_source
+    assert "TERMINAL_ATTACH" not in launch_source
+    assert 'operation == "terminal"' not in launch_source
+    assert "COMMAND_TERMINAL_ATTACH" not in host_source
+    assert "TERMINAL_MAGIC" not in host_source
 
 
 # Stage 3A.1 exact receipt-import policy.
@@ -1568,7 +1592,9 @@ _RECEIPT_PROFILE_MODULE = f"{_RECEIPT_IMPORT_PREFIX}.profile"
 _RECEIPT_REASONS_MODULE = f"{_RECEIPT_IMPORT_PREFIX}.reasons"
 _RECEIPT_SCHEMA_MODULE = f"{_RECEIPT_IMPORT_PREFIX}.schema"
 _RECEIPT_VERIFY_MODULE = f"{_RECEIPT_IMPORT_PREFIX}.verify"
+_RECEIPT_LAUNCH_MODULE = f"{_RECEIPT_IMPORT_PREFIX}.launch"
 _SESSIONS_PATH = "core/project/sessions.py"
+_RUNTIME_FAKE_PATH = "core/testing/runtime_receipt_fake.py"
 _DYNAMIC_IMPORT_NAME = "<dynamic module>"
 _UNRESOLVED_RECEIPT_MODULE = f"{_RECEIPT_IMPORT_PREFIX}.<unresolved>"
 _UNKNOWN_BINDING = object()
@@ -1657,11 +1683,28 @@ _REVIEWED_STAGE_3A1_RUNTIME_IMPORTS = frozenset(
         (_RECEIPT_VERIFY_MODULE, "verify_receipt_static"),
     }
 )
+_REVIEWED_RUNTIME_FAKE_TYPE_IMPORTS = frozenset(
+    {(_RECEIPT_LAUNCH_MODULE, "OwnedFakeRuntimeCapability")}
+)
+_REVIEWED_RUNTIME_FAKE_RUNTIME_IMPORTS = frozenset(
+    {
+        (_RECEIPT_IMPORT_PREFIX + ".canonical", "canonical_bytes"),
+        (_RECEIPT_IMPORT_PREFIX + ".canonical", "receipt_sha256"),
+        (_RECEIPT_IMPORT_PREFIX + ".canonical", "sha256_hex"),
+        (_RECEIPT_LAUNCH_MODULE, "_issue_owned_fake_runtime_capability"),
+        (_RECEIPT_PROFILE_MODULE, "DEFAULT_PROFILE_DIRECTORY"),
+        (_RECEIPT_SCHEMA_MODULE, "ArtifactName"),
+    }
+)
 
 _REVIEWED_RECEIPT_IMPORTS = {
     _SESSIONS_PATH: (
         _REVIEWED_STAGE_3A1_TYPE_IMPORTS,
         _REVIEWED_STAGE_3A1_RUNTIME_IMPORTS,
+    ),
+    _RUNTIME_FAKE_PATH: (
+        _REVIEWED_RUNTIME_FAKE_TYPE_IMPORTS,
+        _REVIEWED_RUNTIME_FAKE_RUNTIME_IMPORTS,
     ),
 }
 
@@ -3055,7 +3098,7 @@ def test_relative_receipt_import_in_another_production_file_is_forbidden() -> No
     )
 
 
-def test_stage3a1_receipt_importers_are_exact() -> None:
+def test_stage3b_receipt_importers_are_exact() -> None:
     repository_root = Path(__file__).parents[3]
     production_sources = _production_python_sources(repository_root)
     violations = tuple(
@@ -3071,7 +3114,7 @@ def test_stage3a1_receipt_importers_are_exact() -> None:
         relative
         for relative, source_text in production_sources.items()
         if _RECEIPT_IMPORT_PREFIX in source_text
-    } == {_SESSIONS_PATH}
+    } == {_SESSIONS_PATH, _RUNTIME_FAKE_PATH}
 
 
 def test_reviewed_sessions_receipt_imports_are_explicit_and_exact() -> None:
