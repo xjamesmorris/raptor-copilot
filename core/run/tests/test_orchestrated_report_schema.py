@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import unittest
 
+from core.llm.accounting import AccountingSummary, CostBasis, CostObservation, RouteIdentity
 from core.run.finding_status import ALL_STATUSES
 from core.run.orchestrated_report_schema import SCHEMA
 
@@ -62,6 +63,80 @@ class TestSchemaShape(unittest.TestCase):
         self.assertEqual(orch["type"], "object")
         # Cost subobject required to be an object when present.
         self.assertEqual(orch["properties"]["cost"]["type"], "object")
+
+    def test_cost_section_documents_additive_accounting_fields(self):
+        cost = SCHEMA["properties"]["orchestration"]["properties"]["cost"]
+        props = cost["properties"]
+        for name in (
+            "provider_billed_usd",
+            "catalog_priced_usd",
+            "configured_rate_usd",
+            "cli_reported_usd",
+            "estimated_usd",
+            "provider_billed_calls",
+            "catalog_priced_calls",
+            "configured_rate_calls",
+            "cli_reported_calls",
+            "subscription_calls",
+            "unknown_calls",
+            "unknown_failed_attempts",
+            "retained_reservation_estimate_usd",
+            "exposure_unresolved",
+            "usd_total_complete",
+            "authoritative_remaining_usd",
+            "total_tokens",
+            "cost_by_model",
+            "accounting_by_route",
+            "cache_hits",
+            "failed_dispatches",
+            "unclassified_legacy_events",
+        ):
+            self.assertIn(name, props)
+        self.assertEqual(
+            props["authoritative_remaining_usd"]["type"],
+            ["number", "null"],
+        )
+        self.assertEqual(props["total_cost"]["type"], "number")
+
+    def test_finding_documents_transport_owned_metadata(self):
+        finding = SCHEMA["properties"]["results"]["items"]
+        props = finding["properties"]
+        for name in (
+            "analysed_by",
+            "analysed_by_provider",
+            "analysis_route",
+            "analysis_provenance",
+            "resolved_model",
+            "cost_observation",
+            "accounting",
+            "accounting_complete",
+            "cache_hit",
+        ):
+            self.assertIn(name, props)
+            self.assertNotIn(name, finding["required"])
+        self.assertEqual(props["accounting_complete"]["type"], "boolean")
+        self.assertEqual(props["cache_hit"]["type"], "boolean")
+        for name in (
+            "analysis_route",
+            "analysis_provenance",
+            "cost_observation",
+            "accounting",
+        ):
+            self.assertEqual(props[name]["type"], "object")
+            self.assertTrue(props[name]["additionalProperties"])
+
+    def test_completeness_descriptions_do_not_claim_invoice_authority(self):
+        finding = SCHEMA["properties"]["results"]["items"]["properties"]
+        cost = SCHEMA["properties"]["orchestration"]["properties"]["cost"]
+        record_description = finding["accounting_complete"]["description"]
+        self.assertIn("estimated", record_description)
+        self.assertIn("no-spend", record_description)
+        self.assertIn("Not invoice authority", record_description)
+        self.assertIn("internal-retry", record_description)
+        self.assertIn(
+            "not invoice authority",
+            cost["properties"]["usd_total_complete"]["description"],
+        )
 
     def test_finding_additional_properties_permissive(self):
         # Per-finding records carry arbitrary keys from the prep
@@ -144,6 +219,43 @@ class TestSchemaConsumerExample(unittest.TestCase):
             # Just assert the dict shape stays parseable + the
             # value is in the enum.
             self.assertIn(report["results"][0]["status"], status_enum)
+
+    def test_accounted_report_fields_match_the_descriptive_schema(self):
+        route = RouteIdentity("example-provider", "example-model")
+        observation = CostObservation(CostBasis.UNKNOWN, route=route)
+        accounting = AccountingSummary().add(observation).as_dict()
+        report = self._make_minimal_report()
+        report["results"][0].update({
+            "analysed_by": route.model,
+            "analysed_by_provider": route.provider,
+            "analysis_route": route.as_dict(),
+            "analysis_provenance": route.as_dict(),
+            "cost_observation": observation.as_dict(),
+            "accounting": accounting,
+            "accounting_complete": False,
+        })
+        report["orchestration"]["cost"].update({
+            "total_tokens": 12,
+            "cost_by_model": {route.model: 0.0},
+            "accounting_by_route": {
+                f"{route.provider}/{route.model}": {
+                    "route": route.as_dict(),
+                    **accounting,
+                },
+            },
+            "cache_hits": 0,
+            "failed_dispatches": 0,
+            "unclassified_legacy_events": 0,
+            **accounting,
+        })
+        finding_props = SCHEMA["properties"]["results"]["items"]["properties"]
+        cost_props = (
+            SCHEMA["properties"]["orchestration"]["properties"]["cost"]
+            ["properties"]
+        )
+        self.assertTrue(set(report["results"][0]).issubset(finding_props))
+        self.assertTrue(set(report["orchestration"]["cost"]).issubset(cost_props))
+        self.assertFalse(report["orchestration"]["cost"]["usd_total_complete"])
 
 
 if __name__ == "__main__":

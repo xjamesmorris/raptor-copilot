@@ -16,14 +16,26 @@ If external LLM fails entirely, falls back to CC dispatch automatically.
 import contextlib
 import copy
 import logging
+import math
 import os
 import sys
 import threading
 import time
 from collections import Counter
+from dataclasses import fields, replace
 from pathlib import Path
 from typing import Any
 
+from core.llm.accounting import (
+    AccountingSummary,
+    CostBasis,
+    CostObservation,
+    ModelKeyAggregation,
+    RouteIdentity,
+    UsdBudgetContract,
+    format_accounting_summary,
+    model_key_aggregation_for_config,
+)
 from core.reporting.formatting import format_elapsed as _format_elapsed
 from core.run.finding_status import read_verdict
 from core.security.log_sanitisation import sanitise_for_terminal
@@ -53,15 +65,158 @@ class CostTracker:
         self._thinking_tokens = 0
         self._max_cost = max_cost  # 0 = no limit
         self._per_model: dict[str, float] = {}
+        self._core_result_per_model: dict[str, float] = {}
+        self._accounting_summary = AccountingSummary()
+        self._core_result_accounting = AccountingSummary()
+        self._route_accounting: dict[RouteIdentity, AccountingSummary] = {}
+        self._core_route_accounting: dict[
+            RouteIdentity, AccountingSummary
+        ] = {}
+        self._core_result_cost = 0.0
+        self._core_result_tokens = 0
+        self._cache_hits = 0
+        self._core_cache_hits = 0
+        self._failed_attempts = 0
+        self._unclassified_legacy_events = 0
 
     def add_cost(self, model_name: str, cost: float, tokens: int = 0,
                  thinking_tokens: int = 0) -> None:
-        """Record cost and tokens from any source (thread-safe)."""
+        """Record a legacy aggregate with no per-attempt accounting basis."""
+        self.record_attempt(
+            model_name,
+            cost=cost,
+            tokens=tokens,
+            thinking_tokens=thinking_tokens,
+            legacy_unclassified=True,
+        )
+
+    def record_attempt(
+        self,
+        model_name: str,
+        *,
+        cost: float,
+        tokens: int = 0,
+        thinking_tokens: int = 0,
+        observation: CostObservation | None = None,
+        route: RouteIdentity | None = None,
+        failed: bool = False,
+        no_spend: bool = False,
+        cache_hit: bool = False,
+        core_accounted: bool = False,
+        retained_reservation_estimate_usd: float = 0.0,
+        legacy_unclassified: bool = False,
+    ) -> None:
+        """Record one completed dispatch attempt exactly once.
+
+        ``core_accounted`` marks observations also present in the owning
+        ``LLMClient`` cumulative snapshot. They remain available provisionally
+        for callers that do not supply that snapshot, but are replaced rather
+        than merged when :meth:`get_summary` receives ``core_stats``.
+        """
+        if observation is not None and not isinstance(
+            observation, CostObservation,
+        ):
+            raise TypeError("observation must be CostObservation or None")
+        if route is not None and not isinstance(route, RouteIdentity):
+            raise TypeError("route must be RouteIdentity or None")
+        if observation is not None and observation.route is not None:
+            route = observation.route
+        if (
+            isinstance(cost, bool)
+            or not isinstance(cost, (int, float))
+            or not math.isfinite(float(cost))
+            or float(cost) < 0.0
+        ):
+            raise ValueError("cost must be a finite non-negative number")
+        if (
+            isinstance(tokens, bool)
+            or not isinstance(tokens, int)
+            or tokens < 0
+        ):
+            raise ValueError("tokens must be a non-negative integer")
+        if (
+            isinstance(thinking_tokens, bool)
+            or not isinstance(thinking_tokens, int)
+            or thinking_tokens < 0
+        ):
+            raise ValueError(
+                "thinking_tokens must be a non-negative integer",
+            )
+        if (
+            observation is not None
+            and observation.has_numeric_usd
+            and not math.isclose(
+                float(cost),
+                observation.legacy_cost_usd,
+                rel_tol=1e-9,
+                abs_tol=1e-12,
+            )
+        ):
+            raise ValueError(
+                "legacy cost does not match the typed observation",
+            )
+        if no_spend and float(cost) != 0.0:
+            raise ValueError("no-spend dispatch cannot carry a non-zero cost")
+
         with self._lock:
-            self._total_cost += cost
-            self._total_tokens += tokens
-            self._thinking_tokens += thinking_tokens
-            self._per_model[model_name] = self._per_model.get(model_name, 0.0) + cost
+            if cache_hit:
+                self._cache_hits += 1
+                if core_accounted:
+                    self._core_cache_hits += 1
+            if no_spend:
+                return
+
+            amount = float(cost)
+            self._total_cost += amount
+            self._total_tokens += int(tokens)
+            self._thinking_tokens += int(thinking_tokens)
+            self._per_model[model_name] = (
+                self._per_model.get(model_name, 0.0) + amount
+            )
+            if core_accounted:
+                self._core_result_cost += amount
+                self._core_result_tokens += int(tokens)
+                self._core_result_per_model[model_name] = (
+                    self._core_result_per_model.get(model_name, 0.0)
+                    + amount
+                )
+            if failed:
+                self._failed_attempts += 1
+            if legacy_unclassified:
+                self._unclassified_legacy_events += 1
+            if observation is None:
+                return
+
+            target_attr = (
+                "_core_result_accounting"
+                if core_accounted else "_accounting_summary"
+            )
+            summary = getattr(self, target_attr)
+            if failed and observation.basis is CostBasis.UNKNOWN:
+                summary = summary.add_unknown_failure(
+                    retained_reservation_estimate_usd=(
+                        retained_reservation_estimate_usd
+                    ),
+                )
+            else:
+                summary = summary.add(observation)
+            setattr(self, target_attr, summary)
+
+            if route is not None:
+                route_map = (
+                    self._core_route_accounting
+                    if core_accounted else self._route_accounting
+                )
+                route_summary = route_map.get(route, AccountingSummary())
+                if failed and observation.basis is CostBasis.UNKNOWN:
+                    route_summary = route_summary.add_unknown_failure(
+                        retained_reservation_estimate_usd=(
+                            retained_reservation_estimate_usd
+                        ),
+                    )
+                else:
+                    route_summary = route_summary.add(observation)
+                route_map[route] = route_summary
 
     @property
     def total_cost(self) -> float:
@@ -188,16 +343,170 @@ class CostTracker:
         consensus_calls = n_findings * n_consensus_models
         return (analysis_calls + consensus_calls) * avg_cost
 
-    def get_summary(self) -> dict[str, Any]:
+    def get_summary(
+        self,
+        *,
+        core_stats: dict[str, Any] | None = None,
+        core_precharged_cost: float = 0.0,
+    ) -> dict[str, Any]:
         with self._lock:
+            total_cost = self._total_cost
+            total_tokens = self._total_tokens
+            cache_hits = self._cache_hits
+            per_model = dict(self._per_model)
+            accounting = _merge_accounting_summaries(
+                self._accounting_summary,
+                self._core_result_accounting,
+            )
+            route_accounting = dict(self._route_accounting)
+            for route, route_summary in self._core_route_accounting.items():
+                route_accounting[route] = _merge_accounting_summaries(
+                    route_accounting.get(route, AccountingSummary()),
+                    route_summary,
+                )
+
+            if core_stats is not None:
+                raw_core_accounting = core_stats.get("accounting")
+                if isinstance(raw_core_accounting, dict):
+                    core_accounting = _accounting_summary_from_mapping(
+                        raw_core_accounting,
+                    )
+                    accounting = _merge_accounting_summaries(
+                        self._accounting_summary,
+                        core_accounting,
+                    )
+                    route_accounting = dict(self._route_accounting)
+
+                core_total = core_stats.get("total_cost")
+                if (
+                    isinstance(core_total, (int, float))
+                    and not isinstance(core_total, bool)
+                    and math.isfinite(float(core_total))
+                    and float(core_total) >= 0.0
+                ):
+                    total_cost = (
+                        self._total_cost
+                        - self._core_result_cost
+                        + float(core_total)
+                        - float(core_precharged_cost)
+                    )
+
+                providers = core_stats.get("providers")
+                core_cache_hits = core_stats.get("cache_hits")
+                if (
+                    isinstance(core_cache_hits, int)
+                    and not isinstance(core_cache_hits, bool)
+                    and core_cache_hits >= 0
+                ):
+                    cache_hits = (
+                        self._cache_hits
+                        - self._core_cache_hits
+                        + core_cache_hits
+                    )
+                if isinstance(providers, dict):
+                    route_accounting = dict(self._route_accounting)
+                    provider_accounting_total = AccountingSummary()
+                    core_tokens = sum(
+                        int(provider_stats.get("total_tokens", 0) or 0)
+                        for provider_stats in providers.values()
+                        if isinstance(provider_stats, dict)
+                        and isinstance(
+                            provider_stats.get("total_tokens", 0),
+                            int,
+                        )
+                    )
+                    total_tokens = (
+                        self._total_tokens
+                        - self._core_result_tokens
+                        + core_tokens
+                    )
+                    per_model = {
+                        model: amount
+                        - self._core_result_per_model.get(model, 0.0)
+                        for model, amount in self._per_model.items()
+                    }
+                    for key, provider_stats in providers.items():
+                        if not isinstance(provider_stats, dict):
+                            continue
+                        provider_summary = _accounting_summary_from_mapping(
+                            provider_stats.get("accounting"),
+                        )
+                        if not _accounting_has_activity(provider_summary):
+                            continue
+                        provider, separator, model = str(key).partition(":")
+                        if not separator or not provider or not model:
+                            continue
+                        provider_cost = provider_stats.get("total_cost", 0.0)
+                        if (
+                            isinstance(provider_cost, (int, float))
+                            and not isinstance(provider_cost, bool)
+                        ):
+                            per_model[model] = (
+                                per_model.get(model, 0.0)
+                                + float(provider_cost)
+                            )
+                        route = RouteIdentity(provider, model)
+                        route_accounting[route] = (
+                            _merge_accounting_summaries(
+                                route_accounting.get(
+                                    route, AccountingSummary(),
+                                ),
+                                provider_summary,
+                            )
+                        )
+                        provider_accounting_total = (
+                            _merge_accounting_summaries(
+                                provider_accounting_total,
+                                provider_summary,
+                            )
+                        )
+                    if not isinstance(raw_core_accounting, dict):
+                        accounting = _merge_accounting_summaries(
+                            self._accounting_summary,
+                            provider_accounting_total,
+                        )
+
+            if self._unclassified_legacy_events:
+                accounting = replace(
+                    accounting,
+                    usd_total_complete=False,
+                    authoritative_remaining_usd=None,
+                )
+            accounting_dict = accounting.as_dict()
             summary = {
-                "total_cost": round(self._total_cost, 4),
-                "total_tokens": self._total_tokens,
+                "total_cost": round(total_cost, 4),
+                "total_tokens": total_tokens,
                 # An uncapped run uses +inf internally; JSON represents
                 # its absent ceiling as null while enforcement stays unchanged.
                 "max_cost": None if self._max_cost == float("inf") else self._max_cost,
-                "budget_used_percent": round(self._budget_ratio() * 100, 1) if self._max_cost > 0 else 0,
-                "cost_by_model": {k: round(v, 4) for k, v in self._per_model.items()},
+                "budget_used_percent": (
+                    round((total_cost / self._max_cost) * 100, 1)
+                    if self._max_cost > 0
+                    and math.isfinite(self._max_cost)
+                    else 0
+                ),
+                "cost_by_model": {
+                    key: round(value, 4)
+                    for key, value in per_model.items()
+                },
+                "accounting_by_route": {
+                    f"{route.provider}/{route.model}": {
+                        "route": route.as_dict(),
+                        **route_summary.as_dict(),
+                    }
+                    for route, route_summary in sorted(
+                        route_accounting.items(),
+                        key=lambda item: (
+                            item[0].provider, item[0].model,
+                        ),
+                    )
+                },
+                "cache_hits": cache_hits,
+                "failed_dispatches": self._failed_attempts,
+                "unclassified_legacy_events": (
+                    self._unclassified_legacy_events
+                ),
+                **accounting_dict,
             }
             if self._thinking_tokens > 0:
                 summary["thinking_tokens"] = self._thinking_tokens
@@ -238,6 +547,103 @@ def _snapshot_verdicts(
     return out
 
 
+_ACCOUNTING_FIELD_NAMES = frozenset(
+    field.name for field in fields(AccountingSummary)
+)
+
+
+def _accounting_summary_from_mapping(value: Any) -> AccountingSummary:
+    if isinstance(value, AccountingSummary):
+        return value
+    if not isinstance(value, dict):
+        return AccountingSummary()
+    return AccountingSummary(**{
+        key: value[key]
+        for key in _ACCOUNTING_FIELD_NAMES
+        if key in value
+    })
+
+
+def _merge_accounting_summaries(
+    left: AccountingSummary,
+    right: AccountingSummary,
+) -> AccountingSummary:
+    if left == AccountingSummary():
+        return right
+    if right == AccountingSummary():
+        return left
+    return left.merge(right)
+
+
+def _accounting_has_activity(summary: AccountingSummary) -> bool:
+    return bool(
+        summary.calls
+        or summary.unknown_failed_attempts
+        or summary.exposure_unresolved
+        or summary.retained_reservation_estimate_usd
+        or not summary.usd_total_complete
+    )
+
+
+def format_cost_summary(cost_summary: dict[str, Any]) -> str:
+    """Render a report cost object without treating compatibility zero as free."""
+    raw_accounting = cost_summary.get("accounting")
+    accounting = _accounting_summary_from_mapping(
+        raw_accounting if isinstance(raw_accounting, dict) else cost_summary,
+    )
+    total_cost = float(cost_summary.get("total_cost", 0.0) or 0.0)
+    unclassified_events = int(
+        cost_summary.get("unclassified_legacy_events", 0) or 0,
+    )
+    if unclassified_events and accounting.calls == 0:
+        return (
+            f"Estimated USD ${total_cost:.2f} "
+            "(legacy; accounting basis unavailable) — incomplete "
+            f"({unclassified_events} unclassified "
+            f"{'event' if unclassified_events == 1 else 'events'})"
+        )
+    if not _accounting_has_activity(accounting):
+        if total_cost <= 0:
+            return ""
+        return (
+            f"Estimated USD ${total_cost:.2f} "
+            "(legacy; accounting basis unavailable) — incomplete"
+        )
+    rendered = format_accounting_summary(accounting)
+    unclassified = total_cost - accounting.legacy_total_cost
+    if (
+        not accounting.usd_total_complete
+        and not unclassified_events
+        and not any((
+            accounting.unknown_calls,
+            accounting.subscription_calls,
+            accounting.unknown_failed_attempts,
+        ))
+    ):
+        rendered += " — incomplete"
+    if unclassified_events and unclassified > 0.00005:
+        rendered += (
+            f"; additional legacy estimate ${unclassified:.2f} "
+            "(basis unavailable) — incomplete "
+            f"({unclassified_events} unclassified "
+            f"{'event' if unclassified_events == 1 else 'events'})"
+        )
+    elif unclassified_events:
+        rendered += (
+            f"; incomplete ({unclassified_events} unclassified "
+            f"{'event' if unclassified_events == 1 else 'events'})"
+        )
+    return rendered
+
+
+def _label_claude_dispatch_result(result: Any) -> Any:
+    """Stamp the canonical logical provider on the direct CC adapter."""
+    from packages.llm_analysis.dispatch import DispatchResult
+    if isinstance(result, DispatchResult) and not result.provider:
+        result.provider = "claudecode"
+    return result
+
+
 def _cc_fallback_role_resolution(role_resolution: dict) -> dict:
     """Role resolution for the CC fallback dispatch.
 
@@ -253,6 +659,20 @@ def _cc_fallback_role_resolution(role_resolution: dict) -> dict:
         "analysis_models": [],
         "analysis_model": None,
     }
+
+
+def _should_fallback_to_cc(results: list[dict[str, Any]]) -> bool:
+    """Allow legacy fallback only for ordinary transport/model failures."""
+    return bool(
+        results
+        and all("error" in result for result in results)
+        # Defensive for wrapped integrations. Native LLMPolicyError values
+        # are re-raised by dispatch_task and never produce this record.
+        and not any(
+            result.get("error_type") == "policy_refusal"
+            for result in results
+        )
+    )
 
 
 def _classify_absent_consensus(
@@ -998,8 +1418,33 @@ def orchestrate(
     # is needed: anything raising here is a wiring bug that should
     # surface, not stall silently.
     from core.run.estimator import estimate_from_scorecard, format_estimate
+    if len(analysis_models_all) == 1:
+        estimate_model = analysis_models_all[0]
+        estimate_model_name = estimate_model.model_name
+        estimate_model_key_aggregation = (
+            model_key_aggregation_for_config(estimate_model)
+        )
+    else:
+        # Scorecard v2 is keyed only by model name. A panel has no single
+        # route identity whose history can be attributed safely.
+        estimate_model_name = ""
+        estimate_model_key_aggregation = ModelKeyAggregation.REFUSE
+    estimate_budget_contract = getattr(
+        llm_config,
+        "usd_budget_contract",
+        UsdBudgetContract.ADVISORY,
+    )
+    if not isinstance(estimate_budget_contract, (UsdBudgetContract, str)):
+        # Some compatibility callers pass lightweight config doubles whose
+        # undeclared attributes auto-materialise. Missing policy remains the
+        # historical advisory default rather than becoming an invalid enum.
+        estimate_budget_contract = UsdBudgetContract.ADVISORY
     _sc_est = estimate_from_scorecard(
-        analysis_model_name or "", n, max_parallel=max_parallel,
+        estimate_model_name,
+        n,
+        max_parallel=max_parallel,
+        model_key_aggregation=estimate_model_key_aggregation,
+        usd_budget_contract=estimate_budget_contract,
     )
     _sc_line = format_estimate(_sc_est)
     if _sc_line:
@@ -1076,32 +1521,19 @@ def orchestrate(
                     validated = validate_structured_response(result, schema)
                     result = validated.data
                     quality = validated.quality
-                return DispatchResult(
-                    result=result, cost=response.cost,
-                    tokens=response.tokens_used, model=response.model,
-                    duration=response.duration, quality=quality,
-                    resolved_model=response.resolved_model,
-                    # getattr: StructuredResponse doesn't carry the
-                    # field yet — wired here so the tracker's
-                    # thinking-token telemetry fires as soon as the
-                    # provider layer surfaces it.
-                    thinking_tokens=getattr(
-                        response, "thinking_tokens", 0,
-                    ) or 0,
+                return DispatchResult.from_core_response(
+                    response,
+                    result=result,
+                    quality=quality,
                 )
             response = client.generate(
                 prompt=prompt, system_prompt=system_prompt,
                 model_config=model, temperature=temperature,
                 exclude_fallback_to=other_active,
             )
-            return DispatchResult(
-                result={"content": response.content}, cost=response.cost,
-                tokens=response.tokens_used, model=response.model,
-                duration=response.duration,
-                resolved_model=response.resolved_model,
-                thinking_tokens=getattr(
-                    response, "thinking_tokens", 0,
-                ) or 0,
+            return DispatchResult.from_core_response(
+                response,
+                result={"content": response.content},
             )
 
         dispatch_mode = "external_llm"
@@ -1126,8 +1558,15 @@ def orchestrate(
             # regressing the documented trust separation — operator
             # instructions and finding-derived content arrived on the
             # SAME channel from the model's perspective.
-            return invoke_cc_simple(prompt, schema, repo_path, claude_bin,
-                                    out_dir, system_prompt=system_prompt)
+            result = invoke_cc_simple(
+                prompt,
+                schema,
+                repo_path,
+                claude_bin,
+                out_dir,
+                system_prompt=system_prompt,
+            )
+            return _label_claude_dispatch_result(result)
 
         dispatch_mode = "cc_dispatch"
 
@@ -1304,9 +1743,10 @@ def orchestrate(
                          exc_info=True)
 
     # Fallback: if external LLM failed entirely, try CC
-    if (dispatch_mode == "external_llm"
-            and analysis_results
-            and all("error" in r for r in analysis_results)):
+    if (
+        dispatch_mode == "external_llm"
+        and _should_fallback_to_cc(analysis_results)
+    ):
         from core.llm.cc_adapter import resolve_claude_cli
         claude_bin = resolve_claude_cli()
         if claude_bin:
@@ -1316,8 +1756,15 @@ def orchestrate(
             def dispatch_fn(prompt, schema, system_prompt, temperature, model):
                 # Same dedicated system-prompt channel as the primary
                 # CC dispatch path above — never fold into user content.
-                return invoke_cc_simple(prompt, schema, repo_path, claude_bin,
-                                        out_dir, system_prompt=system_prompt)
+                result = invoke_cc_simple(
+                    prompt,
+                    schema,
+                    repo_path,
+                    claude_bin,
+                    out_dir,
+                    system_prompt=system_prompt,
+                )
+                return _label_claude_dispatch_result(result)
 
             # Carry the per-model intersected profile into the
             # CC-fallback AnalysisTask. Pre-fix `AnalysisTask()`
@@ -1906,6 +2353,13 @@ def orchestrate(
     low_confidence = sum(1 for r in per_finding_results if r.get("low_confidence"))
 
     analysis_models_list = role_resolution.get("analysis_models", [])
+    core_stats = client.get_stats() if client is not None else None
+    if not isinstance(core_stats, dict):
+        core_stats = None
+    cost_summary = cost_tracker.get_summary(
+        core_stats=core_stats,
+        core_precharged_cost=rank_cost,
+    )
     merged["orchestration"] = {
         "mode": dispatch_mode,
         "multi_model": len(analysis_models_list) > 1,
@@ -1955,7 +2409,7 @@ def orchestrate(
         "correlation": correlation.get("summary") if correlation else None,
         "elapsed_seconds": round(elapsed, 1),
         "max_parallel": max_parallel,
-        "cost": cost_tracker.get_summary(),
+        "cost": cost_summary,
         # Number of full ANALYSE calls avoided because the fast-tier
         # scorecard trusted the cheap-tier "clear FP" verdict. Zero
         # on CC-prep / CC-fallback paths (no prefilter wiring).
@@ -1994,7 +2448,6 @@ def orchestrate(
     # Summary
     orch = merged["orchestration"]
     cost_summary = orch["cost"]
-    cost_total = cost_summary["total_cost"]
     model_name = orch.get("analysis_model") or ""
     model_str = f" ({model_name})" if model_name else ""
 
@@ -2010,8 +2463,9 @@ def orchestrate(
         else:
             parts.append(f"{orch['findings_failed']} failed")
     parts.append(f"{_format_elapsed(orch['elapsed_seconds'])} elapsed")
-    if cost_total > 0:
-        parts.append(f"${cost_total:.2f}")
+    accounting_text = format_cost_summary(cost_summary)
+    if accounting_text:
+        parts.append(accounting_text)
 
     print(f"\n  Orchestration complete{model_str}: {', '.join(parts)}")
     thinking = cost_summary.get("thinking_tokens", 0)
@@ -2529,9 +2983,16 @@ def _merge_results(
     patches_generated = 0
 
     from core.run.finding_status import SKIPPED, set_status
+    from packages.llm_analysis.dispatch import DISPATCH_METADATA_FIELDS
     for finding in results:
         fid = finding.get("finding_id")
         cc = cc_by_id.get(fid)
+        for key in DISPATCH_METADATA_FIELDS:
+            finding.pop(key, None)
+        if cc is not None:
+            for key in DISPATCH_METADATA_FIELDS:
+                if key in cc:
+                    finding[key] = cc[key]
         if cc is None or "error" in cc:
             if cc is None:
                 # Never dispatched (cap / dedup / chokepoint
@@ -2567,6 +3028,8 @@ def _merge_results(
         # against prompt injection where LLM returns crafted field names.
         for k, v in cc.items():
             if k.startswith("_") or k == "finding_id":
+                continue
+            if k in DISPATCH_METADATA_FIELDS:
                 continue
             if k in ("patch_code", "patch_gate"):
                 # Handled explicitly below so every surviving patch is

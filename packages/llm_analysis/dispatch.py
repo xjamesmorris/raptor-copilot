@@ -6,11 +6,21 @@ Task subclasses define semantics: what prompt, what schema, which model.
 """
 
 import logging
+import math
 import sys
 import time
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import Any
+
+from core.llm.accounting import (
+    AccountingSummary,
+    CostBasis,
+    CostObservation,
+    LLMPolicyError,
+    RouteIdentity,
+    cost_observation_from_exception,
+)
 
 # Error classification moved to the shared consumer-side envelope
 # (core.llm.structured_call) — the word-boundary regexes this module
@@ -70,9 +80,43 @@ class _ErrorDictResult(Exception):
     to (``""`` when the path didn't know).
     """
 
-    def __init__(self, message: str, model_name: str = "") -> None:
+    def __init__(
+        self,
+        message: str,
+        model_name: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.model_name = model_name
+        self.metadata = metadata or {}
+
+
+_PROVENANCE_METADATA_FIELDS = frozenset({
+    "analysed_by",
+    "analysed_by_provider",
+    "analysis_provenance",
+    "analysis_route",
+    "resolved_model",
+})
+_ACCOUNTING_METADATA_FIELDS = frozenset({
+    "accounting",
+    "accounting_complete",
+    "cache_hit",
+    "cost_observation",
+    "cost_usd",
+    "duration_seconds",
+})
+DISPATCH_METADATA_FIELDS = (
+    _PROVENANCE_METADATA_FIELDS | _ACCOUNTING_METADATA_FIELDS
+)
+
+
+def strip_dispatch_metadata(payload: dict[str, Any]) -> dict[str, Any]:
+    """Remove transport-owned fields from model-generated content."""
+    out = dict(payload)
+    for key in DISPATCH_METADATA_FIELDS:
+        out.pop(key, None)
+    return out
 
 
 class DispatchResult:
@@ -81,11 +125,27 @@ class DispatchResult:
     def __init__(self, result: dict[str, Any], cost: float = 0.0,
                  tokens: int = 0, model: str = "", duration: float = 0.0,
                  quality: float = 1.0, resolved_model: str | None = None,
-                 thinking_tokens: int = 0) -> None:
+                 thinking_tokens: int = 0, provider: str = "",
+                 cost_observation: CostObservation | None = None,
+                 cache_hit: bool = False, no_spend: bool = False,
+                 core_accounted: bool = False,
+                 retained_reservation_estimate_usd: float = 0.0) -> None:
+        if (
+            cost_observation is not None
+            and not isinstance(cost_observation, CostObservation)
+        ):
+            raise TypeError(
+                "cost_observation must be CostObservation or None",
+            )
         self.result = result
         self.cost = cost
         self.tokens = tokens
-        self.model = model
+        self.model = model if isinstance(model, str) else ""
+        self.provider = (
+            provider.strip().lower()
+            if isinstance(provider, str) and provider.strip()
+            else ""
+        )
         self.duration = duration
         self.quality = quality
         # Provider-reported thinking-token usage (0 when the provider
@@ -96,7 +156,290 @@ class DispatchResult:
         # alias, when the SDK exposed one. Carried into the per-finding result
         # dict so consensus/judge can record scorecard reliability against the
         # concrete model version, not the drifting alias.
-        self.resolved_model = resolved_model
+        self.resolved_model = (
+            resolved_model
+            if isinstance(resolved_model, str) and resolved_model
+            else None
+        )
+        self.cost_observation = cost_observation
+        self.route = (
+            cost_observation.route
+            if cost_observation is not None
+            and cost_observation.route is not None
+            else RouteIdentity(self.provider, self.model)
+            if self.provider and self.model
+            else None
+        )
+        self.cache_hit = bool(cache_hit)
+        self.no_spend = bool(no_spend or cache_hit)
+        self.core_accounted = bool(core_accounted)
+        self.accounting_complete = (
+            self.no_spend
+            or (
+                cost_observation is not None
+                and cost_observation.basis
+                not in (CostBasis.UNKNOWN, CostBasis.SUBSCRIPTION)
+            )
+        )
+        self.retained_reservation_estimate_usd = float(
+            retained_reservation_estimate_usd,
+        )
+
+    @classmethod
+    def from_core_response(
+        cls,
+        response: Any,
+        *,
+        result: dict[str, Any],
+        quality: float = 1.0,
+    ) -> "DispatchResult":
+        """Preserve metadata supplied by an LLMClient response.
+
+        A disagreement between the legacy numeric cost and its typed
+        observation is a contract error. Generic dispatch records that as a
+        per-item failure; the sequential agent treats it as an analysis
+        failure. Neither path silently chooses one value and reports success.
+        """
+        def _string(name: str) -> str:
+            value = getattr(response, name, "")
+            return value if isinstance(value, str) else ""
+
+        def _float(name: str) -> float:
+            value = getattr(response, name, 0)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return 0.0
+            return float(value)
+
+        def _int(name: str) -> int:
+            value = getattr(response, name, 0)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return 0
+            return int(value)
+
+        observation = getattr(response, "cost_observation", None)
+        if not isinstance(observation, CostObservation):
+            observation = None
+        cost = _float("cost")
+        if (
+            observation is not None
+            and not math.isclose(
+                cost,
+                observation.legacy_cost_usd,
+                rel_tol=1e-9,
+                abs_tol=1e-12,
+            )
+        ):
+            raise ValueError(
+                "core response cost does not match its cost observation",
+            )
+        return cls(
+            result=result,
+            cost=cost,
+            tokens=_int("tokens_used"),
+            model=_string("model"),
+            provider=_string("provider"),
+            duration=_float("duration"),
+            quality=quality,
+            resolved_model=_string("resolved_model") or None,
+            thinking_tokens=_int("thinking_tokens"),
+            cost_observation=observation,
+            cache_hit=(
+                getattr(response, "cached", False) is True
+                or getattr(response, "finish_reason", "") == "cached"
+            ),
+            core_accounted=True,
+        )
+
+
+def _dispatch_route(result: Any) -> RouteIdentity | None:
+    route = getattr(result, "route", None)
+    if isinstance(route, RouteIdentity):
+        return route
+    observation = getattr(result, "cost_observation", None)
+    if isinstance(observation, CostObservation) and observation.route is not None:
+        return observation.route
+    provider = getattr(result, "provider", "")
+    model = getattr(result, "model", "")
+    provider = provider if isinstance(provider, str) else ""
+    model = model if isinstance(model, str) else ""
+    if provider and model:
+        return RouteIdentity(provider, model)
+    return None
+
+
+def _effective_observation(
+    result: Any,
+    *,
+    failed: bool,
+) -> CostObservation | None:
+    observation = getattr(result, "cost_observation", None)
+    if isinstance(observation, CostObservation):
+        return observation
+    if getattr(result, "no_spend", False) is True:
+        return None
+    if failed:
+        usage_values = (
+            getattr(result, "cost", 0),
+            getattr(result, "tokens", 0),
+            getattr(result, "thinking_tokens", 0),
+        )
+        if not any(
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and value > 0
+            for value in usage_values
+        ):
+            return None
+    return CostObservation.unknown(route=_dispatch_route(result))
+
+
+def _attempt_accounting(
+    result: Any,
+    *,
+    failed: bool,
+) -> tuple[CostObservation | None, AccountingSummary]:
+    observation = _effective_observation(result, failed=failed)
+    summary = AccountingSummary()
+    if getattr(result, "no_spend", False) is True:
+        return None, summary
+    if observation is None:
+        return observation, summary
+    if failed and observation.basis is CostBasis.UNKNOWN:
+        return observation, summary.add_unknown_failure(
+            retained_reservation_estimate_usd=getattr(
+                result, "retained_reservation_estimate_usd", 0.0,
+            ),
+        )
+    return observation, summary.add(observation)
+
+
+def dispatch_result_metadata(
+    result: Any,
+    *,
+    failed: bool = False,
+) -> dict[str, Any]:
+    """Trusted report metadata derived from the transport object, not content."""
+    observation, accounting = _attempt_accounting(result, failed=failed)
+    route = _dispatch_route(result)
+    raw_model = getattr(result, "model", "")
+    raw_provider = getattr(result, "provider", "")
+    model = (
+        route.model if route is not None
+        else raw_model if isinstance(raw_model, str) else ""
+    )
+    provider = (
+        route.provider if route is not None
+        else raw_provider if isinstance(raw_provider, str) else ""
+    )
+    metadata: dict[str, Any] = {}
+    if model:
+        metadata["analysed_by"] = model
+    if provider:
+        metadata["analysed_by_provider"] = provider
+    if route is not None:
+        metadata["analysis_route"] = route.as_dict()
+    resolved_model = getattr(result, "resolved_model", None)
+    if resolved_model:
+        metadata["resolved_model"] = resolved_model
+    provenance = {
+        key: value for key, value in {
+            "provider": provider or None,
+            "model": model or None,
+            "resolved_model": resolved_model,
+        }.items() if value is not None
+    }
+    if provenance:
+        metadata["analysis_provenance"] = provenance
+    if observation is not None:
+        metadata["cost_observation"] = observation.as_dict()
+    if observation is not None or getattr(result, "no_spend", False) is True:
+        metadata["accounting"] = accounting.as_dict()
+        metadata["accounting_complete"] = accounting.usd_total_complete
+    if getattr(result, "cache_hit", False) is True:
+        metadata["cache_hit"] = True
+    return metadata
+
+
+def record_dispatch_accounting(
+    cost_tracker: Any,
+    result: Any,
+    *,
+    failed: bool = False,
+    model_name: str | None = None,
+) -> None:
+    """Record one dispatch result through the tracker's typed seam."""
+    if cost_tracker is None:
+        return
+    observation = _effective_observation(result, failed=failed)
+    result_model = getattr(result, "model", "")
+    model = (
+        observation.route.model
+        if observation is not None and observation.route is not None
+        else result_model
+        if isinstance(result_model, str) and result_model
+        else model_name or "unknown"
+    )
+    def _number(name: str, *, integer: bool = False) -> float | int:
+        value = getattr(result, name, 0)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return 0
+        return int(value) if integer else float(value)
+
+    record_attempt = getattr(cost_tracker, "record_attempt", None)
+    if callable(record_attempt):
+        record_attempt(
+            model,
+            cost=_number("cost"),
+            tokens=_number("tokens", integer=True),
+            thinking_tokens=_number("thinking_tokens", integer=True),
+            observation=observation,
+            route=_dispatch_route(result),
+            failed=failed,
+            no_spend=getattr(result, "no_spend", False) is True,
+            cache_hit=getattr(result, "cache_hit", False) is True,
+            core_accounted=(
+                getattr(result, "core_accounted", False) is True
+            ),
+            retained_reservation_estimate_usd=_number(
+                "retained_reservation_estimate_usd",
+            ),
+        )
+        return
+    cost = _number("cost")
+    tokens = _number("tokens", integer=True)
+    thinking = _number("thinking_tokens", integer=True)
+    if cost > 0 or tokens > 0 or thinking > 0:
+        cost_tracker.add_cost(model, cost)
+
+
+def record_exception_accounting(
+    cost_tracker: Any,
+    error: BaseException,
+    *,
+    model_name: str = "unknown",
+) -> dict[str, Any]:
+    """Record a failed dispatch and any accounting evidence attached by core."""
+    observation = cost_observation_from_exception(error)
+    if observation is None:
+        record_attempt = getattr(cost_tracker, "record_attempt", None)
+        if callable(record_attempt):
+            record_attempt(
+                model_name,
+                cost=0.0,
+                failed=True,
+            )
+        return {}
+    route = observation.route
+    result = DispatchResult(
+        result={},
+        cost=observation.legacy_cost_usd,
+        model=route.model if route else "",
+        provider=route.provider if route else "",
+        cost_observation=observation,
+        core_accounted=True,
+    )
+    record_dispatch_accounting(cost_tracker, result, failed=True)
+    return dispatch_result_metadata(result, failed=True)
 
 
 class DispatchTask:
@@ -156,17 +499,12 @@ class DispatchTask:
         self, _item: dict[str, Any], result: DispatchResult,
     ) -> dict[str, Any]:
         """Post-process a single result. Default: return result dict with metadata."""
-        out = dict(result.result)
+        out = strip_dispatch_metadata(result.result)
         if result.cost > 0:
             out["cost_usd"] = result.cost
         if result.duration > 0:
             out["duration_seconds"] = round(result.duration, 1)
-        if result.model:
-            out["analysed_by"] = result.model
-        if getattr(result, "resolved_model", None):
-            # Concrete snapshot behind the alias — consumed by consensus/judge
-            # scorecard recording (model_version) and available to coverage.
-            out["resolved_model"] = result.resolved_model
+        out.update(dispatch_result_metadata(result))
         # Surface the validator quality score when the response was
         # incomplete. Lets downstream report consumers see *why* a
         # finding is unverdicted (gh #549) — `quality` defaults to 1.0
@@ -438,6 +776,7 @@ def _dispatch_inner(
                             model=model_name,
                             duration=0.0,
                             quality=1.0,
+                            no_spend=True,
                         )
                 task._tls_budget.tokens = task.budget_tokens_for_model(m)
                 prompt = task.build_prompt(it)
@@ -467,6 +806,7 @@ def _dispatch_inner(
             completed += 1
             elapsed = time.monotonic() - start
 
+            accounting_recorded = False
             try:
                 dispatch_result = future.result()
                 payload = getattr(dispatch_result, "result", None)
@@ -474,7 +814,16 @@ def _dispatch_inner(
                 # (dicts with an ``error`` key): a truthiness check
                 # let an ``{"error": ""}`` envelope ride the success
                 # path and reset the circuit breaker.
-                if isinstance(payload, dict) and "error" in payload:
+                is_error_envelope = (
+                    isinstance(payload, dict) and "error" in payload
+                )
+                record_dispatch_accounting(
+                    cost_tracker,
+                    dispatch_result,
+                    failed=is_error_envelope,
+                )
+                accounting_recorded = True
+                if is_error_envelope:
                     # Error envelope from a non-raising dispatch path —
                     # book any cost the failed call still burned (a CC
                     # timeout can bill before dying), then route the
@@ -483,14 +832,13 @@ def _dispatch_inner(
                     _err_cost = getattr(dispatch_result, "cost", 0) or 0
                     _err_tokens = getattr(dispatch_result, "tokens", 0) or 0
                     _err_model = getattr(dispatch_result, "model", "") or ""
-                    if _err_cost > 0 or _err_tokens > 0:
-                        cost_tracker.add_cost(
-                            _err_model or "unknown", _err_cost,
-                            tokens=_err_tokens,
-                        )
-                        running_cost += _err_cost
+                    running_cost += _err_cost
                     raise _ErrorDictResult(
-                        str(payload.get("error")), model_name=_err_model,
+                        str(payload.get("error")),
+                        model_name=_err_model,
+                        metadata=dispatch_result_metadata(
+                            dispatch_result, failed=True,
+                        ),
                     )
                 processed = task.process_result(item, dispatch_result)
                 processed["finding_id"] = item_id
@@ -531,51 +879,9 @@ def _dispatch_inner(
                     if nonce_leaked_in(nonce, raw_text):
                         processed["_nonce_leaked"] = True
 
-                # Feed costs AND tokens to tracker. Pre-fix only
-                # `cost` was passed; the dispatch_result already
-                # carried `tokens` (provider-reported usage from
-                # external LLM clients, or _tokens parsed from CC
-                # subprocess envelope). CostTracker stored token
-                # totals (`_total_tokens`, `_thinking_tokens`)
-                # but they stayed at 0 across every run because
-                # this single call site was the funnel and it
-                # dropped the kwarg. `get_summary()` then
-                # reported `total_tokens: 0` regardless of actual
-                # usage, breaking telemetry, cost-per-token
-                # diagnostics, and the model-economy reports the
-                # operator UI surfaces.
-                # Pre-fix the gate was `if item_cost > 0:`,
-                # which dropped CC zero-cost responses entirely
-                # — neither the cost (0, fine) NOR the TOKEN
-                # COUNT got recorded. CC subprocess invocations
-                # (`claude -p`) are billed at the parent layer
-                # but produce real token usage that the
-                # downstream model-economy report needs to
-                # surface.
-                #
-                # Run the gate as `cost > 0 OR tokens > 0`:
-                # zero-cost responses with token usage still
-                # contribute to token telemetry, while
-                # truly-empty responses (no cost, no tokens —
-                # error envelopes, immediate refusals) skip
-                # cleanly.
-                model_name = processed.get("analysed_by", "unknown")
-                item_tokens = getattr(dispatch_result, "tokens", 0) or 0
-                item_thinking = getattr(
-                    dispatch_result, "thinking_tokens", 0,
-                ) or 0
-                if item_cost > 0 or item_tokens > 0 or item_thinking > 0:
-                    cost_tracker.add_cost(
-                        model_name, item_cost, tokens=item_tokens,
-                        thinking_tokens=item_thinking,
-                    )
-
-                # Progress line. `display` derives from the scanned
-                # (hostile) repo — file basenames, group criterion
-                # values — and goes straight to the operator TTY:
-                # escape non-printables so a crafted filename cannot
-                # drive ANSI/OSC sequences (title changes, log-line
-                # forgery) onto the terminal mid-run.
+                # Cost, token, route, and basis accounting was recorded
+                # above through the typed seam. Keep the hostile-repo
+                # display value terminal-safe.
                 display = escape_nonprintable(task.get_item_display(item))
                 if "is_exploitable" in processed:
                     exploitable = read_verdict(processed, "is_exploitable")
@@ -640,18 +946,37 @@ def _dispatch_inner(
                 )
                 print(f"{prefix} {display} skipped — model circuit-broken")
 
+            except LLMPolicyError as e:
+                if not accounting_recorded:
+                    record_exception_accounting(
+                        cost_tracker, e, model_name=model_key,
+                    )
+                raise
+
             except Exception as e:  # noqa: BLE001 — per-item isolation: one failed dispatch must not sink the batch
                 err_str = str(e)
                 error_type = _classify_error(err_str)
                 model_name = model.model_name if model is not None else "?"
+                error_metadata: dict[str, Any] = {}
                 if isinstance(e, _ErrorDictResult) and e.model_name:
                     # The error envelope carried its own attribution
                     # (e.g. "claude-code") — better than the "?" bucket
                     # the CC path (model=None) would otherwise land in.
                     model_name = e.model_name
-                results.append({"finding_id": item_id, "error": err_str,
-                                "error_type": error_type,
-                                "analysed_by": model_name})
+                    error_metadata = e.metadata
+                elif not isinstance(e, _ErrorDictResult):
+                    if not accounting_recorded:
+                        error_metadata = record_exception_accounting(
+                            cost_tracker, e, model_name=model_key,
+                        )
+                error_record = {
+                    "finding_id": item_id,
+                    "error": err_str,
+                    "error_type": error_type,
+                    "analysed_by": model_name,
+                }
+                error_record.update(error_metadata)
+                results.append(error_record)
                 display = escape_nonprintable(task.get_item_display(item))
                 prefix = (
                     f"  [{completed}/{total} "

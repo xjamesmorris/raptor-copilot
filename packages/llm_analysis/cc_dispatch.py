@@ -15,6 +15,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from core.llm.accounting import RouteIdentity, cli_cost_observation
 from core.llm.cc_adapter import (
     CCDispatchConfig,
     build_cc_command,
@@ -229,9 +230,15 @@ def invoke_cc_simple(prompt, schema, repo_path, claude_bin, out_dir,
         return DispatchResult(result=result)
 
     cost = parsed.pop("cost_usd", 0)
+    cost_reported = bool(parsed.pop("cost_reported", False))
     tokens = parsed.pop("_tokens", 0)
     model = parsed.pop("analysed_by", "claude-code")
     duration = parsed.pop("duration_seconds", 0)
+    cost_observation = cli_cost_observation(
+        cost_usd=cost,
+        cost_reported=cost_reported,
+        route=RouteIdentity("claudecode", model),
+    )
 
     quality = 1.0
     if schema and isinstance(parsed, dict) and "error" not in parsed:
@@ -276,7 +283,8 @@ def invoke_cc_simple(prompt, schema, repo_path, claude_bin, out_dir,
                            validated.quality, validated.incomplete)
 
     return DispatchResult(result=parsed, cost=cost, tokens=tokens, model=model,
-                          duration=duration, quality=quality)
+                          duration=duration, quality=quality,
+                          cost_observation=cost_observation)
 
 
 _SAFE_ID_RE = re.compile(r"[^A-Za-z0-9._-]")

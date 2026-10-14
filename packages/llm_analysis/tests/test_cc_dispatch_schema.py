@@ -15,6 +15,7 @@ Covers two invoke_cc_simple properties:
 from __future__ import annotations
 
 import contextlib
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -141,3 +142,102 @@ class TestDebugFilesUniquePerInvocation:
         assert f1 != f2
         assert (tmp_path / f1).is_file()
         assert (tmp_path / f2).is_file()
+
+
+class TestEnvelopeAccountingMetadata:
+    def _invoke_success(self, monkeypatch, tmp_path, *, schema):
+        @contextlib.contextmanager
+        def _no_prompt_file(config):
+            yield None
+
+        monkeypatch.setattr(
+            cc_dispatch, "system_prompt_file_for", _no_prompt_file,
+        )
+        monkeypatch.setattr(
+            cc_dispatch, "build_cc_command",
+            lambda config, system_prompt_file=None: ["true"],
+        )
+
+        import core.llm.cc_proxy_hosts as proxy_hosts
+        monkeypatch.setattr(
+            proxy_hosts, "proxy_hosts_for_cc_dispatch",
+            lambda claude_bin: [],
+        )
+        monkeypatch.setattr(
+            proxy_hosts, "readable_paths_for_cc_dispatch",
+            lambda claude_bin: [],
+        )
+
+        payload = (
+            {
+                "type": "result",
+                "structured_output": {"verdict": "ok"},
+                "total_cost_usd": 0.25,
+                "modelUsage": {"claude-test": {}},
+            }
+            if schema
+            else {
+                "type": "result",
+                "result": "analysis",
+                "total_cost_usd": 0.25,
+                "modelUsage": {"claude-test": {}},
+            }
+        )
+        import core.sandbox as sandbox
+        monkeypatch.setattr(
+            sandbox,
+            "run_untrusted_networked",
+            lambda *a, **kw: SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(payload),
+                stderr="",
+            ),
+        )
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        return cc_dispatch.invoke_cc_simple(
+            "prompt",
+            schema,
+            str(tmp_path),
+            "claude",
+            str(out_dir),
+        ), out_dir
+
+    def test_structured_metadata_is_not_validated_as_model_output(
+        self, monkeypatch, tmp_path,
+    ):
+        from core.llm.accounting import CostBasis, RouteIdentity
+
+        schema = {
+            "type": "object",
+            "properties": {"verdict": {"type": "string"}},
+            "required": ["verdict"],
+            "additionalProperties": False,
+        }
+        result, out_dir = self._invoke_success(
+            monkeypatch, tmp_path, schema=schema,
+        )
+
+        assert result.result["verdict"] == "ok"
+        assert "cost_reported" not in result.result
+        assert not (out_dir / "debug").exists()
+        assert result.cost_observation is not None
+        assert result.cost_observation.basis is CostBasis.CLI_REPORTED
+        assert result.cost_observation.estimated_usd == pytest.approx(0.25)
+        assert result.cost_observation.route == RouteIdentity(
+            "claudecode", "claude-test",
+        )
+        assert result.accounting_complete is True
+
+    def test_freeform_metadata_is_removed_from_task_payload(
+        self, monkeypatch, tmp_path,
+    ):
+        from core.llm.accounting import CostBasis
+
+        result, _out_dir = self._invoke_success(
+            monkeypatch, tmp_path, schema=None,
+        )
+
+        assert result.result == {"content": "analysis"}
+        assert result.cost_observation is not None
+        assert result.cost_observation.basis is CostBasis.CLI_REPORTED

@@ -1728,7 +1728,7 @@
     "kind": "literal"
   },
   "core/run/orchestrated_report_schema.py::_FINDING_SCHEMA": {
-    "count": 23,
+    "count": 32,
     "kind": "literal"
   },
   "core/run/orchestrated_report_schema.py::_ORCHESTRATION_SCHEMA": {

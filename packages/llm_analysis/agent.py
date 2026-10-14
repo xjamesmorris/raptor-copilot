@@ -33,6 +33,7 @@ from core.json import dumps_display
 from core.config import RaptorConfig
 from core.inventory.lookup import lookup_function as _lookup_function
 from core.json import load_json, save_json
+from core.llm.accounting import LLMPolicyError
 from core.llm.client import _is_auth_error
 from core.llm.coerce import to_lower_token_safe
 from core.llm.config import LLMConfig
@@ -60,6 +61,33 @@ from core.sarif.parser import deduplicate_findings, parse_sarif_findings
 from packages.llm_analysis.cc_dispatch import _safe_id
 
 logger = get_logger()
+
+
+def _analysis_metadata_from_response(response: Any) -> dict[str, Any]:
+    """Build trusted per-finding provenance from a core response object."""
+    if response is None or not hasattr(response, "result"):
+        return {}
+    from packages.llm_analysis.dispatch import (
+        DispatchResult,
+        dispatch_result_metadata,
+    )
+    dispatch_result = DispatchResult.from_core_response(
+        response,
+        result={},
+    )
+    return dispatch_result_metadata(dispatch_result)
+
+
+def _format_analysis_accounting(stats: dict[str, Any]) -> str:
+    """Shared honest accounting text for sequential analysis reports."""
+    from packages.llm_analysis.orchestrator import format_cost_summary
+    return format_cost_summary(stats)
+
+
+def _raise_if_policy_error(error: Exception) -> None:
+    """Keep explicit core policy refusals terminal across agent helpers."""
+    if isinstance(error, LLMPolicyError):
+        raise error
 
 
 def _file_matches_globs(file_path: str, globs: list[str]) -> bool:
@@ -468,6 +496,7 @@ class VulnerabilityContext:
         # gate itself errored and was skipped best-effort).
         self.patch_gate: dict[str, Any] | None = None
         self.analysis: dict[str, Any] | None = None
+        self.analysis_metadata: dict[str, Any] = {}
 
     def get_full_file_path(self) -> Path | None:
         """Get absolute path to vulnerable file."""
@@ -704,6 +733,7 @@ class VulnerabilityContext:
             "has_exploit": self.exploit_code is not None,
             "has_patch": self.patch_code is not None,
         }
+        result.update(getattr(self, "analysis_metadata", {}) or {})
 
         # Explicit analysis-failure marker. ``error`` is the canonical
         # field (``derive_status`` keys on it); the enum status is
@@ -1326,6 +1356,7 @@ class AutonomousSecurityAgentV2:
             return validation
 
         except Exception as e:  # noqa: BLE001
+            _raise_if_policy_error(e)
             logger.error("✗ Dataflow validation failed: %s", e)
             return {}
 
@@ -1498,12 +1529,20 @@ class AutonomousSecurityAgentV2:
             # no transcript is active. The quality retry shares the
             # tag: its call belongs to the same finding.
             with transcript_subject(vuln.finding_id):
-                raw_analysis, _full_response = self.llm.generate_structured(
+                response = self.llm.generate_structured(
                     prompt=prompt,
                     schema=analysis_schema,
                     system_prompt=system_prompt,
                     task_type=TaskType.ANALYSE,
                 )
+                if hasattr(response, "result"):
+                    raw_analysis = response.result
+                    response_metadata = _analysis_metadata_from_response(
+                        response,
+                    )
+                else:
+                    raw_analysis, _full_response = response
+                    response_metadata = {}
 
                 if raw_analysis is None:
                     logger.debug("Prep mode — Phase 4 will handle analysis")
@@ -1516,13 +1555,22 @@ class AutonomousSecurityAgentV2:
                 validated = validate_structured_response(
                     raw_analysis, analysis_schema,
                 )
+                initial_validated = validated
                 # See validate_dataflow above for the retry rationale.
                 validated = attempt_quality_retry(
                     self.llm, validated, prompt, analysis_schema,
                     system_prompt=system_prompt, task_type=TaskType.ANALYSE,
                     threshold=0.5,
                 )
-            analysis = validated.data
+            from packages.llm_analysis.dispatch import strip_dispatch_metadata
+            analysis = strip_dispatch_metadata(validated.data)
+            # A higher-quality retry can be served by a different fallback
+            # route, but the shared retry helper returns only validated
+            # content. Retain per-finding route metadata only when the selected
+            # result is the response object whose provenance we observed.
+            vuln.analysis_metadata = (
+                response_metadata if validated is initial_validated else {}
+            )
             if validated.quality < 0.5:
                 logger.warning(
                     "Low-quality LLM response "
@@ -1786,6 +1834,7 @@ class AutonomousSecurityAgentV2:
             return True
 
         except Exception as e:  # noqa: BLE001
+            _raise_if_policy_error(e)
             logger.error("✗ LLM analysis failed: %s", e)
             if _is_auth_error(e):
                 print(
@@ -2629,6 +2678,7 @@ class AutonomousSecurityAgentV2:
             return False
 
         except Exception as e:  # noqa: BLE001
+            _raise_if_policy_error(e)
             logger.error("   ✗ Exploit generation failed: %s", e)
             if _is_auth_error(e):
                 print("⚠️  LLM authentication failed — check your API key.")
@@ -3196,6 +3246,7 @@ class AutonomousSecurityAgentV2:
             return True
 
         except Exception as e:  # noqa: BLE001
+            _raise_if_policy_error(e)
             logger.error("   ✗ Patch generation failed: %s", e)
             if _is_auth_error(e):
                 print("⚠️  LLM authentication failed — check your API key.")
@@ -4551,7 +4602,9 @@ class AutonomousSecurityAgentV2:
                 logger.info("")
             logger.info("LLM Statistics:")
             logger.info("   Total requests: %s", llm_stats['total_requests'])
-            logger.info("   Total cost: $%.4f", llm_stats['total_cost'])
+            accounting_text = _format_analysis_accounting(llm_stats)
+            if accounting_text:
+                logger.info("   Accounting: %s", accounting_text)
             logger.info("   Execution time: %.1fs", execution_time)
         if not is_prep_only:
             logger.info("")
@@ -5072,7 +5125,9 @@ def main() -> None:
                 f"tool calls {tl['tool_calls_served']} served / "
                 f"{tl['tool_calls_refused']} refused"
             )
-        print(f"LLM cost: ${report['llm_stats']['total_cost']:.4f}")
+        accounting_text = _format_analysis_accounting(report["llm_stats"])
+        if accounting_text:
+            print(f"LLM accounting: {accounting_text}")
         print(f"Output: {out_dir}")
         print("=" * 70)
 
