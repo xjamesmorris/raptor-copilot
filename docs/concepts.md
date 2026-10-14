@@ -76,29 +76,30 @@ Claude Code becomes the fallback.
 
 RAPTOR has two separate cost surfaces:
 
-**Orchestration (Claude Code subscription).** The Claude Code session that runs
-RAPTOR uses your subscription (Max, Pro, Team, or Enterprise) or an Anthropic
-API key.  This covers all interactive reasoning: reading code, interpreting
-results, deciding what to do next.
+**Orchestration (Claude Code account).** The Claude Code session that runs
+RAPTOR uses the account and billing mode configured for that CLI. RAPTOR does
+not infer whether a particular call is included in a subscription or billed
+separately.
 
 **Analysis dispatch (per-token API calls).** When `/agentic` or `/codeql
 --analyze` dispatches findings to an external LLM, those calls are billed per
-token to the configured provider.  If you only use Claude Code as the analysis
-model (the default), there is no extra cost beyond your subscription.  If you
-configure external models (OpenAI, Gemini, etc.), those API calls are billed to
-those providers.
+token to the configured provider. Claude CLI-reported amounts are estimates;
+an absent amount is unknown rather than zero. External API routes use
+versioned catalog or configured-rate estimates unless a provider supplies
+stronger evidence.
 
-A per-run budget cap (`--max-cost-usd`, default $10) prevents runaway spend on
-the dispatch layer.  The cap is enforced atomically -- concurrent analysis
-workers cannot race past it.  Cost is tracked in real time and reported at run
-end.
+The default per-run budget (`--max-cost-usd`, default $10) is advisory. RAPTOR
+atomically reserves estimates so concurrent workers share the same budget
+state, but no current provider supports a preemptive provider-enforced USD hard
+limit. Reports keep provider-billed USD, estimated USD, subscription calls,
+unknown calls, and unresolved failed-attempt exposure separate.
 
 | Scenario | Orchestration cost | Dispatch cost |
 |----------|--------------------|---------------|
 | `/scan` (no LLM) | Subscription | None |
-| `/agentic` with Claude Code as analyser | Subscription | Subscription (same) |
-| `/agentic --model gemini-2.5-pro` | Subscription | Gemini API |
-| `/agentic` with Ollama | Subscription | Free (local) |
+| `/agentic` with Claude Code as analyser | Account-dependent | CLI-reported estimate or unknown |
+| `/agentic --model gemini-2.5-pro` | Account-dependent | Catalog estimate for Gemini API |
+| `/agentic` with Ollama | Account-dependent | Unknown (a URL does not prove local/no-charge execution) |
 
 See [LLM providers](llm.md) for token pricing, budget configuration, and
 credential isolation.
