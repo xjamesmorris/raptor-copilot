@@ -1,0 +1,2 @@
+72 44 0:52 / /home rw,relatime - btrfs /dev/mapper/root rw,space_cache=v2,subvolid=256,subvol=/home
+73 72 0:52 /projects /home/runner rw,relatime - btrfs /dev/mapper/root rw,space_cache=v2,subvolid=300,subvol=/projects
