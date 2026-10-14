@@ -4933,9 +4933,9 @@ class ClaudeCodeLLMProvider(LLMProvider):
         )
 
         if sr.error:
-            error = CCTransportError(sr.error)
-            attach_cost_observation(error, observation)
-            raise error
+            transport_error = CCTransportError(sr.error)
+            attach_cost_observation(transport_error, observation)
+            raise transport_error
 
         # The claude-code harness reports the model it used in the
         # stream-json output; treat that as the resolved snapshot. But
@@ -5086,9 +5086,9 @@ class ClaudeCodeLLMProvider(LLMProvider):
             result = self._parse_stream_content(sr.content)
             if isinstance(result, dict) and "error" in result and result["error"]:
                 msg = f"claude -p structured parse failed: {result['error']}"
-                error = RuntimeError(msg)
-                attach_cost_observation(error, observation)
-                raise error
+                parse_error = RuntimeError(msg)
+                attach_cost_observation(parse_error, observation)
+                raise parse_error
 
         return StructuredResponse(
             result=result,

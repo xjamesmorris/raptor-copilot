@@ -1070,7 +1070,7 @@ def _failure_disposition(error: Exception) -> str:
     return "fatal"
 
 
-def _billed_failure_usage(error: Exception) -> tuple[float, int, int]:
+def _billed_failure_usage(error: BaseException) -> tuple[float, int, int]:
     """(cost_usd, tokens_in, tokens_out) a failed attempt already paid.
 
     Provider shape/truncation guards stamp ``billed_*`` attributes on
