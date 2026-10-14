@@ -95,6 +95,11 @@ class PlumbingReason(str, Enum):
     SIDECAR_POLICY_VIOLATION = "sidecar_policy_violation"
     SIDECAR_PARSE_FAILED = "sidecar_parse_failed"
     SIDECAR_DIGEST_MISMATCH = "sidecar_digest_mismatch"
+    SIDECAR_LIMIT_EXCEEDED = "sidecar_limit_exceeded"
+    SESSION_ENTRY_MISSING = "session_entry_missing"
+    SESSION_ENTRY_INVALID = "session_entry_invalid"
+    SESSION_ENTRY_POLICY_VIOLATION = "session_entry_policy_violation"
+    SESSION_ENTRY_WRITE_FAILED = "session_entry_write_failed"
     POINTER_MISSING = "pointer_missing"
     POINTER_INVALID = "pointer_invalid"
     POINTER_WRITE_FAILED = "pointer_write_failed"
@@ -111,10 +116,13 @@ class PlumbingReason(str, Enum):
     STATE_NOT_FINAL = "state_not_final"
     CAS_CONFLICT = "cas_conflict"
     CONCURRENT_FINALIZER = "concurrent_finalizer"
+    SESSION_REPLACED = "session_replaced"
     STATIC_VERIFICATION_FAILED = "static_verification_failed"
+    RECEIPT_STATE_REJECTED = "receipt_state_rejected"
     COLLECTION_ADAPTATION_FAILED = "collection_adaptation_failed"
     SIDECAR_STILL_REFERENCED = "sidecar_still_referenced"
     SIDECAR_CLEANUP_INCOMPLETE = "sidecar_cleanup_incomplete"
+    SESSION_ENTRY_CLEANUP_INCOMPLETE = "session_entry_cleanup_incomplete"
     POINTER_CLEANUP_INCOMPLETE = "pointer_cleanup_incomplete"
 
 
@@ -174,6 +182,7 @@ _REASONS_BY_DISPOSITION = {
         {
             PlumbingReason.CAS_CONFLICT,
             PlumbingReason.CONCURRENT_FINALIZER,
+            PlumbingReason.SESSION_REPLACED,
         }
     ),
     PlumbingDisposition.PERSISTENCE_FAILED: frozenset(
@@ -188,6 +197,11 @@ _REASONS_BY_DISPOSITION = {
             PlumbingReason.SIDECAR_POLICY_VIOLATION,
             PlumbingReason.SIDECAR_PARSE_FAILED,
             PlumbingReason.SIDECAR_DIGEST_MISMATCH,
+            PlumbingReason.SIDECAR_LIMIT_EXCEEDED,
+            PlumbingReason.SESSION_ENTRY_MISSING,
+            PlumbingReason.SESSION_ENTRY_INVALID,
+            PlumbingReason.SESSION_ENTRY_POLICY_VIOLATION,
+            PlumbingReason.SESSION_ENTRY_WRITE_FAILED,
             PlumbingReason.POINTER_MISSING,
             PlumbingReason.POINTER_INVALID,
             PlumbingReason.POINTER_WRITE_FAILED,
@@ -195,12 +209,16 @@ _REASONS_BY_DISPOSITION = {
         }
     ),
     PlumbingDisposition.RECEIPT_REJECTED: frozenset(
-        {PlumbingReason.STATIC_VERIFICATION_FAILED}
+        {
+            PlumbingReason.STATIC_VERIFICATION_FAILED,
+            PlumbingReason.RECEIPT_STATE_REJECTED,
+        }
     ),
     PlumbingDisposition.CLEANUP_FAILED: frozenset(
         {
             PlumbingReason.SIDECAR_STILL_REFERENCED,
             PlumbingReason.SIDECAR_CLEANUP_INCOMPLETE,
+            PlumbingReason.SESSION_ENTRY_CLEANUP_INCOMPLETE,
             PlumbingReason.POINTER_CLEANUP_INCOMPLETE,
         }
     ),

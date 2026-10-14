@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import hmac
 import os
+import re
 import stat
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -41,6 +42,12 @@ from .reasons import ReceiptRejection
 from .schema import RuntimeReceipt
 from .verify import parse_receipt, serialize_receipt
 
+MAX_SESSION_ENTRY_BYTES = 16_384
+_RECEIPT_FILE_RE = re.compile(
+    r"^(?P<pid>[1-9][0-9]{0,19})\.receipt\."
+    r"(?P<digest>[0-9a-f]{64})\.json(?P<temporary>\.tmp)?$"
+)
+
 
 class PersistenceCrashPoint(str, Enum):
     """Deterministic test seams around durable write and cleanup boundaries."""
@@ -56,6 +63,14 @@ class PersistenceCrashPoint(str, Enum):
     BEFORE_CLEANUP = "before_cleanup"
     AFTER_POINTER_UNLINK = "after_pointer_unlink"
     AFTER_SIDECAR_UNLINK = "after_sidecar_unlink"
+    BEFORE_ENTRY_TEMP_CREATE = "before_entry_temp_create"
+    AFTER_ENTRY_TEMP_WRITE = "after_entry_temp_write"
+    AFTER_ENTRY_TEMP_FSYNC = "after_entry_temp_fsync"
+    AFTER_ENTRY_RENAME = "after_entry_rename"
+    AFTER_ENTRY_PARENT_FSYNC = "after_entry_parent_fsync"
+    AFTER_ENTRY_REREAD = "after_entry_reread"
+    BEFORE_ENTRY_UNLINK = "before_entry_unlink"
+    AFTER_ENTRY_UNLINK = "after_entry_unlink"
 
 
 CrashInjector = Callable[[PersistenceCrashPoint], None]
@@ -102,6 +117,14 @@ def _after_sidecar_read(root_fd: int, file_name: str, file_fd: int) -> None:
 
 def _after_pointer_read(root_fd: int, file_name: str, file_fd: int) -> None:
     """Test seam between the first and final pointer fstat."""
+
+
+def _after_session_entry_read(
+    root_fd: int,
+    file_name: str,
+    file_fd: int,
+) -> None:
+    """Test seam between the first and final session-entry fstat."""
 
 
 def _current_euid() -> int:
@@ -531,6 +554,19 @@ def _atomic_write_at(
     raw: bytes,
     reason: PlumbingReason,
     fault: CrashInjector | None,
+    crash_points: tuple[
+        PersistenceCrashPoint,
+        PersistenceCrashPoint,
+        PersistenceCrashPoint,
+        PersistenceCrashPoint,
+        PersistenceCrashPoint,
+    ] = (
+        PersistenceCrashPoint.BEFORE_TEMP_CREATE,
+        PersistenceCrashPoint.AFTER_TEMP_WRITE,
+        PersistenceCrashPoint.AFTER_TEMP_FSYNC,
+        PersistenceCrashPoint.AFTER_RENAME,
+        PersistenceCrashPoint.AFTER_PARENT_FSYNC,
+    ),
 ) -> None:
     if _stat_at(root_fd, temporary_name) is not None:
         _abort(
@@ -538,7 +574,10 @@ def _atomic_write_at(
             reason,
             stage="temp_exists",
         )
-    _hit(fault, PersistenceCrashPoint.BEFORE_TEMP_CREATE)
+    before_create, after_write, after_fsync, after_rename, after_parent_fsync = (
+        crash_points
+    )
+    _hit(fault, before_create)
     flags = (
         os.O_WRONLY
         | os.O_CREAT
@@ -564,9 +603,9 @@ def _atomic_write_at(
     try:
         os.fchmod(file_fd, 0o600)
         _write_all(file_fd, raw, reason=reason)
-        _hit(fault, PersistenceCrashPoint.AFTER_TEMP_WRITE)
+        _hit(fault, after_write)
         os.fsync(file_fd)
-        _hit(fault, PersistenceCrashPoint.AFTER_TEMP_FSYNC)
+        _hit(fault, after_fsync)
         temporary_stat = os.fstat(file_fd)
         _validate_regular_stat(
             temporary_stat,
@@ -590,9 +629,9 @@ def _atomic_write_at(
             src_dir_fd=root_fd,
             dst_dir_fd=root_fd,
         )
-        _hit(fault, PersistenceCrashPoint.AFTER_RENAME)
+        _hit(fault, after_rename)
         os.fsync(root_fd)
-        _hit(fault, PersistenceCrashPoint.AFTER_PARENT_FSYNC)
+        _hit(fault, after_parent_fsync)
     except OSError as exc:
         _abort(
             PlumbingDisposition.PERSISTENCE_FAILED,
@@ -684,6 +723,46 @@ def _read_sidecar_at(
         reference,
         _read_sidecar_raw_at(root_fd, reference),
     )
+
+
+def _read_session_entry_raw_at(
+    root_fd: int,
+    pid: CanonicalPid,
+) -> bytes:
+    return _read_regular_at(
+        root_fd,
+        pid.text,
+        max_bytes=MAX_SESSION_ENTRY_BYTES,
+        missing_reason=PlumbingReason.SESSION_ENTRY_MISSING,
+        policy_reason=PlumbingReason.SESSION_ENTRY_POLICY_VIOLATION,
+        read_reason=PlumbingReason.SESSION_ENTRY_INVALID,
+        after_read=_after_session_entry_read,
+    )
+
+
+def session_entry_temporary_name(pid: CanonicalPid) -> str:
+    """Return the one exact temporary name used by host-v2 entry writes."""
+    if not isinstance(pid, CanonicalPid):
+        raise TypeError("pid must be CanonicalPid")
+    return f".{pid.text}.receipt-entry.tmp"
+
+
+def _receipt_file_name_valid(
+    pid: CanonicalPid,
+    file_name: str,
+    *,
+    temporary: bool,
+) -> bool:
+    if not isinstance(file_name, str):
+        return False
+    match = _RECEIPT_FILE_RE.fullmatch(file_name)
+    if match is None or bool(match.group("temporary")) is not temporary:
+        return False
+    try:
+        named_pid = CanonicalPid.parse(match.group("pid"))
+    except ValueError:
+        return False
+    return named_pid == pid
 
 
 def _read_pointer_raw_at(
@@ -879,6 +958,244 @@ def read_receipt_sidecar(
                     stage="sidecar_postlock",
                 )
             return stored
+        finally:
+            _recheck_root(root_handle)
+            os.close(root_handle.fd)
+    except _PersistenceAbort as exc:
+        return exc.failure
+
+
+def read_receipt_sidecar_bytes_for_registry(
+    root: Path,
+    reference: ReceiptReference,
+) -> bytes | PlumbingFailure:
+    """Read immutable sidecar bytes without taking the storage lock.
+
+    Real-registry callers use this only while holding the separate session
+    lock. Content-addressed policy and read/re-stat checks still apply.
+    """
+    if not isinstance(reference, ReceiptReference):
+        raise TypeError("reference must be ReceiptReference")
+    try:
+        root_handle = _open_root(root)
+        try:
+            return _read_sidecar_raw_at(root_handle.fd, reference)
+        finally:
+            _recheck_root(root_handle)
+            os.close(root_handle.fd)
+    except _PersistenceAbort as exc:
+        return exc.failure
+
+
+def read_receipt_file_bytes(
+    root: Path,
+    pid: CanonicalPid,
+    file_name: str,
+) -> bytes | PlumbingFailure:
+    """Read one validated immutable receipt filename under its storage lock."""
+    if not isinstance(pid, CanonicalPid):
+        raise TypeError("pid must be CanonicalPid")
+    if not _receipt_file_name_valid(pid, file_name, temporary=False):
+        return plumbing_failure(
+            PlumbingDisposition.INVALID_REQUEST,
+            PlumbingReason.INVALID_RECEIPT_REFERENCE,
+        )
+    try:
+        root_handle = _open_root(root)
+        try:
+            with _strict_lock(root_handle, pid):
+                return _read_regular_at(
+                    root_handle.fd,
+                    file_name,
+                    max_bytes=MAX_RECEIPT_BYTES,
+                    missing_reason=PlumbingReason.SIDECAR_MISSING,
+                    policy_reason=PlumbingReason.SIDECAR_POLICY_VIOLATION,
+                    read_reason=PlumbingReason.SIDECAR_READ_FAILED,
+                    after_read=_after_sidecar_read,
+                )
+        finally:
+            _recheck_root(root_handle)
+            os.close(root_handle.fd)
+    except _PersistenceAbort as exc:
+        return exc.failure
+
+
+def read_session_entry_bytes(
+    root: Path,
+    pid: CanonicalPid,
+    *,
+    missing_ok: bool = False,
+) -> bytes | None | PlumbingFailure:
+    """Read one exact PID entry with the hardened regular-file policy."""
+    if not isinstance(pid, CanonicalPid):
+        raise TypeError("pid must be CanonicalPid")
+    try:
+        root_handle = _open_root(root)
+        try:
+            if missing_ok and _stat_at(root_handle.fd, pid.text) is None:
+                return None
+            return _read_session_entry_raw_at(root_handle.fd, pid)
+        finally:
+            _recheck_root(root_handle)
+            os.close(root_handle.fd)
+    except _PersistenceAbort as exc:
+        return exc.failure
+
+
+def write_session_entry_bytes(
+    root: Path,
+    pid: CanonicalPid,
+    raw: bytes,
+    *,
+    fault: CrashInjector | None = None,
+) -> bytes | PlumbingFailure:
+    """Atomically write and byte-verify one real-registry PID entry.
+
+    The caller holds the PID's session lock. This helper never takes the
+    receipt-storage lock and performs no receipt or reference parsing.
+    """
+    if not isinstance(pid, CanonicalPid):
+        raise TypeError("pid must be CanonicalPid")
+    if type(raw) is not bytes or not raw or len(raw) > MAX_SESSION_ENTRY_BYTES:
+        return plumbing_failure(
+            PlumbingDisposition.INVALID_REQUEST,
+            PlumbingReason.SESSION_ENTRY_INVALID,
+        )
+    try:
+        root_handle = _open_root(root)
+        try:
+            _atomic_write_at(
+                root_handle.fd,
+                final_name=pid.text,
+                temporary_name=session_entry_temporary_name(pid),
+                raw=raw,
+                reason=PlumbingReason.SESSION_ENTRY_WRITE_FAILED,
+                fault=fault,
+                crash_points=(
+                    PersistenceCrashPoint.BEFORE_ENTRY_TEMP_CREATE,
+                    PersistenceCrashPoint.AFTER_ENTRY_TEMP_WRITE,
+                    PersistenceCrashPoint.AFTER_ENTRY_TEMP_FSYNC,
+                    PersistenceCrashPoint.AFTER_ENTRY_RENAME,
+                    PersistenceCrashPoint.AFTER_ENTRY_PARENT_FSYNC,
+                ),
+            )
+            observed = _read_session_entry_raw_at(root_handle.fd, pid)
+            if not hmac.compare_digest(observed, raw):
+                _abort(
+                    PlumbingDisposition.PERSISTENCE_FAILED,
+                    PlumbingReason.SESSION_ENTRY_WRITE_FAILED,
+                    stage="entry_reread",
+                )
+            _hit(fault, PersistenceCrashPoint.AFTER_ENTRY_REREAD)
+            return observed
+        finally:
+            _recheck_root(root_handle)
+            os.close(root_handle.fd)
+    except _PersistenceAbort as exc:
+        return exc.failure
+
+
+def unlink_session_entry_if_bytes(
+    root: Path,
+    pid: CanonicalPid,
+    expected_raw: bytes,
+    *,
+    fault: CrashInjector | None = None,
+) -> bool | PlumbingFailure:
+    """Unlink one real-registry entry only when its full bytes still match."""
+    if not isinstance(pid, CanonicalPid):
+        raise TypeError("pid must be CanonicalPid")
+    if (
+        type(expected_raw) is not bytes
+        or not expected_raw
+        or len(expected_raw) > MAX_SESSION_ENTRY_BYTES
+    ):
+        return plumbing_failure(
+            PlumbingDisposition.INVALID_REQUEST,
+            PlumbingReason.SESSION_ENTRY_INVALID,
+        )
+    try:
+        root_handle = _open_root(root)
+        try:
+            observed = _read_session_entry_raw_at(root_handle.fd, pid)
+            if not hmac.compare_digest(observed, expected_raw):
+                _abort(
+                    PlumbingDisposition.STATE_CONFLICT,
+                    PlumbingReason.SESSION_REPLACED,
+                    stage="entry_unlink_recheck",
+                )
+            _hit(fault, PersistenceCrashPoint.BEFORE_ENTRY_UNLINK)
+            try:
+                os.unlink(pid.text, dir_fd=root_handle.fd)
+                os.fsync(root_handle.fd)
+            except OSError as exc:
+                _abort(
+                    PlumbingDisposition.CLEANUP_FAILED,
+                    PlumbingReason.SESSION_ENTRY_CLEANUP_INCOMPLETE,
+                    stage="entry_unlink",
+                    error_number=exc.errno,
+                )
+            _hit(fault, PersistenceCrashPoint.AFTER_ENTRY_UNLINK)
+            return True
+        finally:
+            _recheck_root(root_handle)
+            os.close(root_handle.fd)
+    except _PersistenceAbort as exc:
+        return exc.failure
+
+
+def unlink_session_entry_temporary(
+    root: Path,
+    pid: CanonicalPid,
+) -> bool | PlumbingFailure:
+    """Remove only the exact host-v2 session-entry temporary."""
+    if not isinstance(pid, CanonicalPid):
+        raise TypeError("pid must be CanonicalPid")
+    try:
+        root_handle = _open_root(root)
+        try:
+            _unlink_regular_at(
+                root_handle.fd,
+                session_entry_temporary_name(pid),
+                max_bytes=MAX_SESSION_ENTRY_BYTES,
+                allow_empty=True,
+                reason=PlumbingReason.SESSION_ENTRY_CLEANUP_INCOMPLETE,
+            )
+            return True
+        finally:
+            _recheck_root(root_handle)
+            os.close(root_handle.fd)
+    except _PersistenceAbort as exc:
+        return exc.failure
+
+
+def unlink_receipt_file_exact(
+    root: Path,
+    pid: CanonicalPid,
+    file_name: str,
+    *,
+    temporary: bool = False,
+) -> bool | PlumbingFailure:
+    """Remove one validated receipt sidecar or temporary by exact name."""
+    if not isinstance(pid, CanonicalPid):
+        raise TypeError("pid must be CanonicalPid")
+    if not _receipt_file_name_valid(pid, file_name, temporary=temporary):
+        return plumbing_failure(
+            PlumbingDisposition.INVALID_REQUEST,
+            PlumbingReason.INVALID_RECEIPT_REFERENCE,
+        )
+    try:
+        root_handle = _open_root(root)
+        try:
+            with _strict_lock(root_handle, pid):
+                _unlink_regular_at(
+                    root_handle.fd,
+                    file_name,
+                    max_bytes=MAX_RECEIPT_BYTES,
+                    allow_empty=temporary,
+                    reason=PlumbingReason.SIDECAR_CLEANUP_INCOMPLETE,
+                )
+            return True
         finally:
             _recheck_root(root_handle)
             os.close(root_handle.fd)
@@ -1375,6 +1692,7 @@ def cleanup_pointer_temporary(
 
 __all__ = [
     "CrashInjector",
+    "MAX_SESSION_ENTRY_BYTES",
     "PersistenceCrashPoint",
     "cleanup_pointer_temporary",
     "cleanup_selected_receipt",
@@ -1383,6 +1701,14 @@ __all__ = [
     "compare_and_swap_modeled_pointer",
     "initialize_modeled_pointer",
     "read_modeled_pointer",
+    "read_receipt_file_bytes",
     "read_receipt_sidecar",
+    "read_receipt_sidecar_bytes_for_registry",
+    "read_session_entry_bytes",
+    "session_entry_temporary_name",
+    "unlink_receipt_file_exact",
+    "unlink_session_entry_if_bytes",
+    "unlink_session_entry_temporary",
+    "write_session_entry_bytes",
     "write_receipt_sidecar",
 ]
