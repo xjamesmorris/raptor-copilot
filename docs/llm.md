@@ -256,10 +256,11 @@ contradicts the configured region.
   limit at construction time. `RAPTOR_LLM_STREAM_TRANSPORT=1` carries
   otherwise-non-streaming calls (plain generation AND instructor
   structured generation) over SSE — see Long Structured Calls below.
-- **Multi-model panels:** two entries that peel to the same
-  underlying model (e.g. a Bedrock id and its direct-API name) log a
-  same-weights warning — their agreement is transport consistency,
-  not independent consensus.
+- **Multi-model panels:** two route-qualified entries that peel to the same
+  declared model (for example, a Bedrock ID and its direct-API name) are
+  rejected before submission. Their agreement would measure transport
+  consistency, not independent consensus. Distinct models from the same
+  family remain valid, as do explicit `#sc0`/`#sc1` self-consistency handles.
 
 ### Long Structured Calls
 
@@ -397,6 +398,17 @@ primary — resolvable whenever the `claude` binary is installed.
 5. Shorthand resolution: bare tokens like `haiku`, `opus`, `sonnet` match against
    configured model names. Ambiguous matches raise an error.
 
+Core callers that require an immutable route can construct
+`LLMClient(pinned_config=ModelConfig(...))`. This disables fallback and task
+specialization and revalidates the provider, model, and route fields before
+every fresh, structured-repair, or tool-use dispatch. Exact-pinned clients do
+not read or write the shared response cache because its logical identity
+cannot attest the pin's full route. Mutating the configuration or supplying a
+different per-call route raises `PinnedRouteViolation`; error messages do not
+include credentials or endpoint values. Legacy provider-only pins such as
+`pinned_model="claudecode"` remain advisory provider selection, not an
+exact-model attestation.
+
 ### Fast-Tier Models
 
 Certain task types (`verdict_binary`, `classify`) automatically use cheaper models:
@@ -484,13 +496,26 @@ Beyond per-call recording, four producers run at analysis time:
 
 Controlled by `LLMConfig.scorecard_enabled` (default `True`).
 
+The current scorecard schema is v2 and is keyed only by model name. Existing
+unambiguous API and Claude CLI routes continue recording numeric history for
+compatibility, but the CLI labels every persisted dollar value
+**Estimated USD (legacy; authority unknown)**. Routes whose provider declares
+model-name aggregation unsafe, and configurations that reuse one model name
+across different routes, fail closed: trust reads return learning/no data and
+writes are refused without modifying the sidecar. Unknown and subscription
+cost observations are not inserted as zero-cost calls, and provider-billed
+observations cannot be represented in v2.
+
 ## Cost Management
 
-### Budget Cap
+### Advisory Budget and Strict Contracts
 
-`LLMConfig.max_cost_per_scan` sets a USD budget cap (default $10.00). Enforced via
-atomic pre-debit reservation before each provider call. Concurrent dispatchers cannot
-race past the cap. Override with `--max-cost-usd` on the CLI.
+`LLMConfig.max_cost_per_scan` remains an **advisory** USD budget by default
+(`usd_budget_contract="advisory"`). The client atomically reserves an estimated
+amount before each provider call, so concurrent dispatchers see in-flight
+estimates, then reconciles successful attempts to the observed amount. This is
+not a provider-native hard ceiling: a call can cost more than its reservation,
+and a timed-out process may continue billing upstream.
 
 **Note:** there is no `RAPTOR_MAX_COST` environment variable — no code reads it.
 The budget cap is set via `--max-cost-usd` (CLI), `max_cost_per_scan` (config), or —
@@ -551,10 +576,40 @@ outcomes, sustained for at least 5 minutes. Each is env-overridable
 `RAPTOR_LLM_BREAKER=0` disables the breaker for a run — see
 [Environment Variables](environment.md).
 
+### Strict Accounting Admission
+
+Library callers can opt into stronger accounting admission:
+
+- `authoritative_required` permits `provider_billed`, or
+  `catalog_priced`/`configured_rate` only when the operator declares that exact
+  `(provider, model, basis)` in `trusted_usd_routes`. The default declaration
+  set is empty. A failed attempt with no authorized observation latches the
+  client or tool loop: no retry, fallback, or later fresh call is allowed.
+  Its retained reservation is reported only as an estimate; actual exposure
+  remains unknown.
+- `hard_limit_required` is explicitly unsupported for every current provider
+  and refuses before dispatch. No current transport proves a preemptive,
+  provider-enforced USD limit.
+
+Cache hits remain usable because they dispatch no new provider request.
+
 ### Token Pricing
 
-Per-1K-token input/output rates are maintained in `core/llm/model_data.py` for every
-known model, verified against provider pricing pages. Includes:
+RAPTOR preserves the existing numeric cost fields and adds a basis to explain
+what each number means:
+
+- `provider_billed`: provider/invoice-reported USD. No current provider emits
+  this basis.
+- `catalog_priced`: provider token counts multiplied by RAPTOR's versioned
+  price catalog.
+- `configured_rate`: an operator-supplied flat rate.
+- `cli_reported`: the Claude CLI's `total_cost_usd` when that field was
+  actually present, including an explicit `0.0`.
+- `subscription`: incremental USD is not represented.
+- `unknown`: no trustworthy USD amount is available.
+
+Per-1K-token input/output rates are maintained in `core/llm/model_data.py` for
+known models. Catalog arithmetic includes:
 
 - Bedrock cross-region surcharge (10%, applied to geo-prefixed models with a
   confirmed `global.` cross-region SKU; other geo prefixes stay at 1.0x)
@@ -562,12 +617,18 @@ known model, verified against provider pricing pages. Includes:
   1-hour cache writes, 0.1x for cache reads)
 - Thinking/reasoning tokens billed at output rate across all providers
 
-Unknown models log a warning and record $0 cost (budget caps silently defeated).
+For compatibility, legacy numeric fields remain numeric and therefore use
+`0.0` when no USD amount is available. The additive accounting fields mark
+that observation `unknown` or `subscription`, set `usd_total_complete=false`,
+and exclude it from cost means and scorecard denominators. Reports must not
+interpret that compatibility zero as free or authoritative.
 
 ### Viewing Costs
 
-Costs are reported at the end of each run. The scorecard also tracks cumulative
-per-model cost and token usage.
+Core statistics report per-basis subtotals and counts, incomplete totals,
+unknown failed attempts, and unresolved exposure. The scorecard retains
+cumulative legacy estimated cost and token history for eligible existing
+routes; its USD values are not evidence for a strict budget contract.
 
 ## Transcript Record / Replay
 
@@ -638,6 +699,49 @@ No operator configuration is needed — the defaults adapt automatically.
 If a provider is consistently throttled, RAPTOR logs the effective rate
 at run end.
 
+## Response Cache Identity
+
+Free-form and structured response-cache keys are versioned and include the
+normalized routing provider as well as the requested model, prompt, system
+prompt, generation options, and (for structured calls) schema. The same model
+name reached through two providers therefore uses separate cache entries.
+Cache identity never includes API keys, credentials, or endpoint URLs.
+
+Exact-pinned clients intentionally bypass shared response-cache reads and
+writes, including pins whose route fields use defaults. Every exact-pinned call
+therefore dispatches fresh until a separately reviewed cache format can carry
+full-route evidence. This does not prove that two default-looking routes used
+different endpoints; it means the logical cache entry cannot prove which full
+route produced it. Ordinary unpinned clients and legacy provider-only advisory
+pins retain the shared-cache behavior described below.
+
+Fallback output remains filed under the originally requested route so repeated
+requests retain the existing fallback behavior. The MAC-covered entry records
+that requested route separately from the provider/model that actually served
+the response; cache replays report the serving route rather than relabeling it
+as the primary.
+
+Before replay, RAPTOR rechecks the stored serving provider/model against the
+same current candidate list used for a cold call. Disabling fallback, removing
+or disabling its `ModelConfig`, crossing the local/cloud tier boundary,
+same-name fallback suppression, and per-call `exclude_fallback_to` therefore
+turn a previously warmed fallback entry into a miss. Re-enabling the route can
+reuse the same entry; policy state is not added to the key. Daily quota
+throttling is intentionally separate: it blocks a new provider round-trip but
+does not de-authorize an already-produced eligible cache entry.
+
+When a provider reports an optional concrete `resolved_model` snapshot, RAPTOR
+stores it separately from the logical provider/model route and preserves it on
+replay. The field is covered by cache integrity, but it remains provider
+self-report, not served-model attestation and not an authorization input.
+Missing or malformed values remain unknown (`None`); RAPTOR never fabricates a
+snapshot from the configured alias.
+
+Entries written before route-qualified identity was introduced are safe misses:
+RAPTOR does not infer a provider from legacy response fields or migrate those
+records in place. Legacy files can remain until normal size-based eviction or
+operator cleanup; the first matching call writes a fresh route-qualified entry.
+Integrity verification and tamper quarantine continue to apply unchanged.
 
 ## Credential Isolation
 

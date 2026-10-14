@@ -1524,9 +1524,20 @@
     "kind": "literal",
     "note": "Claude Code backend-selection env vars (infrastructure constants, not a learnable name vocabulary); grew to 10 when the Bedrock Mantle flag joined the calibration signature"
   },
-  "core/llm/client.py::flush_usage_to_scorecard": {
+  "core/llm/accounting.py::as_dict": {
+    "count": 16,
+    "kind": "literal",
+    "note": "accounting-summary serialization field names (per-basis USD subtotals and call counts, completeness/exposure flags, authoritative-remaining); additive report schema consumed by telemetry/policy tests, not a name vocabulary"
+  },
+  "core/llm/client.py::cur": {
+    "count": 14,
+    "kind": "literal",
+    "note": "per-alias usage accumulator fields (tokens, latency, cost, scorecard call counts) flushed into scorecard usage cells; ledger schema, not a name vocabulary"
+  },
+  "core/llm/client.py::usage_entry": {
     "count": 10,
-    "kind": "literal"
+    "kind": "literal",
+    "note": "scorecard _usage cell record fields (persistence schema; keys unchanged); not a name vocabulary"
   },
   "core/llm/coerce.py::_KNOWN_LANG_TAGS": {
     "count": 38,
@@ -1568,8 +1579,13 @@
     "kind": "literal"
   },
   "core/llm/scorecard/cli.py::_stats_to_json": {
-    "count": 18,
+    "count": 20,
     "kind": "literal"
+  },
+  "core/llm/scorecard/cli.py::out": {
+    "count": 11,
+    "kind": "literal",
+    "note": "scorecard CLI JSON summary fields incl. cost_basis; report schema asserted by CLI tests, not a name vocabulary"
   },
   "core/llm/scorecard/scorecard.py::cell": {
     "count": 14,
