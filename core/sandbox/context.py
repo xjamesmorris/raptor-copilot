@@ -1782,7 +1782,7 @@ def sandbox(block_network=_UNSET, target: str | None = None, output: str | None 
                 "sandbox(no_degrade=True) refuses a profile without the "
                 "mount/Landlock backend."
             )
-        profile_config = PROFILES.get(
+        profile_config: Mapping[str, Any] = PROFILES.get(
             selected_profile or DEFAULT_PROFILE,
             {},
         )
@@ -8270,10 +8270,11 @@ def sandbox(block_network=_UNSET, target: str | None = None, output: str | None 
         # Preserve backend-owned metadata (capture loss and backend id)
         # across _interpret_result(), whose legacy contract replaces
         # sandbox_info with its termination analysis.
-        _backend_info = dict(getattr(result, "sandbox_info", {}) or {})
+        result_meta: Any = result
+        _backend_info = dict(getattr(result_meta, "sandbox_info", {}) or {})
         # Interpret process termination for observability
         _interpret_result(result, cmd_display)
-        result.sandbox_info.update(_backend_info)
+        result_meta.sandbox_info.update(_backend_info)
 
         _capture_attrs = (
             "stdout_truncated",
@@ -8282,24 +8283,24 @@ def sandbox(block_network=_UNSET, target: str | None = None, output: str | None 
             "stderr_bytes_kept",
         )
         _capture_metadata_present = all(
-            hasattr(result, name) for name in _capture_attrs
+            hasattr(result_meta, name) for name in _capture_attrs
         )
-        result.sandbox_info["capture"] = {
+        result_meta.sandbox_info["capture"] = {
             "enabled": bool(kwargs.get("capture_output", False)),
             "stdout_truncated": (
-                bool(result.stdout_truncated)
+                bool(result_meta.stdout_truncated)
                 if _capture_metadata_present else None
             ),
             "stderr_truncated": (
-                bool(result.stderr_truncated)
+                bool(result_meta.stderr_truncated)
                 if _capture_metadata_present else None
             ),
             "stdout_bytes_kept": (
-                int(result.stdout_bytes_kept)
+                int(result_meta.stdout_bytes_kept)
                 if _capture_metadata_present else None
             ),
             "stderr_bytes_kept": (
-                int(result.stderr_bytes_kept)
+                int(result_meta.stderr_bytes_kept)
                 if _capture_metadata_present else None
             ),
         }
@@ -8318,7 +8319,7 @@ def sandbox(block_network=_UNSET, target: str | None = None, output: str | None 
         else:
             _backend = "linux-landlock-subprocess"
         if _backend is not None:
-            result.sandbox_info["backend"] = _backend
+            result_meta.sandbox_info["backend"] = _backend
         if (
             no_degrade
             and _backend != "linux-fork-mount-pid-netns"
@@ -8329,7 +8330,7 @@ def sandbox(block_network=_UNSET, target: str | None = None, output: str | None 
                 "sandbox(no_degrade=True) completed on an unexpected "
                 f"backend {_backend!r}; refusing the result."
             )
-        result.sandbox_info["degrade_waiver_honored"] = bool(
+        result_meta.sandbox_info["degrade_waiver_honored"] = bool(
             _degraded_untrusted_allowed(no_degrade=no_degrade)
             and (
                 not used_spawn
@@ -8337,7 +8338,7 @@ def sandbox(block_network=_UNSET, target: str | None = None, output: str | None 
                 or _mount_ns_degraded is not None
             )
         )
-        result.sandbox_info["no_degrade"] = bool(no_degrade)
+        result_meta.sandbox_info["no_degrade"] = bool(no_degrade)
 
         # Synthetic-result stamp transfer (EBADF teardown race): the
         # handler minted a CompletedProcess whose rc=-9 reflects no
@@ -8346,7 +8347,7 @@ def sandbox(block_network=_UNSET, target: str | None = None, output: str | None 
         # attached by _interpret_result above, so the handler parks
         # the stamp on the result object.
         if getattr(result, "_synthetic_ebadf", False):
-            result.sandbox_info["synthetic_result"] = (  # type: ignore[attr-defined]
+            result_meta.sandbox_info["synthetic_result"] = (
                 "ebadf-teardown-race")
 
         # Record whether mount-ns engaged on this run so per-run
