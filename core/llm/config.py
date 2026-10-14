@@ -18,6 +18,12 @@ from typing import Any, Optional
 
 from core.logging import get_logger
 
+from .accounting import (
+    TrustedUsdRoute,
+    UsdBudgetContract,
+    normalize_budget_contract,
+    normalize_trusted_routes,
+)
 from .detection import (
     OPENAI_SDK_AVAILABLE,
     _get_available_ollama_models,
@@ -1754,6 +1760,20 @@ class LLMConfig:
     max_seconds_per_scan: float | None = None   # wall-clock deadline
     max_calls_per_scan: int | None = None       # total provider calls
     max_tokens_per_scan: int | None = None      # aggregate tokens
+    # Existing budget arithmetic is advisory: estimates reserve headroom and
+    # completed observations reconcile later. Stronger contracts are explicit
+    # opt-ins and fail closed when a route lacks the required evidence.
+    usd_budget_contract: UsdBudgetContract = UsdBudgetContract.ADVISORY
+    # Operator declarations that allow catalog/configured estimates for an
+    # exact route to satisfy AUTHORITATIVE_REQUIRED. Nothing is trusted by
+    # default; these declarations are programmatic only and are not loaded
+    # from models.json.
+    trusted_usd_routes: tuple[TrustedUsdRoute, ...] = field(
+        default_factory=tuple,
+    )
+    # Exact pinned configurations disable every model-selection mechanism
+    # other than primary_model. Set through ``for_pinned_model``.
+    exact_pinned: bool = False
     # Model scorecard (core/llm/scorecard) — track per-model
     # reliability across decision classes and use measured miss-rate
     # to gate fast-tier short-circuit decisions. None or False
@@ -1807,6 +1827,26 @@ class LLMConfig:
         """
         from .task_types import FAST_TIER_TASKS
 
+        self.usd_budget_contract = normalize_budget_contract(
+            getattr(
+                self,
+                "usd_budget_contract",
+                UsdBudgetContract.ADVISORY,
+            ),
+        )
+        self.trusted_usd_routes = normalize_trusted_routes(
+            getattr(self, "trusted_usd_routes", ()) or (),
+        )
+        self.exact_pinned = bool(getattr(self, "exact_pinned", False))
+        if self.exact_pinned:
+            if self.primary_model is None:
+                raise ValueError(
+                    "exact pinned configuration requires primary_model",
+                )
+            self.enable_fallback = False
+            self.fallback_models = []
+            self.specialized_models = {}
+            return
         if self.primary_model is None:
             return
         fast_config = _build_fast_model_for(self.primary_model)
@@ -1814,6 +1854,33 @@ class LLMConfig:
             return
         for task in FAST_TIER_TASKS:
             self.specialized_models.setdefault(task, fast_config)
+
+    @classmethod
+    def for_pinned_model(
+        cls,
+        model: ModelConfig,
+        *,
+        usd_budget_contract: UsdBudgetContract | str = (
+            UsdBudgetContract.ADVISORY
+        ),
+        trusted_usd_routes: tuple[TrustedUsdRoute, ...] = (),
+    ) -> "LLMConfig":
+        """Build a no-fallback, no-specialization exact route config."""
+        if not isinstance(model, ModelConfig):
+            raise TypeError("model must be ModelConfig")
+        return cls(
+            primary_model=model,
+            fallback_models=[],
+            specialized_models={},
+            enable_fallback=False,
+            usd_budget_contract=normalize_budget_contract(
+                usd_budget_contract,
+            ),
+            trusted_usd_routes=normalize_trusted_routes(
+                trusted_usd_routes,
+            ),
+            exact_pinned=True,
+        )
 
     def _configured_models(self) -> list[ModelConfig]:
         """Every model the operator has configured: primary + fallbacks +
@@ -1995,9 +2062,10 @@ class LLMConfig:
         but the signature should match reality so type-checkers
         catch new callers that miss the guard.
         """
+        if getattr(self, "exact_pinned", False):
+            return self.primary_model
         if task_type in self.specialized_models:
             model = self.specialized_models[task_type]
             if model.enabled:
                 return model
         return self.primary_model
-

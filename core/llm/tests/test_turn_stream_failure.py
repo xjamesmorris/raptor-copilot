@@ -15,8 +15,17 @@ from typing import Any
 
 import pytest
 
+from core.llm.accounting import (
+    AttemptLedger,
+    CostBasis,
+    LLMAccountingUnavailableError,
+    RouteIdentity,
+    UsdBudgetContract,
+    cost_observation_from_exception,
+)
 from core.llm.config import ModelConfig
 from core.llm.providers import LLMProvider
+from core.testing import make_test_client
 
 
 # ---------------------------------------------------------------------------
@@ -64,7 +73,9 @@ def _text_chunk(text: str, usage: Any = None) -> SimpleNamespace:
     )
 
 
-def test_openai_midstream_failure_books_usage_and_raises_typed() -> None:
+def test_openai_midstream_failure_books_usage_and_raises_typed(
+    tmp_path,
+) -> None:
     provider = _openai_provider()
     stream = _ExplodingStream(
         [_text_chunk(
@@ -78,7 +89,7 @@ def test_openai_midstream_failure_books_usage_and_raises_typed() -> None:
     ))
 
     received: list[Any] = []
-    with pytest.raises(RuntimeError, match="stream failed mid-turn"):
+    with pytest.raises(RuntimeError, match="stream failed mid-turn") as excinfo:
         for chunk in provider.turn_stream([], []):
             received.append(chunk)
 
@@ -88,8 +99,33 @@ def test_openai_midstream_failure_books_usage_and_raises_typed() -> None:
     assert provider.total_input_tokens == 11
     assert provider.total_output_tokens == 4
     assert provider.total_cost > 0.0
+    observation = cost_observation_from_exception(excinfo.value)
+    assert observation is not None
+    assert observation.basis is CostBasis.CONFIGURED_RATE
     # The stream was still closed (finally ran).
     assert stream.closed
+
+    client = make_test_client(tmp_path / "advisory")
+    client.config.primary_model = provider.config
+    attempt = AttemptLedger(
+        route=RouteIdentity("openai", "test-model"),
+        reservation_usd=0.0,
+    )
+    assert client._settle_failed_attempt(attempt, excinfo.value) is None
+    assert client.get_stats()["accounting"]["configured_rate_calls"] == 1
+
+    strict = make_test_client(tmp_path / "strict")
+    strict.config.primary_model = provider.config
+    strict.config.enable_cost_tracking = True
+    strict.config.usd_budget_contract = (
+        UsdBudgetContract.AUTHORITATIVE_REQUIRED
+    )
+    strict_attempt = AttemptLedger(
+        route=RouteIdentity("openai", "test-model"),
+        reservation_usd=0.1,
+    )
+    policy = strict._settle_failed_attempt(strict_attempt, excinfo.value)
+    assert isinstance(policy, LLMAccountingUnavailableError)
 
 
 def test_openai_midstream_failure_estimates_output_when_no_usage() -> None:
@@ -154,12 +190,20 @@ def test_openai_healthy_stream_unchanged() -> None:
 
 
 def _anthropic_provider():
-    pytest.importorskip("anthropic")
     from core.llm.providers import AnthropicProvider
-    return AnthropicProvider(ModelConfig(
-        provider="anthropic", model_name="claude-opus-4-6",
-        api_key="test-key", timeout=1,
-    ))
+    provider = AnthropicProvider.__new__(AnthropicProvider)
+    LLMProvider.__init__(
+        provider,
+        ModelConfig(
+            provider="anthropic",
+            model_name="claude-opus-4-6",
+            api_key="test-key",
+            timeout=1,
+        ),
+    )
+    provider._stream_sse_ok = True
+    provider._caching_warning_emitted = True
+    return provider
 
 
 class _FakeAnthropicStream:
@@ -194,7 +238,9 @@ def _message_start(input_tokens: int, cache_read: int = 0,
     ))
 
 
-def test_anthropic_midstream_failure_books_usage_and_raises_typed() -> None:
+def test_anthropic_midstream_failure_books_usage_and_raises_typed(
+    tmp_path,
+) -> None:
     provider = _anthropic_provider()
     stream = _FakeAnthropicStream(
         [
@@ -208,7 +254,7 @@ def test_anthropic_midstream_failure_books_usage_and_raises_typed() -> None:
     ))
 
     received: list[Any] = []
-    with pytest.raises(RuntimeError, match="stream failed mid-turn"):
+    with pytest.raises(RuntimeError, match="stream failed mid-turn") as excinfo:
         for chunk in provider.turn_stream([], []):
             received.append(chunk)
 
@@ -220,7 +266,34 @@ def test_anthropic_midstream_failure_books_usage_and_raises_typed() -> None:
     assert provider.total_cache_read_tokens == 7
     assert provider.total_cache_write_tokens == 3
     assert provider.total_cost > 0.0
+    observation = cost_observation_from_exception(excinfo.value)
+    assert observation is not None
+    assert observation.basis is CostBasis.CATALOG_PRICED
     assert stream.exited
+
+    advisory = make_test_client(tmp_path / "advisory")
+    advisory.config.primary_model = provider.config
+    attempt = AttemptLedger(
+        route=RouteIdentity("anthropic", "claude-opus-4-6"),
+        reservation_usd=0.0,
+    )
+    assert advisory._settle_failed_attempt(attempt, excinfo.value) is None
+    assert advisory.get_stats()["accounting"]["catalog_priced_calls"] == 1
+
+    strict = make_test_client(tmp_path / "strict")
+    strict.config.primary_model = provider.config
+    strict.config.enable_cost_tracking = True
+    strict.config.usd_budget_contract = (
+        UsdBudgetContract.AUTHORITATIVE_REQUIRED
+    )
+    strict_attempt = AttemptLedger(
+        route=RouteIdentity("anthropic", "claude-opus-4-6"),
+        reservation_usd=0.1,
+    )
+    assert isinstance(
+        strict._settle_failed_attempt(strict_attempt, excinfo.value),
+        LLMAccountingUnavailableError,
+    )
 
 
 def test_anthropic_healthy_stream_unchanged() -> None:

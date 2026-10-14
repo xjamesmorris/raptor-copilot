@@ -19,6 +19,7 @@ binary is invoked.
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import subprocess
@@ -27,6 +28,10 @@ from typing import Any
 
 import pytest
 
+from core.llm.accounting import (
+    CostBasis,
+    cost_observation_from_exception,
+)
 from core.llm.cc_adapter import StreamJsonResult
 from core.llm.config import ModelConfig
 from core.llm.providers import (
@@ -91,6 +96,7 @@ def _stream_result(
         content=json.dumps(payload),
         session_id=session_id,
         cost_usd=cost_usd,
+        cost_reported=True,
         input_tokens=3,
         output_tokens=4,
         model="claude-haiku-4-5-20251001",
@@ -109,6 +115,7 @@ def _stream_freeform(
     return StreamJsonResult(
         content=text,
         cost_usd=cost_usd,
+        cost_reported=True,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         model=model,
@@ -459,11 +466,54 @@ def test_generate_structured_parse_error_raises(monkeypatch) -> None:
     import core.llm.cc_adapter as _cc_adapter
     monkeypatch.setattr(
         _cc_adapter, "run_cc_streaming",
-        lambda *a, **k: StreamJsonResult(content="not json"),
+        lambda *a, **k: StreamJsonResult(
+            content="not json",
+            cost_usd=0.4,
+            cost_reported=True,
+            input_tokens=3,
+            output_tokens=2,
+        ),
     )
     p = ClaudeCodeLLMProvider(_config())
-    with pytest.raises(RuntimeError, match="structured parse failed"):
+    with pytest.raises(RuntimeError) as excinfo:
         p.generate_structured("compute", {"type": "object"})
+    assert str(excinfo.value).startswith(
+        "claude -p structured parse failed:",
+    )
+    assert "unparseable stream content: not json" in str(excinfo.value)
+    observation = cost_observation_from_exception(excinfo.value)
+    assert observation is not None
+    assert observation.basis is CostBasis.CLI_REPORTED
+    assert observation.estimated_usd == pytest.approx(0.4)
+    assert observation.route.provider == "claudecode"
+    assert p.call_count == 1
+    assert p.total_cost == pytest.approx(0.4)
+
+
+def test_generate_structured_parse_error_without_reported_cost(
+    monkeypatch,
+) -> None:
+    import core.llm.cc_adapter as _cc_adapter
+
+    monkeypatch.setattr(
+        _cc_adapter,
+        "run_cc_streaming",
+        lambda *a, **k: StreamJsonResult(
+            content="not json",
+            cost_usd=0.0,
+            cost_reported=False,
+            input_tokens=3,
+            output_tokens=2,
+        ),
+    )
+    p = ClaudeCodeLLMProvider(_config())
+    with pytest.raises(RuntimeError, match="structured parse failed") as excinfo:
+        p.generate_structured("compute", {"type": "object"})
+    observation = cost_observation_from_exception(excinfo.value)
+    assert observation is not None
+    assert observation.basis is CostBasis.UNKNOWN
+    assert observation.estimated_usd is None
+    assert p.call_count == 1
 
 
 def test_generate_structured_tracks_usage(monkeypatch) -> None:
@@ -1157,6 +1207,7 @@ def _stream_budget_abort(cost_usd: float = 4.8) -> StreamJsonResult:
     """A budget-aborted call: nonzero exit, error set, real money spent."""
     return StreamJsonResult(
         cost_usd=cost_usd,
+        cost_reported=True,
         input_tokens=1000,
         output_tokens=2000,
         error="claude -p exited 1: error_max_budget_usd",
@@ -1175,11 +1226,14 @@ def test_generate_books_failed_call_spend_before_raise(monkeypatch) -> None:
         lambda *a, **k: _stream_budget_abort(cost_usd=4.8),
     )
     p = ClaudeCodeLLMProvider(_config())
-    with pytest.raises(RuntimeError, match="error_max_budget_usd"):
+    with pytest.raises(RuntimeError, match="error_max_budget_usd") as excinfo:
         p.generate("hi")
     assert p.total_cost == pytest.approx(4.8)
     assert p.total_input_tokens == 1000
     assert p.total_output_tokens == 2000
+    observation = cost_observation_from_exception(excinfo.value)
+    assert observation is not None
+    assert observation.basis is CostBasis.CLI_REPORTED
 
 
 def test_generate_structured_books_failed_call_spend_before_raise(
@@ -1205,9 +1259,103 @@ def test_generate_structured_books_spend_on_parse_failure(monkeypatch) -> None:
         lambda *a, **k: _stream_freeform(text="not json at all", cost_usd=0.9),
     )
     p = ClaudeCodeLLMProvider(_config())
-    with pytest.raises(RuntimeError, match="structured parse failed"):
+    with pytest.raises(RuntimeError, match="structured parse failed") as excinfo:
         p.generate_structured("compute", {"type": "object"})
     assert p.total_cost == pytest.approx(0.9)
+    assert p.call_count == 1
+    observation = cost_observation_from_exception(excinfo.value)
+    assert observation is not None
+    assert observation.basis is CostBasis.CLI_REPORTED
+
+
+def test_client_advisory_settles_claude_parse_failure_once(
+    monkeypatch,
+) -> None:
+    import core.llm.cc_adapter as _cc_adapter
+
+    from core.llm.client import LLMClient
+    from core.llm.config import LLMConfig
+
+    calls = 0
+
+    def failed_stream(*args, **kwargs):
+        nonlocal calls
+        del args, kwargs
+        calls += 1
+        return _stream_freeform(text="not json", cost_usd=0.6)
+
+    monkeypatch.setattr(_cc_adapter, "run_cc_streaming", failed_stream)
+    client = LLMClient(LLMConfig(
+        primary_model=_config(),
+        fallback_models=[],
+        enable_caching=False,
+        enable_fallback=False,
+        max_retries=1,
+    ))
+
+    with pytest.raises(RuntimeError):
+        client.generate_structured("compute", {"type": "object"})
+
+    accounting = client.get_stats()["accounting"]
+    assert calls == 1
+    assert accounting["cli_reported_calls"] == 1
+    assert accounting["unknown_failed_attempts"] == 0
+    assert client.provider_spend_usd == pytest.approx(0.6)
+
+
+def test_client_strict_claude_refuses_before_dispatch(monkeypatch) -> None:
+    import core.llm.cc_adapter as _cc_adapter
+
+    from core.llm.accounting import (
+        LLMAccountingUnavailableError,
+        UsdBudgetContract,
+    )
+    from core.llm.client import LLMClient
+    from core.llm.config import LLMConfig
+
+    calls = 0
+
+    def forbidden_stream(*args, **kwargs):
+        nonlocal calls
+        del args, kwargs
+        calls += 1
+        return _stream_freeform()
+
+    monkeypatch.setattr(_cc_adapter, "run_cc_streaming", forbidden_stream)
+    client = LLMClient(LLMConfig(
+        primary_model=_config(),
+        fallback_models=[],
+        enable_caching=False,
+        enable_fallback=False,
+        enable_cost_tracking=True,
+        usd_budget_contract=UsdBudgetContract.AUTHORITATIVE_REQUIRED,
+    ))
+
+    with pytest.raises(LLMAccountingUnavailableError):
+        client.generate_structured("compute", {"type": "object"})
+    assert calls == 0
+
+
+def test_providers_has_no_function_local_accounting_imports() -> None:
+    import core.llm.accounting as accounting
+    import core.llm.providers as providers
+
+    exported = set(accounting.__all__)
+    tree = ast.parse(Path(providers.__file__).read_text(encoding="utf-8"))
+    offenders = []
+    for function in (
+        node for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ):
+        for node in ast.walk(function):
+            if isinstance(node, ast.ImportFrom):
+                names = {alias.name for alias in node.names}
+                if (
+                    node.module == "core.llm.accounting"
+                    and names & exported
+                ):
+                    offenders.append((function.name, node.lineno, names))
+    assert offenders == []
 
 
 def test_turn_resumable_books_failed_call_spend(monkeypatch) -> None:

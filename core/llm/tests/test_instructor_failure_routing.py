@@ -19,8 +19,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from core.llm.accounting import (
+    CostBasis,
+    cost_observation_from_exception,
+)
 from core.llm.config import ModelConfig
 from core.llm.providers import LLMProvider, StructuredResponse
+from core.testing import make_test_client
 
 # ---------------------------------------------------------------------------
 # Unit: route classification
@@ -223,6 +228,23 @@ def test_failed_instructor_call_books_usage(monkeypatch) -> None:
     assert provider.total_tokens == 150
 
 
+def test_boundary_instructor_failure_attaches_booked_observation(
+    monkeypatch,
+) -> None:
+    exc = _transport_exc("401 unauthorized")
+    exc.last_completion = SimpleNamespace(
+        usage=SimpleNamespace(prompt_tokens=4, completion_tokens=2),
+    )
+    provider, _ = _openai_provider(monkeypatch, exc)
+
+    with pytest.raises(Exception) as excinfo:
+        provider.generate_structured("p", _SCHEMA)
+
+    observation = cost_observation_from_exception(excinfo.value)
+    assert observation is not None
+    assert observation.basis is CostBasis.CATALOG_PRICED
+
+
 def test_failed_call_books_anthropic_shaped_usage() -> None:
     """The booking helper reads both OpenAI (prompt/completion) and
     Anthropic (input/output) usage field names."""
@@ -254,8 +276,103 @@ def test_no_completion_books_nothing() -> None:
     )
     booked: list = []
     provider.track_usage = lambda *a, **k: booked.append(a)
-    provider._book_instructor_failure_usage(RuntimeError("net down"), 0.1)
+    assert (
+        provider._book_instructor_failure_usage(
+            RuntimeError("net down"), 0.1,
+        )
+        is None
+    )
     assert booked == []
+
+
+def test_no_usage_instructor_failure_settles_unknown_in_client(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    provider, fallback_calls = _anthropic_provider(
+        monkeypatch,
+        _transport_exc("401 unauthorized"),
+    )
+    client = make_test_client(
+        tmp_path,
+        enable_caching=False,
+        max_retries=1,
+    )
+    client.config.primary_model = provider.config
+    client.providers[
+        f"{provider.config.provider}:{provider.config.model_name}"
+    ] = provider
+
+    with pytest.raises(Exception, match="401"):
+        client.generate_structured("p", _SCHEMA)
+
+    assert fallback_calls == []
+    assert (
+        provider.instructor_client.messages.create_with_completion.call_count
+        == 1
+    )
+    accounting = client.get_stats()["accounting"]
+    assert accounting["unknown_failed_attempts"] == 1
+    assert accounting["catalog_priced_calls"] == 0
+
+
+def _completion_with_usage(stop_reason: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        stop_reason=stop_reason,
+        content=[],
+        usage=SimpleNamespace(input_tokens=4, output_tokens=2),
+    )
+
+
+def test_anthropic_refusal_attaches_usage_observation(monkeypatch) -> None:
+    provider, fallback_calls = _anthropic_provider(
+        monkeypatch,
+        _FakeValidationError(
+            last_completion=_completion_with_usage("refusal"),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="model refused") as excinfo:
+        provider.generate_structured("p", _SCHEMA)
+
+    observation = cost_observation_from_exception(excinfo.value)
+    assert observation is not None
+    assert observation.basis is CostBasis.CATALOG_PRICED
+    assert fallback_calls == []
+    assert provider.call_count == 1
+
+
+def test_anthropic_truncation_attaches_usage_observation(monkeypatch) -> None:
+    provider, fallback_calls = _anthropic_provider(
+        monkeypatch,
+        _FakeIncompleteOutput(
+            last_completion=_completion_with_usage("max_tokens"),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="truncated") as excinfo:
+        provider.generate_structured("p", _SCHEMA)
+
+    observation = cost_observation_from_exception(excinfo.value)
+    assert observation is not None
+    assert observation.basis is CostBasis.CATALOG_PRICED
+    assert fallback_calls == []
+    assert provider.call_count == 1
+
+
+def test_anthropic_boundary_attaches_usage_observation(monkeypatch) -> None:
+    error = _transport_exc("401 unauthorized")
+    error.last_completion = _completion_with_usage("end_turn")
+    provider, fallback_calls = _anthropic_provider(monkeypatch, error)
+
+    with pytest.raises(Exception, match="401") as excinfo:
+        provider.generate_structured("p", _SCHEMA)
+
+    observation = cost_observation_from_exception(excinfo.value)
+    assert observation is not None
+    assert observation.basis is CostBasis.CATALOG_PRICED
+    assert fallback_calls == []
+    assert provider.call_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -341,13 +458,20 @@ def _truncated_completion(stop_reason: str = "max_tokens") -> SimpleNamespace:
 def _anthropic_provider(monkeypatch, exc: Exception,
                         provider_name: str = "anthropic",
                         model_name: str = "claude-sonnet-4-6"):
-    pytest.importorskip("anthropic")
     from core.llm.providers import AnthropicProvider
-    monkeypatch.delenv("RAPTOR_LLM_SOCKET", raising=False)
-    provider = AnthropicProvider(ModelConfig(
-        provider=provider_name, model_name=model_name,
-        api_key="sk-ant-test", timeout=1,
-    ))
+    provider = AnthropicProvider.__new__(AnthropicProvider)
+    LLMProvider.__init__(
+        provider,
+        ModelConfig(
+            provider=provider_name,
+            model_name=model_name,
+            api_key="sk-ant-test",
+            timeout=1,
+        ),
+    )
+    provider._stream_sse_ok = True
+    provider._instructor_lock = threading.Lock()
+    provider._instructor_consec_failures = 0
     fake_instructor = MagicMock()
     fake_instructor.messages.create_with_completion.side_effect = exc
     provider.instructor_client = fake_instructor

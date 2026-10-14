@@ -650,6 +650,7 @@ class TestExtractEnvelopeMetadata:
         into: dict = {}
         extract_envelope_metadata(envelope, into)
         assert into["cost_usd"] == 0.25
+        assert into["cost_reported"] is True
         assert into["duration_seconds"] == 5.0
         assert into["analysed_by"] == "claude-opus-4-20250514"
         assert into["_tokens"] == 300
@@ -658,6 +659,7 @@ class TestExtractEnvelopeMetadata:
         into: dict = {}
         extract_envelope_metadata({}, into)
         assert "cost_usd" not in into
+        assert "cost_reported" not in into
         assert into["analysed_by"] == "claude-code"
 
     def test_string_usage_does_not_crash(self):
@@ -772,6 +774,7 @@ class TestParseStreamJsonLines:
         assert r.content == "hello"
         assert r.session_id == "sess-abc"
         assert r.cost_usd == 0.005
+        assert r.cost_reported is True
         assert r.input_tokens == 100
         assert r.output_tokens == 50
         assert r.cache_read_tokens == 80
@@ -861,6 +864,43 @@ class TestParseStreamJsonLines:
         ]
         r = parse_stream_json_lines(lines)
         assert r.error == "something broke"
+
+    def test_cost_presence_distinguishes_absent_from_explicit_zero(self):
+        from core.llm.cc_adapter import parse_stream_json_lines
+
+        absent = parse_stream_json_lines([
+            json.dumps({"type": "result", "is_error": False}),
+        ])
+        explicit_zero = parse_stream_json_lines([
+            json.dumps({
+                "type": "result",
+                "is_error": False,
+                "total_cost_usd": 0.0,
+            }),
+        ])
+
+        assert absent.cost_usd == 0.0
+        assert absent.cost_reported is False
+        assert explicit_zero.cost_usd == 0.0
+        assert explicit_zero.cost_reported is True
+
+    @pytest.mark.parametrize(
+        "bad_cost",
+        [-1.0, float("nan"), float("inf"), True, "0.1"],
+    )
+    def test_malformed_cost_is_not_reported(self, bad_cost):
+        from core.llm.cc_adapter import parse_stream_json_lines
+
+        parsed = parse_stream_json_lines([
+            json.dumps({
+                "type": "result",
+                "is_error": False,
+                "total_cost_usd": bad_cost,
+            }),
+        ])
+
+        assert parsed.cost_usd == 0.0
+        assert parsed.cost_reported is False
 
     def test_error_result_empty_text_falls_back_to_subtype(self):
         # Budget-cap aborts emit is_error with result "" and the cause

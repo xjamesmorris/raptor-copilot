@@ -38,9 +38,11 @@ without context:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Literal, Union, TYPE_CHECKING
+
+from core.llm.accounting import AccountingSummary, CostObservation
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -242,6 +244,9 @@ class TurnResponse:
     cache_write_tokens: int = 0
     cost_usd: float | None = None
     error_message: str | None = None
+    cost_observation: CostObservation = field(
+        default_factory=CostObservation.unknown,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -361,10 +366,12 @@ class ContextOverflow(RuntimeError):
         *args: Any,
         messages: list[Any] | None = None,
         tool_calls_made: int = 0,
+        accounting: AccountingSummary | None = None,
     ) -> None:
         super().__init__(*args)
         self.messages = list(messages) if messages else []
         self.tool_calls_made = tool_calls_made
+        self.accounting = accounting or AccountingSummary()
 
 
 # ---------------------------------------------------------------------------
@@ -392,10 +399,12 @@ class CostBudgetExceeded(RuntimeError):
         *args: Any,
         messages: list[Any] | None = None,
         tool_calls_made: int = 0,
+        accounting: AccountingSummary | None = None,
     ) -> None:
         super().__init__(*args)
         self.messages = list(messages) if messages else []
         self.tool_calls_made = tool_calls_made
+        self.accounting = accounting or AccountingSummary()
 
 
 class ToolHandlerTimeout(RuntimeError):
@@ -541,6 +550,9 @@ class LoopTerminated:
     iterations: int
     total_cost_usd: float
     error_message: str | None = None
+    accounting: AccountingSummary = field(
+        default_factory=AccountingSummary,
+    )
 
 
 LoopEvent = Union[
@@ -607,3 +619,6 @@ class ToolLoopResult:
     # that only want totals use ``total_input_tokens`` /
     # ``total_output_tokens``.
     per_turn_tokens: tuple[tuple[int, int], ...] = ()
+    accounting: AccountingSummary = field(
+        default_factory=AccountingSummary,
+    )

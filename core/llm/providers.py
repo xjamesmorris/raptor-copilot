@@ -15,7 +15,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from inspect import isclass
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -25,6 +25,23 @@ if TYPE_CHECKING:
 from core.json import dumps_display
 from core.logging import get_logger
 
+from .accounting import (
+    AccountingCapability,
+    AccountingMode,
+    AccountingSummary,
+    CostBasis,
+    CostObservation,
+    ModelKeyAggregation,
+    PinnedRouteSnapshot,
+    PinnedRouteViolation,
+    attach_cost_observation,
+    cli_cost_observation,
+    cost_basis_for_model_config,
+    cost_observation_from_exception,
+    direct_api_accounting_capability,
+    estimated_cost_observation,
+    route_identity_from_config,
+)
 from .cc_adapter import strip_json_fences
 from .config import ModelConfig
 
@@ -419,6 +436,9 @@ class LLMResponse:
     # "gemini-2.5-pro-002"). None when the provider doesn't surface it — the
     # provenance manifest then records the alias only, never a guess.
     resolved_model: str | None = None
+    cost_observation: CostObservation = field(
+        default_factory=CostObservation.unknown,
+    )
 
 
 @dataclass
@@ -447,6 +467,9 @@ class StructuredResponse:
     cache_write_tokens: int = 0
     # Concrete model snapshot the provider served (see LLMResponse.resolved_model).
     resolved_model: str | None = None
+    cost_observation: CostObservation = field(
+        default_factory=CostObservation.unknown,
+    )
 
     def __iter__(self):
         """Allow unpacking as 2-tuple for backwards compatibility."""
@@ -497,6 +520,7 @@ class LLMProvider(ABC):
         self.total_duration = 0.0
         self.total_cache_read_tokens = 0
         self.total_cache_write_tokens = 0
+        self.accounting_summary = AccountingSummary()
         self._usage_lock = threading.Lock()
 
     @abstractmethod
@@ -577,6 +601,39 @@ class LLMProvider(ABC):
         sequentially today regardless — informational flag for v1."""
         return False
 
+    def accounting_capability(self) -> AccountingCapability:
+        """Fail-closed accounting capability for an unclassified provider."""
+        return AccountingCapability()
+
+    def validate_pinned_route(self) -> None:
+        """Reject mutation of a route pinned by :class:`LLMClient`."""
+        snapshot = getattr(self, "_raptor_pinned_route_snapshot", None)
+        if not isinstance(snapshot, PinnedRouteSnapshot):
+            return
+        current = PinnedRouteSnapshot.from_model_config(self.config)
+        if current != snapshot:
+            raise PinnedRouteViolation(
+                "Pinned route violation before provider dispatch: expected "
+                f"{snapshot.provider}/{snapshot.model}; effective route "
+                "or configuration changed",
+            )
+
+    def expected_cost_basis(self) -> CostBasis:
+        """Expected observation basis before a fresh provider call."""
+        return CostBasis.UNKNOWN
+
+    def cost_observation(
+        self,
+        cost: float,
+        *,
+        cost_reported: bool | None = None,
+    ) -> CostObservation:
+        """Return this provider's typed observation for a numeric cost."""
+        del cost, cost_reported
+        return CostObservation.unknown(
+            route=route_identity_from_config(self.config),
+        )
+
     def context_window(self) -> int:
         """Total tokens the model accepts. Drives the loop's context-
         policy enforcement. Sourced from :mod:`core.llm.model_data`
@@ -630,6 +687,25 @@ class LLMProvider(ABC):
             response.input_tokens * in_per_m
             + response.output_tokens * out_per_m
         ) / 1_000_000.0
+
+    def turn_cost_observation(
+        self, response: TurnResponse,
+    ) -> CostObservation:
+        """Typed cost evidence for one tool-use turn."""
+        observation = getattr(response, "cost_observation", None)
+        if (
+            isinstance(observation, CostObservation)
+            and observation.basis is not CostBasis.UNKNOWN
+        ):
+            return observation
+        if response.stop_reason in (StopReason.ERROR, StopReason.REFUSED):
+            return CostObservation.unknown(
+                route=route_identity_from_config(self.config),
+            )
+        return self.cost_observation(
+            self.compute_cost(response),
+            cost_reported=response.cost_usd is not None,
+        )
 
     def turn(
         self,
@@ -738,7 +814,8 @@ class LLMProvider(ABC):
                     input_tokens: int = 0, output_tokens: int = 0,
                     duration: float = 0.0,
                     cache_read_tokens: int = 0,
-                    cache_write_tokens: int = 0) -> None:
+                    cache_write_tokens: int = 0,
+                    cost_observation: CostObservation | None = None) -> None:
         """Track token usage, cost, and call duration (thread-safe).
 
         ``sanitize_cost`` at the write: this ledger is the budget
@@ -746,6 +823,7 @@ class LLMProvider(ABC):
         single NaN booked here makes every budget comparison False.
         """
         from core.llm.cost import sanitize_cost
+        observation = cost_observation or self.cost_observation(cost)
         with self._usage_lock:
             self.total_tokens += tokens
             self.total_input_tokens += input_tokens
@@ -755,6 +833,10 @@ class LLMProvider(ABC):
             self.total_cost += sanitize_cost(cost)
             self.call_count += 1
             self.total_duration += duration
+            summary = getattr(
+                self, "accounting_summary", AccountingSummary(),
+            )
+            self.accounting_summary = summary.add(observation)
         logger.debug("LLM usage: %s tokens, $%.4f (total: %s tokens, $%.4f)", tokens, cost or 0.0, self.total_tokens, self.total_cost)
 
     def _calculate_cost_split(self, input_tokens: int, output_tokens: int,
@@ -959,7 +1041,7 @@ class LLMProvider(ABC):
 
     def _book_instructor_failure_usage(
         self, exc: Exception, duration: float,
-    ) -> None:
+    ) -> CostObservation | None:
         """Book the spend of a failed instructor call.
 
         A pydantic-validation failure happens AFTER a completed (paid)
@@ -974,7 +1056,7 @@ class LLMProvider(ABC):
             completion = getattr(exc, "last_completion", None)
             usage = getattr(completion, "usage", None)
             if usage is None:
-                return
+                return None
             input_tokens = getattr(usage, "prompt_tokens", None)
             if input_tokens is None:
                 input_tokens = getattr(usage, "input_tokens", 0)
@@ -984,11 +1066,13 @@ class LLMProvider(ABC):
             input_tokens = int(input_tokens or 0)
             output_tokens = int(output_tokens or 0)
             if input_tokens <= 0 and output_tokens <= 0:
-                return
+                return None
             cost = self._calculate_cost_split(input_tokens, output_tokens, 0)
+            observation = self.cost_observation(cost)
             self.track_usage(
                 input_tokens + output_tokens, cost,
                 input_tokens, output_tokens, duration,
+                cost_observation=observation,
             )
             # Per-attempt attribution for the telemetry row — the
             # ledger booking above is aggregate-only and cannot say
@@ -997,10 +1081,12 @@ class LLMProvider(ABC):
                 exc, cost_usd=cost, tokens_in=input_tokens,
                 tokens_out=output_tokens,
             )
+            return observation
         except Exception as book_exc:  # noqa: BLE001 — best-effort booking
             logger.debug(
                 "instructor failure usage booking skipped: %s", book_exc,
             )
+            return None
 
     def _structured_fallback(self, prompt: str, schema: dict[str, Any],
                              pydantic_model, system_prompt: str | None = None,
@@ -1022,6 +1108,7 @@ class LLMProvider(ABC):
         ``None`` means "not overridden" and leaves ``generate``'s own
         config-default resolution in effect.
         """
+        self.validate_pinned_route()
         schema_json = dumps_display(schema)
         schema_block = (
             f"\n\n## Output format\n"
@@ -1095,6 +1182,7 @@ class LLMProvider(ABC):
                 cache_read_tokens=response.cache_read_tokens,
                 cache_write_tokens=response.cache_write_tokens,
                 resolved_model=response.resolved_model,
+                cost_observation=response.cost_observation,
             )
         except Exception as e:
             # Pre-fix the logger interpolated `e` directly into the
@@ -1149,6 +1237,7 @@ class LLMProvider(ABC):
     ) -> TurnResponse:
         """Synthesise one tool-use round-trip via plain ``generate()``."""
         del cache_control, provider_specific  # unused by fallback
+        self.validate_pinned_route()
         tool_protocol = self._render_tool_protocol(tools) if tools else ""
         sys_combined = "\n\n".join(s for s in (system, tool_protocol) if s) or None
         rendered_prompt = self._render_messages_as_prompt(messages)
@@ -1173,6 +1262,13 @@ class LLMProvider(ABC):
             input_tokens=getattr(response, "input_tokens", 0) or 0,
             output_tokens=getattr(response, "output_tokens", 0) or 0,
             cost_usd=float(cost) if cost is not None else None,
+            cost_observation=getattr(
+                response,
+                "cost_observation",
+                CostObservation.unknown(
+                    route=route_identity_from_config(self.config),
+                ),
+            ),
         )
 
     @staticmethod
@@ -1673,6 +1769,26 @@ class OpenAICompatibleProvider(LLMProvider):
     Gemini (via OpenAI compat), Mistral, etc.
     """
 
+    def accounting_capability(self) -> AccountingCapability:
+        return direct_api_accounting_capability(self.config)
+
+    def expected_cost_basis(self) -> CostBasis:
+        return cost_basis_for_model_config(self.config)
+
+    def cost_observation(
+        self,
+        cost: float,
+        *,
+        cost_reported: bool | None = None,
+    ) -> CostObservation:
+        del cost_reported
+        try:
+            return estimated_cost_observation(self.config, cost)
+        except (TypeError, ValueError):
+            return CostObservation.unknown(
+                route=route_identity_from_config(self.config),
+            )
+
     def __init__(self, config: ModelConfig) -> None:
         super().__init__(config)
         if not OPENAI_SDK_AVAILABLE:
@@ -1817,10 +1933,12 @@ class OpenAICompatibleProvider(LLMProvider):
 
             tokens_used = input_tokens + output_tokens + thinking_tokens
             cost = self._calculate_cost_split(input_tokens, output_tokens, thinking_tokens)
+            observation = self.cost_observation(cost)
 
             self.track_usage(
                 tokens_used, cost, input_tokens, output_tokens, duration,
                 cache_read_tokens=cache_read_tokens,
+                cost_observation=observation,
             )
             logger.debug("[OpenAI] model=%s, tokens=%s, cost=$%.4f, duration=%.2fs%s",
                          self.config.model_name, tokens_used, cost, duration,
@@ -1839,6 +1957,7 @@ class OpenAICompatibleProvider(LLMProvider):
                 duration=duration,
                 cache_read_tokens=cache_read_tokens,
                 resolved_model=extract_resolved_model(response),
+                cost_observation=observation,
             )
 
         except Exception as e:
@@ -1920,9 +2039,11 @@ class OpenAICompatibleProvider(LLMProvider):
 
                 tokens_used = input_tokens + output_tokens + thinking_tokens
                 cost = self._calculate_cost_split(input_tokens, output_tokens, thinking_tokens)
+                observation = self.cost_observation(cost)
                 self.track_usage(
                     tokens_used, cost, input_tokens, output_tokens, duration,
                     cache_read_tokens=cache_read_tokens,
+                    cost_observation=observation,
                 )
 
                 self._note_instructor_success()
@@ -1940,11 +2061,12 @@ class OpenAICompatibleProvider(LLMProvider):
                     output_tokens=output_tokens,
                     cache_read_tokens=cache_read_tokens,
                     resolved_model=extract_resolved_model(completion),
+                    cost_observation=observation,
                 )
 
             except Exception as e:
                 # A completed-but-invalid generation still spent money.
-                self._book_instructor_failure_usage(
+                failed_observation = self._book_instructor_failure_usage(
                     e, time.monotonic() - t_start)
                 route = self._instructor_exception_route(e)
                 if route != "fallback":
@@ -1958,6 +2080,8 @@ class OpenAICompatibleProvider(LLMProvider):
                         "%s/%s — skipping JSON fallback re-send",
                         route, self.config.provider, self.config.model_name,
                     )
+                    if failed_observation is not None:
+                        attach_cost_observation(e, failed_observation)
                     raise
                 self._note_instructor_failure(e)
 
@@ -2249,12 +2373,17 @@ class OpenAICompatibleProvider(LLMProvider):
         # reports 0 cost / 0 tokens for tool-use no matter how many
         # turns the loop ran for.
         cost = self.compute_cost(turn_response)
+        observation = self.cost_observation(cost)
+        turn_response = replace(
+            turn_response, cost_observation=observation,
+        )
         self.track_usage(
             tokens=turn_response.input_tokens + turn_response.output_tokens,
             cost=cost,
             input_tokens=turn_response.input_tokens,
             output_tokens=turn_response.output_tokens,
             duration=duration,
+            cost_observation=observation,
         )
         return turn_response
 
@@ -2478,23 +2607,30 @@ class OpenAICompatibleProvider(LLMProvider):
             # buffering the stream) — then raise the sanitised typed
             # error the non-streaming paths use.
             booked_out = output_tokens or approx_output_chars // 4
+            booked_observation: CostObservation | None = None
             if input_tokens or booked_out:
                 try:
+                    cost = self._calculate_cost_split(
+                        input_tokens, booked_out,
+                    )
+                    booked_observation = self.cost_observation(cost)
                     self.track_usage(
                         tokens=input_tokens + booked_out,
-                        cost=self._calculate_cost_split(
-                            input_tokens, booked_out,
-                        ),
+                        cost=cost,
                         input_tokens=input_tokens,
                         output_tokens=booked_out,
                         duration=time.monotonic() - t_start,
+                        cost_observation=booked_observation,
                     )
                 except Exception as book_exc:  # noqa: BLE001 — best-effort booking
                     logger.debug(
                         "stream failure usage booking skipped: %s",
                         book_exc,
                     )
-            raise self._convert_stream_failure(exc) from exc
+            converted = self._convert_stream_failure(exc)
+            if booked_observation is not None:
+                attach_cost_observation(converted, booked_observation)
+            raise converted from exc
         finally:
             resp.close()
 
@@ -2815,6 +2951,26 @@ class AnthropicProvider(LLMProvider):
     and token counting.
     """
 
+    def accounting_capability(self) -> AccountingCapability:
+        return direct_api_accounting_capability(self.config)
+
+    def expected_cost_basis(self) -> CostBasis:
+        return cost_basis_for_model_config(self.config)
+
+    def cost_observation(
+        self,
+        cost: float,
+        *,
+        cost_reported: bool | None = None,
+    ) -> CostObservation:
+        del cost_reported
+        try:
+            return estimated_cost_observation(self.config, cost)
+        except (TypeError, ValueError):
+            return CostObservation.unknown(
+                route=route_identity_from_config(self.config),
+            )
+
     def __init__(self, config: ModelConfig) -> None:
         super().__init__(config)
         if not ANTHROPIC_SDK_AVAILABLE:
@@ -2957,6 +3113,7 @@ class AnthropicProvider(LLMProvider):
                 cache_read_tokens=cache_read_tokens,
                 cache_write_tokens=cache_write_tokens,
             )
+            observation = self.cost_observation(cost)
 
             def _raise_paid(err: BaseException) -> None:
                 """Book the rejected response's spend, stamp the
@@ -2970,12 +3127,14 @@ class AnthropicProvider(LLMProvider):
                         duration,
                         cache_read_tokens=cache_read_tokens,
                         cache_write_tokens=cache_write_tokens,
+                        cost_observation=observation,
                     )
                 except Exception:  # noqa: BLE001 — booking must not mask the shape error
                     logger.debug(
                         "shape-guard spend booking failed",
                         exc_info=True,
                     )
+                attach_cost_observation(err, observation)
                 _attach_billed_usage(
                     err, cost_usd=cost, tokens_in=input_tokens,
                     tokens_out=output_tokens + thinking_tokens,
@@ -3061,6 +3220,7 @@ class AnthropicProvider(LLMProvider):
                 tokens_used, cost, input_tokens, output_tokens, duration,
                 cache_read_tokens=cache_read_tokens,
                 cache_write_tokens=cache_write_tokens,
+                cost_observation=observation,
             )
             logger.debug("[Anthropic] model=%s, tokens=%s, cost=$%.4f, duration=%.2fs", self.config.model_name, tokens_used, cost, duration)
 
@@ -3078,6 +3238,7 @@ class AnthropicProvider(LLMProvider):
                 cache_read_tokens=cache_read_tokens,
                 cache_write_tokens=cache_write_tokens,
                 resolved_model=extract_resolved_model(response),
+                cost_observation=observation,
             )
 
         except Exception as e:
@@ -3198,10 +3359,12 @@ class AnthropicProvider(LLMProvider):
                     cache_read_tokens=cache_read_tokens,
                     cache_write_tokens=cache_write_tokens,
                 )
+                observation = self.cost_observation(cost)
                 self.track_usage(
                     tokens_used, cost, input_tokens, output_tokens, duration,
                     cache_read_tokens=cache_read_tokens,
                     cache_write_tokens=cache_write_tokens,
+                    cost_observation=observation,
                 )
 
                 self._note_instructor_success()
@@ -3225,11 +3388,12 @@ class AnthropicProvider(LLMProvider):
                     cache_read_tokens=cache_read_tokens,
                     cache_write_tokens=cache_write_tokens,
                     resolved_model=extract_resolved_model(completion),
+                    cost_observation=observation,
                 )
 
             except Exception as e:
                 # A completed-but-invalid generation still spent money.
-                self._book_instructor_failure_usage(
+                failed_observation = self._book_instructor_failure_usage(
                     e, time.monotonic() - t_start)
                 refusal = _instructor_refusal_stop(e)
                 if refusal is not None:
@@ -3246,7 +3410,10 @@ class AnthropicProvider(LLMProvider):
                         f"(stop_reason={refusal}, instructor tool-use "
                         "leg — tool args empty)"
                     )
-                    raise RuntimeError(msg) from e
+                    error = RuntimeError(msg)
+                    if failed_observation is not None:
+                        attach_cost_observation(error, failed_observation)
+                    raise error from e
                 truncation = _instructor_truncation_stop(e)
                 if truncation is not None:
                     # Output budget exhausted mid-tool-call. Not
@@ -3274,7 +3441,10 @@ class AnthropicProvider(LLMProvider):
                         f"limit reached, stop_reason={truncation}, "
                         "instructor tool-use leg)"
                     )
-                    raise _llm_truncation_error(msg) from e
+                    error = _llm_truncation_error(msg)
+                    if failed_observation is not None:
+                        attach_cost_observation(error, failed_observation)
+                    raise error from e
                 route = self._instructor_exception_route(e)
                 if route != "fallback":
                     # Boundary failure (blocked/auth/quota): see the
@@ -3285,6 +3455,8 @@ class AnthropicProvider(LLMProvider):
                         "%s/%s — skipping JSON fallback re-send",
                         route, self.config.provider, self.config.model_name,
                     )
+                    if failed_observation is not None:
+                        attach_cost_observation(e, failed_observation)
                     raise
                 self._note_instructor_failure(e)
 
@@ -3577,6 +3749,10 @@ class AnthropicProvider(LLMProvider):
         # when the loop ran for many turns. Cost via ``compute_cost``
         # so cache multipliers (1.25x write, 0.1x read) apply.
         cost = self.compute_cost(turn_response)
+        observation = self.cost_observation(cost)
+        turn_response = replace(
+            turn_response, cost_observation=observation,
+        )
         self.track_usage(
             tokens=turn_response.input_tokens + turn_response.output_tokens,
             cost=cost,
@@ -3585,6 +3761,7 @@ class AnthropicProvider(LLMProvider):
             duration=duration,
             cache_read_tokens=turn_response.cache_read_tokens,
             cache_write_tokens=turn_response.cache_write_tokens,
+            cost_observation=observation,
         )
         self._maybe_warn_silent_cache_failure(turn_response, cache_control)
         return turn_response
@@ -3805,6 +3982,7 @@ class AnthropicProvider(LLMProvider):
             # received — then raise the sanitised typed error the
             # non-streaming paths use.
             booked_out = output_tokens or approx_output_chars // 4
+            booked_observation: CostObservation | None = None
             if input_tokens or booked_out or cache_read or cache_write:
                 try:
                     cost = self.compute_cost(TurnResponse(
@@ -3814,6 +3992,7 @@ class AnthropicProvider(LLMProvider):
                         cache_read_tokens=cache_read,
                         cache_write_tokens=cache_write,
                     ))
+                    booked_observation = self.cost_observation(cost)
                     self.track_usage(
                         tokens=input_tokens + booked_out,
                         cost=cost,
@@ -3822,13 +4001,17 @@ class AnthropicProvider(LLMProvider):
                         duration=time.monotonic() - t_start,
                         cache_read_tokens=cache_read,
                         cache_write_tokens=cache_write,
+                        cost_observation=booked_observation,
                     )
                 except Exception as book_exc:  # noqa: BLE001 — best-effort booking
                     logger.debug(
                         "stream failure usage booking skipped: %s",
                         book_exc,
                     )
-            raise self._convert_stream_failure(exc) from exc
+            converted = self._convert_stream_failure(exc)
+            if booked_observation is not None:
+                attach_cost_observation(converted, booked_observation)
+            raise converted from exc
 
         duration = time.monotonic() - t_start
 
@@ -4036,6 +4219,26 @@ class GeminiProvider(LLMProvider):
     Falls back to OpenAICompatibleProvider if google-genai is not installed.
     """
 
+    def accounting_capability(self) -> AccountingCapability:
+        return direct_api_accounting_capability(self.config)
+
+    def expected_cost_basis(self) -> CostBasis:
+        return cost_basis_for_model_config(self.config)
+
+    def cost_observation(
+        self,
+        cost: float,
+        *,
+        cost_reported: bool | None = None,
+    ) -> CostObservation:
+        del cost_reported
+        try:
+            return estimated_cost_observation(self.config, cost)
+        except (TypeError, ValueError):
+            return CostObservation.unknown(
+                route=route_identity_from_config(self.config),
+            )
+
     def __init__(self, config: ModelConfig) -> None:
         super().__init__(config)
         if not GENAI_SDK_AVAILABLE:
@@ -4187,8 +4390,12 @@ class GeminiProvider(LLMProvider):
 
             tokens_used = input_tokens + output_tokens + thinking_tokens
             cost = self._calculate_cost_split(input_tokens, output_tokens, thinking_tokens)
+            observation = self.cost_observation(cost)
 
-            self.track_usage(tokens_used, cost, input_tokens, output_tokens, duration)
+            self.track_usage(
+                tokens_used, cost, input_tokens, output_tokens, duration,
+                cost_observation=observation,
+            )
             logger.debug("[Gemini] model=%s, tokens=%s, cost=$%.4f, duration=%.2fs, thinking=%s",
                          self.config.model_name, tokens_used, cost, duration, thinking_tokens)
 
@@ -4204,6 +4411,7 @@ class GeminiProvider(LLMProvider):
                 output_tokens=output_tokens,
                 thinking_tokens=thinking_tokens,
                 duration=duration,
+                cost_observation=observation,
             )
 
         except Exception as e:
@@ -4274,7 +4482,11 @@ class GeminiProvider(LLMProvider):
 
             tokens_used = input_tokens + output_tokens + thinking_tokens
             cost = self._calculate_cost_split(input_tokens, output_tokens, thinking_tokens)
-            self.track_usage(tokens_used, cost, input_tokens, output_tokens, duration)
+            observation = self.cost_observation(cost)
+            self.track_usage(
+                tokens_used, cost, input_tokens, output_tokens, duration,
+                cost_observation=observation,
+            )
 
             logger.debug("[Gemini] structured model=%s, tokens=%s, cost=$%.4f, duration=%.2fs, thinking=%s",
                          self.config.model_name, tokens_used, cost, duration, thinking_tokens)
@@ -4338,6 +4550,7 @@ class GeminiProvider(LLMProvider):
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 resolved_model=extract_resolved_model(response),
+                cost_observation=observation,
             )
 
         except (json.JSONDecodeError, ValueError, KeyError) as e:
@@ -4476,6 +4689,47 @@ class ClaudeCodeLLMProvider(LLMProvider):
     """
 
     is_stub = False
+
+    def accounting_capability(self) -> AccountingCapability:
+        return AccountingCapability(
+            mode=AccountingMode.UNKNOWN,
+            hard_limit_supported=False,
+            model_key_aggregation=ModelKeyAggregation.LEGACY_MODEL_NAME,
+        )
+
+    def expected_cost_basis(self) -> CostBasis:
+        return CostBasis.UNKNOWN
+
+    def cost_observation(
+        self,
+        cost: float,
+        *,
+        cost_reported: bool | None = None,
+    ) -> CostObservation:
+        return cli_cost_observation(
+            cost_usd=cost,
+            cost_reported=bool(cost_reported),
+            route=route_identity_from_config(self.config),
+        )
+
+    def turn_cost_observation(
+        self, response: TurnResponse,
+    ) -> CostObservation:
+        observation = getattr(response, "cost_observation", None)
+        if isinstance(observation, CostObservation):
+            if observation.route is None:
+                return CostObservation(
+                    basis=observation.basis,
+                    provider_billed_usd=observation.provider_billed_usd,
+                    estimated_usd=observation.estimated_usd,
+                    catalog_version=observation.catalog_version,
+                    route=route_identity_from_config(self.config),
+                )
+            return observation
+        return self.cost_observation(
+            float(response.cost_usd or 0.0),
+            cost_reported=response.cost_usd is not None,
+        )
 
     def __init__(
         self,
@@ -4663,6 +4917,10 @@ class ClaudeCodeLLMProvider(LLMProvider):
         # ``max(total_cost, provider_spend)``), so raising first
         # made the spend invisible to max-cost enforcement.
         total_tokens = sr.input_tokens + sr.output_tokens
+        observation = self.cost_observation(
+            sr.cost_usd,
+            cost_reported=sr.cost_reported,
+        )
         self.track_usage(
             tokens=total_tokens,
             cost=sr.cost_usd,
@@ -4671,10 +4929,13 @@ class ClaudeCodeLLMProvider(LLMProvider):
             cache_read_tokens=sr.cache_read_tokens,
             cache_write_tokens=sr.cache_creation_tokens,
             duration=duration,
+            cost_observation=observation,
         )
 
         if sr.error:
-            raise CCTransportError(sr.error)
+            error = CCTransportError(sr.error)
+            attach_cost_observation(error, observation)
+            raise error
 
         # The claude-code harness reports the model it used in the
         # stream-json output; treat that as the resolved snapshot. But
@@ -4700,6 +4961,7 @@ class ClaudeCodeLLMProvider(LLMProvider):
             cache_read_tokens=sr.cache_read_tokens,
             cache_write_tokens=sr.cache_creation_tokens,
             duration=duration,
+            cost_observation=observation,
         )
 
     def generate_structured(
@@ -4798,6 +5060,10 @@ class ClaudeCodeLLMProvider(LLMProvider):
         # ``max(total_cost, provider_spend)``), so raising first
         # made the spend invisible to max-cost enforcement.
         total_tokens = sr.input_tokens + sr.output_tokens
+        observation = self.cost_observation(
+            sr.cost_usd,
+            cost_reported=sr.cost_reported,
+        )
         self.track_usage(
             tokens=total_tokens,
             cost=sr.cost_usd,
@@ -4806,10 +5072,13 @@ class ClaudeCodeLLMProvider(LLMProvider):
             cache_read_tokens=sr.cache_read_tokens,
             cache_write_tokens=sr.cache_creation_tokens,
             duration=duration,
+            cost_observation=observation,
         )
 
         if sr.error:
-            raise CCTransportError(sr.error)
+            error = CCTransportError(sr.error)
+            attach_cost_observation(error, observation)
+            raise error
 
         if sr.structured_output is not None:
             result = sr.structured_output
@@ -4817,7 +5086,9 @@ class ClaudeCodeLLMProvider(LLMProvider):
             result = self._parse_stream_content(sr.content)
             if isinstance(result, dict) and "error" in result and result["error"]:
                 msg = f"claude -p structured parse failed: {result['error']}"
-                raise RuntimeError(msg)
+                error = RuntimeError(msg)
+                attach_cost_observation(error, observation)
+                raise error
 
         return StructuredResponse(
             result=result,
@@ -4831,6 +5102,7 @@ class ClaudeCodeLLMProvider(LLMProvider):
             output_tokens=sr.output_tokens,
             cache_read_tokens=sr.cache_read_tokens,
             cache_write_tokens=sr.cache_creation_tokens,
+            cost_observation=observation,
         )
 
     def supports_tool_use(self) -> bool: return True
@@ -4928,6 +5200,13 @@ class ClaudeCodeLLMProvider(LLMProvider):
                 input_tokens=getattr(response, "input_tokens", 0) or 0,
                 output_tokens=getattr(response, "output_tokens", 0) or 0,
                 cost_usd=float(cost) if cost is not None else None,
+                cost_observation=getattr(
+                    response,
+                    "cost_observation",
+                    CostObservation.unknown(
+                        route=route_identity_from_config(self.config),
+                    ),
+                ),
             )
 
         if self._resumable:
@@ -4962,17 +5241,32 @@ class ClaudeCodeLLMProvider(LLMProvider):
             err_msg = ("subprocess error: "
                        + escape_nonprintable(redact_secrets(str(exc)[:500])))
             logger.warning("ClaudeCodeLLMProvider.turn: %s", err_msg)
+            observation = cost_observation_from_exception(exc)
             return TurnResponse(
                 content=[],
                 stop_reason=StopReason.ERROR,
                 input_tokens=0,
                 output_tokens=0,
+                cost_usd=(
+                    observation.legacy_cost_usd
+                    if observation is not None
+                    and observation.has_numeric_usd
+                    else None
+                ),
                 error_message=err_msg,
+                cost_observation=(
+                    observation
+                    if observation is not None
+                    else CostObservation.unknown(
+                        route=route_identity_from_config(self.config),
+                    )
+                ),
             )
 
         if isinstance(response, StructuredResponse):
             result = response.result
             cost_usd = response.cost
+            cost_observation = response.cost_observation
             # Preserve the real input/output split —
             # generate_structured populates both fields, and
             # ToolUseLoop records per-turn (input, output) pairs plus
@@ -4982,7 +5276,10 @@ class ClaudeCodeLLMProvider(LLMProvider):
             output_tokens = response.output_tokens
         else:
             result, _ = response
-            cost_usd = 0.0
+            cost_usd = None
+            cost_observation = CostObservation.unknown(
+                route=route_identity_from_config(self.config),
+            )
             input_tokens = 0
             output_tokens = 0
 
@@ -4992,6 +5289,7 @@ class ClaudeCodeLLMProvider(LLMProvider):
             cost_usd=cost_usd,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cost_observation=cost_observation,
         )
 
     def _turn_resumable(
@@ -5092,6 +5390,11 @@ class ClaudeCodeLLMProvider(LLMProvider):
                 error_message=err_msg,
             )
         duration = _time.monotonic() - start
+        observation = self.cost_observation(
+            sr.cost_usd,
+            cost_reported=sr.cost_reported,
+        )
+        reported_cost = sr.cost_usd if sr.cost_reported else None
 
         # Book usage BEFORE the error/empty-content returns: a failed
         # turn (budget abort, refusal) still spent real money, and
@@ -5106,6 +5409,7 @@ class ClaudeCodeLLMProvider(LLMProvider):
             cache_read_tokens=sr.cache_read_tokens,
             cache_write_tokens=sr.cache_creation_tokens,
             duration=duration,
+            cost_observation=observation,
         )
 
         if sr.error:
@@ -5135,9 +5439,11 @@ class ClaudeCodeLLMProvider(LLMProvider):
             return TurnResponse(
                 content=[],
                 stop_reason=StopReason.ERROR,
-                input_tokens=0,
-                output_tokens=0,
+                input_tokens=sr.input_tokens,
+                output_tokens=sr.output_tokens,
+                cost_usd=reported_cost,
                 error_message=err_msg,
+                cost_observation=observation,
             )
 
         self._messages_seen = len(messages)
@@ -5155,7 +5461,9 @@ class ClaudeCodeLLMProvider(LLMProvider):
                 stop_reason=StopReason.ERROR,
                 input_tokens=sr.input_tokens,
                 output_tokens=sr.output_tokens,
+                cost_usd=reported_cost,
                 error_message="empty response from stream-json",
+                cost_observation=observation,
             )
 
         if sr.structured_output is not None:
@@ -5168,15 +5476,18 @@ class ClaudeCodeLLMProvider(LLMProvider):
                     stop_reason=StopReason.ERROR,
                     input_tokens=sr.input_tokens,
                     output_tokens=sr.output_tokens,
+                    cost_usd=reported_cost,
                     error_message=f"structured parse: {result['error']}",
+                    cost_observation=observation,
                 )
 
         turn_resp = self._parse_turn_structured_result(
             result,
             tools,
-            cost_usd=sr.cost_usd,
+            cost_usd=reported_cost,
             input_tokens=sr.input_tokens,
             output_tokens=sr.output_tokens,
+            cost_observation=observation,
         )
         # Remember what this turn emitted so the next resumed turn can
         # recognise the loop's echo of it (see the unseen-slice skip).
@@ -5336,15 +5647,19 @@ class ClaudeCodeLLMProvider(LLMProvider):
         result: dict[str, Any],
         tools: Sequence[ToolDef],
         *,
-        cost_usd: float = 0.0,
+        cost_usd: float | None = None,
         input_tokens: int = 0,
         output_tokens: int = 0,
+        cost_observation: CostObservation | None = None,
     ) -> TurnResponse:
         """Translate CC's structured response into a
         :class:`TurnResponse`. Defensive against malformed output —
         falls back to a text block if the result doesn't fit either
         branch of the discriminated schema."""
         usd: float | None = float(cost_usd) if cost_usd is not None else None
+        observation = cost_observation or CostObservation.unknown(
+            route=route_identity_from_config(self.config),
+        )
         rtype = result.get("type")
         if rtype == "tool_call":
             name = result.get("tool_name")
@@ -5362,6 +5677,7 @@ class ClaudeCodeLLMProvider(LLMProvider):
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     cost_usd=usd,
+                    cost_observation=observation,
                 )
             # Malformed tool_call — surface the raw result as text so
             # callers can see what went wrong rather than silently
@@ -5372,6 +5688,7 @@ class ClaudeCodeLLMProvider(LLMProvider):
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 cost_usd=usd,
+                cost_observation=observation,
             )
         # Default to "complete" for type="complete" and any other
         # unexpected discriminator value.
@@ -5382,6 +5699,7 @@ class ClaudeCodeLLMProvider(LLMProvider):
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cost_usd=usd,
+            cost_observation=observation,
         )
 
 

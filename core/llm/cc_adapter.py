@@ -999,6 +999,7 @@ def extract_envelope_metadata(envelope: dict, into: dict) -> None:
     cost = envelope.get("total_cost_usd")
     if isinstance(cost, (int, float)):
         into["cost_usd"] = cost
+        into["cost_reported"] = True
     duration_ms = envelope.get("duration_ms")
     if isinstance(duration_ms, (int, float)):
         into["duration_seconds"] = round(duration_ms / 1000, 1)
@@ -1275,6 +1276,7 @@ class StreamJsonResult:
     structured_output: dict[str, Any] | None = None
     session_id: str | None = None
     cost_usd: float = 0.0
+    cost_reported: bool = False
     input_tokens: int = 0
     output_tokens: int = 0
     cache_read_tokens: int = 0
@@ -1399,6 +1401,7 @@ def parse_stream_json_lines(lines: list[str]) -> StreamJsonResult:
             cost = _finite_cost(obj.get("total_cost_usd"))
             if cost is not None:
                 result.cost_usd = cost
+                result.cost_reported = True
             usage = obj.get("usage")
             if not isinstance(usage, dict):
                 # A null / non-object ``usage`` on the result event
@@ -1784,6 +1787,7 @@ def run_cc_streaming(
         # can book the spend on its ledger; dropping it here made N
         # budget-aborted calls invisible to max-cost enforcement.
         err.cost_usd = partial.cost_usd
+        err.cost_reported = partial.cost_reported
         err.input_tokens = partial.input_tokens
         err.output_tokens = partial.output_tokens
         err.cache_read_tokens = partial.cache_read_tokens
