@@ -21,7 +21,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from core.json import load_json
+from core.json import load_json, save_json
 from core.run import (
     RUN_METADATA_FILE,
     RunOwnershipError,
@@ -32,6 +32,9 @@ from core.run import (
     interrupt_run,
     resume_run,
     start_run,
+)
+from core.testing.runtime_receipt_fake import (
+    build_runtime_receipt_lineage_fields as _valid_exact_lineage_fields,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -50,7 +53,6 @@ def _user_state_in_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class TestOwnershipEnforcement(unittest.TestCase):
-
     def _status(self, out: Path) -> str:
         return load_json(out / RUN_METADATA_FILE)["status"]
 
@@ -78,8 +80,7 @@ class TestOwnershipEnforcement(unittest.TestCase):
             # Simulated supervisor kill: the drain's interrupt must not
             # hit the double-finalisation refusal (pre-fix it did,
             # because the run was already stamped completed).
-            interrupt_run(out, "SIGTERM drain",
-                          expected_command="audit")
+            interrupt_run(out, "SIGTERM drain", expected_command="audit")
             self.assertEqual(self._status(out), "interrupted")
             segment = resume_run(out, note="resumed by test")
             self.assertEqual(segment, 2)
@@ -129,12 +130,63 @@ class TestOwnershipEnforcement(unittest.TestCase):
         """Runs predating command recording (or hand-built dirs) have
         no owner to defend — a claim passes through."""
         import json
+
         with TemporaryDirectory() as d:
             out = Path(d) / "legacy"
             out.mkdir()
-            (out / RUN_METADATA_FILE).write_text(
-                json.dumps({"status": "running"}))
+            (out / RUN_METADATA_FILE).write_text(json.dumps({"status": "running"}))
             ensure_run_command(out, "understand")  # must not raise
+
+    def test_receipt_metadata_refuses_generic_terminal_paths_first(self):
+        from unittest.mock import patch
+
+        from core.json import save_json
+        from core.run import metadata as md
+
+        with TemporaryDirectory() as d:
+            out = Path(d) / "receipt-run"
+            out.mkdir()
+            save_json(
+                out / RUN_METADATA_FILE,
+                {
+                    "version": 2,
+                    "command": "audit",
+                    "status": "running",
+                    "project": None,
+                    "project_source": "session",
+                    **_valid_exact_lineage_fields(),
+                },
+                mode=0o600,
+            )
+            before = (out / RUN_METADATA_FILE).read_bytes()
+            for action in (
+                lambda: complete_run(out),
+                lambda: fail_run(out, "x"),
+                lambda: cancel_run(out),
+                lambda: interrupt_run(out),
+                lambda: md.reopen_run(out),
+                lambda: md.project_run_projections(out),
+            ):
+                with (
+                    self.subTest(action=action),
+                    patch.object(
+                        md,
+                        "_finalize_sandbox_summary",
+                        side_effect=AssertionError(
+                            "receipt veto must precede terminal side effects"
+                        ),
+                    ),
+                    self.assertRaises(md.RunRuntimeReceiptError) as raised,
+                ):
+                    action()
+                self.assertEqual(
+                    raised.exception.reason,
+                    md.RunReceiptReason.TERMINAL_TRANSITION_FORBIDDEN,
+                )
+                self.assertEqual(
+                    (out / RUN_METADATA_FILE).read_bytes(),
+                    before,
+                )
 
 
 class TestOwnershipViaStub(unittest.TestCase):
@@ -148,7 +200,10 @@ class TestOwnershipViaStub(unittest.TestCase):
         env.pop("RAPTOR_CALLER_DIR", None)
         return subprocess.run(
             [sys.executable, LIFECYCLE] + list(args),
-            capture_output=True, text=True, env=env, cwd=cwd,
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=cwd,
         )
 
     def test_stub_refuses_foreign_claim_and_owner_proceeds(self):
@@ -156,18 +211,19 @@ class TestOwnershipViaStub(unittest.TestCase):
             out = Path(d) / "audit-run"
             start_run(out, "audit")
 
-            refused = self._run("complete", str(out),
-                                "--command", "understand")
+            refused = self._run("complete", str(out), "--command", "understand")
             self.assertEqual(refused.returncode, 1, refused.stderr)
             self.assertIn("owned by command 'audit'", refused.stderr)
             self.assertEqual(
-                load_json(out / RUN_METADATA_FILE)["status"], "running",
+                load_json(out / RUN_METADATA_FILE)["status"],
+                "running",
             )
 
             owned = self._run("complete", str(out), "--command", "audit")
             self.assertEqual(owned.returncode, 0, owned.stderr)
             self.assertEqual(
-                load_json(out / RUN_METADATA_FILE)["status"], "completed",
+                load_json(out / RUN_METADATA_FILE)["status"],
+                "completed",
             )
 
     def test_stub_fail_with_claim_and_message(self):
@@ -175,8 +231,7 @@ class TestOwnershipViaStub(unittest.TestCase):
         with TemporaryDirectory() as d:
             out = Path(d) / "scan-run"
             start_run(out, "scan")
-            refused = self._run("fail", str(out), "boom",
-                                "--command", "understand")
+            refused = self._run("fail", str(out), "boom", "--command", "understand")
             self.assertEqual(refused.returncode, 1, refused.stderr)
             ok = self._run("fail", str(out), "boom", "--command", "scan")
             self.assertEqual(ok.returncode, 0, ok.stderr)
@@ -188,18 +243,52 @@ class TestOwnershipViaStub(unittest.TestCase):
         with TemporaryDirectory() as d:
             out = Path(d) / "audit-run"
             start_run(out, "audit")
-            refused = self._run("interrupt", str(out), "drain",
-                                "--command", "understand")
+            refused = self._run(
+                "interrupt", str(out), "drain", "--command", "understand"
+            )
             self.assertEqual(refused.returncode, 1, refused.stderr)
             self.assertEqual(
-                load_json(out / RUN_METADATA_FILE)["status"], "running",
+                load_json(out / RUN_METADATA_FILE)["status"],
+                "running",
             )
-            ok = self._run("interrupt", str(out), "drain",
-                           "--command", "audit")
+            ok = self._run("interrupt", str(out), "drain", "--command", "audit")
             self.assertEqual(ok.returncode, 0, ok.stderr)
             self.assertEqual(
-                load_json(out / RUN_METADATA_FILE)["status"], "interrupted",
+                load_json(out / RUN_METADATA_FILE)["status"],
+                "interrupted",
             )
+
+    def test_receipt_run_refuses_complete_and_fail_without_mutation(self):
+        for action, args in (
+            ("complete", ()),
+            ("fail", ("should-not-land",)),
+        ):
+            with self.subTest(action=action), TemporaryDirectory() as d:
+                out = Path(d) / "receipt-run"
+                out.mkdir()
+                save_json(
+                    out / RUN_METADATA_FILE,
+                    {
+                        "version": 2,
+                        "command": "scan",
+                        "status": "running",
+                        "project": None,
+                        "project_source": "session",
+                        **_valid_exact_lineage_fields(),
+                    },
+                    mode=0o600,
+                )
+                before = (out / RUN_METADATA_FILE).read_bytes()
+
+                refused = self._run(action, str(out), *args)
+
+                self.assertEqual(refused.returncode, 1, refused.stderr)
+                self.assertIn("terminal_transition_forbidden", refused.stderr)
+                self.assertEqual((out / RUN_METADATA_FILE).read_bytes(), before)
+                self.assertEqual(
+                    load_json(out / RUN_METADATA_FILE)["status"],
+                    "running",
+                )
 
 
 if __name__ == "__main__":

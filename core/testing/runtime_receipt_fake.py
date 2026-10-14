@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import hashlib
+import json
 import os
 import platform
 import secrets
@@ -13,7 +14,7 @@ import subprocess
 import tempfile
 import threading
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
@@ -49,6 +50,7 @@ _COMPILER_ENV: Mapping[str, str] = MappingProxyType(
     }
 )
 _BUILD_CACHE_LOCK = threading.Lock()
+_RUNTIME_RECEIPT_TEST_TOKEN = "00112233445566778899aabbccddeeff"
 _RECEIPT_CASES_PATH = (
     Path(__file__).resolve().parents[1]
     / "startup/tests/fixtures/runtime_receipt/cases.json"
@@ -668,6 +670,229 @@ def forbid_receipt_sidecar_reads(message: str) -> Iterator[None]:
         yield
 
 
+@dataclass(slots=True)
+class RuntimeReceiptRunEnvironment:
+    """Stable receipt-backed run fixture shared by run integration tests."""
+
+    root: Path
+    entry: Path
+    reference: Any
+    receipt: Any
+    snapshot: Any
+    profiles: Any
+    active: list[Path | None]
+    frozen: list[tuple[Path, str | None, str]]
+
+
+@contextlib.contextmanager
+def runtime_receipt_run_environment(
+    test_root: Path,
+    monkeypatch: Any,
+) -> Iterator[RuntimeReceiptRunEnvironment]:
+    """Install one deterministic ownerless receipt-backed session."""
+
+    from core.project import sessions
+    from core.run import metadata as run_metadata
+    from core.run.pin import set_process_project
+    from core.startup.host import Frontend, SessionHostClaim
+    from core.startup.runtime_receipt.canonical import canonical_bytes
+    from core.startup.runtime_receipt.plumbing_types import (
+        PlumbingFailure,
+        RuntimeReceiptSnapshot,
+        reference_from_receipt,
+    )
+    from core.startup.runtime_receipt.profile import load_profile_store
+    from core.startup.runtime_receipt.reasons import ReceiptRejection
+    from core.startup.runtime_receipt.verify import parse_receipt, serialize_receipt
+
+    receipt = parse_receipt(canonical_bytes(build_runtime_receipt_document()))
+    assert not isinstance(receipt, ReceiptRejection)
+    reference = reference_from_receipt(receipt)
+    assert not isinstance(reference, PlumbingFailure)
+    snapshot = RuntimeReceiptSnapshot(reference=reference, receipt=receipt)
+    profiles = load_profile_store()
+    assert not isinstance(profiles, ReceiptRejection)
+
+    root = Path(test_root) / "sessions.d"
+    root.mkdir(mode=0o700)
+    root.chmod(0o700)
+    host = SessionHostClaim(
+        frontend=Frontend.COPILOT,
+        uid=reference.launcher_euid.value,
+        executable=Path("/owned/copilot"),
+        executable_device=10,
+        executable_inode=20,
+    )
+    sidecar = root / reference.sidecar_name
+    sidecar.write_bytes(serialize_receipt(receipt))
+    sidecar.chmod(0o600)
+    entry = root / reference.session_pid.text
+    entry.write_bytes(
+        sessions._serialize_session_receipt_entry(
+            reference,
+            since="2026-09-12T00:00:00.000000+00:00",
+            host=host,
+            token_hex=_RUNTIME_RECEIPT_TEST_TOKEN,
+        )
+    )
+    entry.chmod(0o600)
+
+    monkeypatch.setattr(sessions, "SESSIONS_DIR", root)
+    monkeypatch.setattr(sessions, "_pid_running", lambda _pid: True)
+    monkeypatch.setattr(
+        sessions,
+        "proc_starttime",
+        lambda _pid: reference.session_starttime_ticks.text,
+    )
+    monkeypatch.setattr(sessions, "boot_id", lambda: reference.boot_id.value)
+    monkeypatch.setattr(
+        sessions,
+        "pidns_id",
+        lambda: reference.pid_namespace_inode.text,
+    )
+    monkeypatch.setattr(
+        sessions,
+        "_current_euid",
+        lambda: reference.launcher_euid.value,
+    )
+    monkeypatch.setattr(
+        sessions,
+        "_process_uid",
+        lambda _pid: reference.launcher_euid.value,
+    )
+    monkeypatch.setattr(
+        sessions,
+        "_process_executable_identity",
+        lambda _pid: (10, 20),
+    )
+    monkeypatch.setenv(sessions.ENV_SESSION_PID, reference.session_pid.text)
+    monkeypatch.setenv(sessions.ENV_SESSION_TOKEN, _RUNTIME_RECEIPT_TEST_TOKEN)
+    monkeypatch.delenv("CLAUDECODE", raising=False)
+
+    clock_lock = threading.Lock()
+    clock_tick = 0
+    clock_base = runtime_receipt_verification_now().replace(microsecond=0)
+
+    class _AdvancingDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            nonlocal clock_tick
+            with clock_lock:
+                value = clock_base + timedelta(microseconds=clock_tick)
+                clock_tick += 1
+            return value if tz is None else value.astimezone(tz)
+
+    monkeypatch.setattr(run_metadata, "datetime", _AdvancingDateTime)
+    monkeypatch.setattr(
+        "core.project.project.PROJECTS_DIR",
+        Path(test_root) / "projects",
+    )
+    monkeypatch.setattr(
+        "core.project.project.DEFAULT_OUTPUT_BASE",
+        Path(test_root) / "managed-projects",
+    )
+    monkeypatch.setattr(
+        "core.run.provenance.build_start_manifest",
+        lambda **_kwargs: {"provenance": "test"},
+    )
+    monkeypatch.setattr("core.run.tmp_reaper.reap_stale_tmp", lambda: None)
+    monkeypatch.setattr("core.run.tmp_reaper.reap_stale_logs", lambda: None)
+    monkeypatch.setattr(
+        "core.run.tmp_reaper.reap_stale_runs",
+        lambda _parent: [],
+    )
+    active: list[Path | None] = []
+    frozen: list[tuple[Path, str | None, str]] = []
+    monkeypatch.setattr(
+        "core.sandbox.summary.set_active_run_dir",
+        lambda value: active.append(None if value is None else Path(value)),
+    )
+    monkeypatch.setattr(
+        "core.run.pin.freeze_run_pin",
+        lambda run_dir, project, source: frozen.append(
+            (Path(run_dir), project, source)
+        ),
+    )
+
+    set_process_project(None)
+    try:
+        yield RuntimeReceiptRunEnvironment(
+            root=root,
+            entry=entry,
+            reference=reference,
+            receipt=receipt,
+            snapshot=snapshot,
+            profiles=profiles,
+            active=active,
+            frozen=frozen,
+        )
+    finally:
+        set_process_project(None)
+
+
+def start_runtime_receipt_run(
+    environment: RuntimeReceiptRunEnvironment,
+    test_root: Path,
+    name: str = "receipt-run",
+    **kwargs: Any,
+) -> Path:
+    """Start a run using an installed receipt-backed test environment."""
+
+    from core.run import metadata as run_metadata
+
+    del environment
+    return run_metadata.start_run(
+        Path(test_root) / "runs" / name,
+        "scan",
+        **kwargs,
+    )
+
+
+def build_runtime_receipt_lineage_fields() -> dict[str, Any]:
+    """Build exact reserved metadata for generic lifecycle veto tests."""
+
+    from core.run import metadata as run_metadata
+    from core.startup.runtime_receipt.canonical import canonical_bytes, sha256_hex
+    from core.startup.runtime_receipt.plumbing_types import (
+        PlumbingFailure,
+        RuntimeReceiptSnapshot,
+        reference_from_receipt,
+        serialize_reference,
+        serialize_snapshot,
+    )
+    from core.startup.runtime_receipt.reasons import ReceiptRejection
+    from core.startup.runtime_receipt.verify import parse_receipt
+
+    receipt = parse_receipt(canonical_bytes(build_runtime_receipt_document()))
+    assert not isinstance(receipt, ReceiptRejection)
+    reference = reference_from_receipt(receipt)
+    assert not isinstance(reference, PlumbingFailure)
+    snapshot = RuntimeReceiptSnapshot(reference=reference, receipt=receipt)
+    snapshot_value = json.loads(serialize_snapshot(snapshot))
+    assert isinstance(snapshot_value, dict)
+    snapshot_sha256 = sha256_hex(canonical_bytes(snapshot_value))
+    reference_value = json.loads(serialize_reference(reference))
+    assert isinstance(reference_value, dict)
+    return {
+        run_metadata.RUN_RUNTIME_RECEIPT_KEY: snapshot_value,
+        run_metadata.RUN_RUNTIME_RECEIPT_LINEAGE_KEY: {
+            "schema": run_metadata.RUN_RECEIPT_LINEAGE_SCHEMA,
+            "schema_version": run_metadata.RUN_RECEIPT_LINEAGE_SCHEMA_VERSION,
+            "entries": [
+                {
+                    "segment": 2,
+                    "resumed_at_utc": "2026-09-12T08:30:00.000000+00:00",
+                    "relation": "exact",
+                    "prior_snapshot_sha256": snapshot_sha256,
+                    "current_snapshot_sha256": snapshot_sha256,
+                    "prior_reference": reference_value,
+                    "current_reference": copy.deepcopy(reference_value),
+                }
+            ],
+        },
+    }
+
+
 def make_owned_runtime_receipt_fake(
     test_root: Path,
     *,
@@ -741,8 +966,12 @@ __all__ = [
     "FakeRuntimeScenario",
     "FakeRuntimeUnsupported",
     "build_runtime_receipt_document",
+    "build_runtime_receipt_lineage_fields",
     "forbid_receipt_sidecar_reads",
     "make_owned_runtime_receipt_fake",
     "resign_runtime_receipt_document",
+    "RuntimeReceiptRunEnvironment",
     "runtime_receipt_verification_now",
+    "runtime_receipt_run_environment",
+    "start_runtime_receipt_run",
 ]

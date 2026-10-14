@@ -1,5 +1,8 @@
 """Tests for libexec/raptor-lifecycle-hook."""
 
+import contextlib
+import copy
+import hashlib
 import importlib.machinery
 import importlib.util
 import io
@@ -12,19 +15,33 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+import pytest
+
 from core.json import load_json, save_json
+from core.project import sessions
+from core.run import metadata as run_metadata
 from core.run.metadata import (
-    RUN_METADATA_FILE, STATUS_RUNNING, STATUS_COMPLETED, STATUS_FAILED,
+    RUN_METADATA_FILE,
+    STATUS_RUNNING,
+    STATUS_COMPLETED,
+    STATUS_FAILED,
 )
 from core.startup.host import Frontend, SessionHostClaim
+from core.testing.runtime_receipt_fake import (
+    build_runtime_receipt_document as _receipt_document,
+    build_runtime_receipt_lineage_fields as _valid_exact_lineage_fields,
+    forbid_receipt_sidecar_reads as _sidecar_reads_forbidden,
+    resign_runtime_receipt_document as _resign,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[3]  # core/run/tests/ → raptor/
 HOOK_SCRIPT = REPO_ROOT / "libexec" / "raptor-lifecycle-hook"
 
 # Import the hook module despite its hyphenated filename and missing .py ext.
 _loader = importlib.machinery.SourceFileLoader("lifecycle_hook", str(HOOK_SCRIPT))
-_spec = importlib.util.spec_from_loader("lifecycle_hook", _loader,
-                                        origin=str(HOOK_SCRIPT))
+_spec = importlib.util.spec_from_loader(
+    "lifecycle_hook", _loader, origin=str(HOOK_SCRIPT)
+)
 _hook_mod = importlib.util.module_from_spec(_spec)
 _hook_mod.__file__ = str(HOOK_SCRIPT)
 _spec.loader.exec_module(_hook_mod)
@@ -33,11 +50,16 @@ FAILURE_MARKER = _hook_mod.FAILURE_MARKER
 MULTI_TURN = _hook_mod._MULTI_TURN_COMMANDS
 
 SESSION_PID = 99999
+_HOST_V2_TOKEN = "00112233445566778899aabbccddeeff"
 
 
-def _make_running_run(parent: Path, name: str, command: str,
-                      session_pid: int = SESSION_PID,
-                      tool_pid: int = 11111) -> Path:
+def _make_running_run(
+    parent: Path,
+    name: str,
+    command: str,
+    session_pid: int = SESSION_PID,
+    tool_pid: int = 11111,
+) -> Path:
     """Create a run directory with status=running metadata."""
     d = parent / name
     d.mkdir(parents=True, exist_ok=True)
@@ -68,6 +90,85 @@ RAPTOR_BASH_FAILURE = json.dumps({
 
 def _stdin(payload: str):
     return patch.object(sys, "stdin", io.StringIO(payload))
+
+def _receipt_marker_value(variant: str) -> object:
+    if variant == "invalid":
+        return {"malformed": True}
+    document = copy.deepcopy(_receipt_document())
+    if variant in {"pending", "rejected"}:
+        document["decision"]["state"] = variant
+    elif variant == "digest":
+        document["receipt_sha256"] = "f" * 64
+    elif variant == "profile":
+        document["stable_identity"]["profile_id"] = "other-profile"
+    elif variant == "stable":
+        document["stable_identity"]["cli_version"] = "9.9.9"
+    elif variant == "nonce":
+        document["launch_binding"]["receipt_nonce"] = "f" * 32
+    elif variant == "session":
+        replacement = "99999999-8888-4777-8666-555555555555"
+        document["launch_instance"]["session_id"] = replacement
+        document["launch_binding"]["session_id"] = replacement
+    elif variant not in {"exact", "missing-sidecar"}:
+        raise AssertionError(f"unknown lifecycle variant {variant}")
+    return _resign(document)
+
+
+def _write_host_v2_entry(root: Path) -> Path:
+    fields = {
+        "v": "2",
+        "project": "-",
+        "since": "2026-09-12T00:00:00+00:00",
+        "starttime": "1",
+        "boot_id": "00000000-0000-4000-8000-000000000000",
+        "pidns": "1",
+        "host_v": "2",
+        "host": "copilot",
+        "host_uid": str(os.geteuid()),
+        "host_exe": "/owned/copilot",
+        "host_exe_dev": "10",
+        "host_exe_ino": "20",
+        "host_receipt_v": "1",
+        "host_receipt_state": "verified",
+        "host_receipt_sha256": "a" * 64,
+        "host_receipt_reference": "{}",
+        "token": _HOST_V2_TOKEN,
+        "seeded_by": "owned_fake",
+    }
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    root.chmod(0o700)
+    entry = root / str(os.getpid())
+    entry.write_text(
+        "".join(f"{key}={fields[key]}\n" for key in sessions._HOST_V2_ENTRY_KEYS),
+        encoding="utf-8",
+    )
+    entry.chmod(0o600)
+    return entry
+
+
+@contextlib.contextmanager
+def _receipt_authority_calls_forbidden(*, metadata_lock: bool = True):
+    paths = [
+        "core.run.metadata.compare_run_runtime_receipt",
+        "core.project.sessions.capture_current_session_runtime_receipt",
+        "core.project.sessions.session_runtime_receipt_fence",
+        "core.project.sessions._strict_session_lock",
+        "core.project.oplock.project_op_lock",
+    ]
+    if metadata_lock:
+        paths.append("core.run.metadata._metadata_lock")
+    with contextlib.ExitStack() as stack:
+        for target in paths:
+            stack.enter_context(
+                patch(
+                    target,
+                    side_effect=AssertionError(
+                        f"lifecycle deny-only path called {target}"
+                    ),
+                )
+            )
+        stack.enter_context(_sidecar_reads_forbidden("lifecycle deny-only path"))
+        yield
 
 
 class TestToolFailureMarker(unittest.TestCase):
@@ -261,10 +362,11 @@ class TestStopHook(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             out = Path(tmp) / "out"
             run = _make_running_run(out, "scan-001", "scan", tool_pid=1)
-            with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID), \
-                 patch("core.run.metadata._pid_alive", return_value=False):
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", Path(tmp)),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+                patch("core.run.metadata._pid_alive", return_value=False),
+            ):
                 sys.argv = ["hook", "stop"]
                 _hook_mod.main()
             self.assertEqual(_status(run), STATUS_COMPLETED)
@@ -274,10 +376,11 @@ class TestStopHook(unittest.TestCase):
             out = Path(tmp) / "out"
             run = _make_running_run(out, "scan-001", "scan", tool_pid=1)
             (run / FAILURE_MARKER).write_text("")
-            with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID), \
-                 patch("core.run.metadata._pid_alive", return_value=False):
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", Path(tmp)),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+                patch("core.run.metadata._pid_alive", return_value=False),
+            ):
                 sys.argv = ["hook", "stop"]
                 _hook_mod.main()
             self.assertEqual(_status(run), STATUS_FAILED)
@@ -289,10 +392,11 @@ class TestStopHook(unittest.TestCase):
             out = Path(tmp) / "out"
             run = _make_running_run(out, "scan-001", "scan", tool_pid=1)
             (run / FAILURE_MARKER).write_text("")
-            with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID), \
-                 patch("core.run.metadata._pid_alive", return_value=False):
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", Path(tmp)),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+                patch("core.run.metadata._pid_alive", return_value=False),
+            ):
                 sys.argv = ["hook", "stop"]
                 _hook_mod.main()
             self.assertFalse((run / FAILURE_MARKER).exists())
@@ -308,10 +412,11 @@ class TestStopHook(unittest.TestCase):
             # to test that Stop cleans it up even on the fail path.
             # Test the complete path instead: no marker.
             (run / FAILURE_MARKER).unlink()
-            with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID), \
-                 patch("core.run.metadata._pid_alive", return_value=False):
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", Path(tmp)),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+                patch("core.run.metadata._pid_alive", return_value=False),
+            ):
                 sys.argv = ["hook", "stop"]
                 _hook_mod.main()
             self.assertEqual(_status(run), STATUS_COMPLETED)
@@ -320,12 +425,12 @@ class TestStopHook(unittest.TestCase):
     def test_skips_multi_turn_validate(self):
         with TemporaryDirectory() as tmp:
             out = Path(tmp) / "out"
-            run = _make_running_run(out, "validate-001", "validate",
-                                    tool_pid=1)
-            with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID), \
-                 patch("core.run.metadata._pid_alive", return_value=False):
+            run = _make_running_run(out, "validate-001", "validate", tool_pid=1)
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", Path(tmp)),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+                patch("core.run.metadata._pid_alive", return_value=False),
+            ):
                 sys.argv = ["hook", "stop"]
                 _hook_mod.main()
             self.assertEqual(_status(run), STATUS_RUNNING)
@@ -333,12 +438,12 @@ class TestStopHook(unittest.TestCase):
     def test_skips_multi_turn_understand(self):
         with TemporaryDirectory() as tmp:
             out = Path(tmp) / "out"
-            run = _make_running_run(out, "understand-001", "understand",
-                                    tool_pid=1)
-            with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID), \
-                 patch("core.run.metadata._pid_alive", return_value=False):
+            run = _make_running_run(out, "understand-001", "understand", tool_pid=1)
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", Path(tmp)),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+                patch("core.run.metadata._pid_alive", return_value=False),
+            ):
                 sys.argv = ["hook", "stop"]
                 _hook_mod.main()
             self.assertEqual(_status(run), STATUS_RUNNING)
@@ -359,12 +464,14 @@ class TestStopHook(unittest.TestCase):
     def test_skips_different_session(self):
         with TemporaryDirectory() as tmp:
             out = Path(tmp) / "out"
-            run = _make_running_run(out, "scan-001", "scan",
-                                    session_pid=88888, tool_pid=1)
-            with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID), \
-                 patch("core.run.metadata._pid_alive", return_value=False):
+            run = _make_running_run(
+                out, "scan-001", "scan", session_pid=88888, tool_pid=1
+            )
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", Path(tmp)),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+                patch("core.run.metadata._pid_alive", return_value=False),
+            ):
                 sys.argv = ["hook", "stop"]
                 _hook_mod.main()
             self.assertEqual(_status(run), STATUS_RUNNING)
@@ -376,10 +483,11 @@ class TestStopHook(unittest.TestCase):
             meta = load_json(run / RUN_METADATA_FILE)
             meta["status"] = STATUS_COMPLETED
             save_json(run / RUN_METADATA_FILE, meta)
-            with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID), \
-                 patch("core.run.metadata._pid_alive", return_value=False):
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", Path(tmp)),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+                patch("core.run.metadata._pid_alive", return_value=False),
+            ):
                 sys.argv = ["hook", "stop"]
                 _hook_mod.main()
             self.assertEqual(_status(run), STATUS_COMPLETED)
@@ -391,16 +499,19 @@ class TestStopHook(unittest.TestCase):
             d = out / "scan-001"
             d.mkdir(parents=True)
             meta = {
-                "version": 1, "command": "scan",
+                "version": 1,
+                "command": "scan",
                 "timestamp": "2026-05-03T12:00:00+00:00",
-                "status": STATUS_RUNNING, "extra": {},
+                "status": STATUS_RUNNING,
+                "extra": {},
                 "session_pid": SESSION_PID,
                 # no tool_pid
             }
             save_json(d / RUN_METADATA_FILE, meta)
-            with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID):
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", Path(tmp)),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+            ):
                 sys.argv = ["hook", "stop"]
                 _hook_mod.main()
             self.assertEqual(_status(d), STATUS_COMPLETED)
@@ -414,9 +525,10 @@ class TestSessionEndHook(unittest.TestCase):
             out = Path(tmp) / "out"
             run1 = _make_running_run(out, "scan-001", "scan")
             run2 = _make_running_run(out, "validate-002", "validate")
-            with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID):
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", Path(tmp)),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+            ):
                 sys.argv = ["hook", "session-end"]
                 _hook_mod.main()
             self.assertEqual(_status(run1), STATUS_FAILED)
@@ -427,9 +539,10 @@ class TestSessionEndHook(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             out = Path(tmp) / "out"
             run = _make_running_run(out, "validate-001", "validate")
-            with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID):
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", Path(tmp)),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+            ):
                 sys.argv = ["hook", "session-end"]
                 _hook_mod.main()
             self.assertEqual(_status(run), STATUS_FAILED)
@@ -441,9 +554,10 @@ class TestSessionEndHook(unittest.TestCase):
             out = Path(tmp) / "out"
             run = _make_running_run(out, "scan-001", "scan")
             (run / FAILURE_MARKER).write_text("")
-            with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID):
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", Path(tmp)),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+            ):
                 sys.argv = ["hook", "session-end"]
                 _hook_mod.main()
             self.assertFalse((run / FAILURE_MARKER).exists())
@@ -455,9 +569,10 @@ class TestSessionEndHook(unittest.TestCase):
             meta = load_json(run / RUN_METADATA_FILE)
             meta["status"] = STATUS_COMPLETED
             save_json(run / RUN_METADATA_FILE, meta)
-            with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID):
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", Path(tmp)),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+            ):
                 sys.argv = ["hook", "session-end"]
                 _hook_mod.main()
             self.assertEqual(_status(run), STATUS_COMPLETED)
@@ -465,11 +580,11 @@ class TestSessionEndHook(unittest.TestCase):
     def test_skips_different_session(self):
         with TemporaryDirectory() as tmp:
             out = Path(tmp) / "out"
-            run = _make_running_run(out, "scan-001", "scan",
-                                    session_pid=88888)
-            with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID):
+            run = _make_running_run(out, "scan-001", "scan", session_pid=88888)
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", Path(tmp)),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+            ):
                 sys.argv = ["hook", "session-end"]
                 _hook_mod.main()
             self.assertEqual(_status(run), STATUS_RUNNING)
@@ -490,24 +605,12 @@ class TestSessionEndHook(unittest.TestCase):
             )
             with (
                 patch.object(sessions, "SESSIONS_DIR", sessions_dir),
-                patch.object(
-                    sessions,
-                    "_pid_running",
-                    lambda pid: pid == SESSION_PID,
-                ),
-                patch.object(
-                    sessions,
-                    "proc_starttime",
-                    lambda _pid: "new-start",
-                ),
+                patch.object(sessions, "_pid_running", lambda pid: pid == SESSION_PID),
+                patch.object(sessions, "proc_starttime", lambda _pid: "new-start"),
                 patch.object(sessions, "boot_id", lambda: "same-boot"),
                 patch.object(sessions, "pidns_id", lambda: "same-ns"),
                 patch.object(sessions, "_comm", lambda _pid: "copilot"),
-                patch.object(
-                    sessions,
-                    "_process_uid",
-                    lambda _pid: os.geteuid(),
-                ),
+                patch.object(sessions, "_process_uid", lambda _pid: os.geteuid()),
                 patch.object(
                     sessions,
                     "_process_executable_identity",
@@ -526,17 +629,10 @@ class TestSessionEndHook(unittest.TestCase):
                     **claim.session_fields(),
                 }
                 (sessions_dir / str(SESSION_PID)).write_text(
-                    "".join(
-                        f"{key}={value}\n" for key, value in fields.items()
-                    ),
+                    "".join(f"{key}={value}\n" for key, value in fields.items()),
                     encoding="utf-8",
                 )
-                run = _make_running_run(
-                    repo / "out",
-                    "scan-001",
-                    "scan",
-                    tool_pid=1,
-                )
+                run = _make_running_run(repo / "out", "scan-001", "scan", tool_pid=1)
                 meta = load_json(run / RUN_METADATA_FILE)
                 meta.update(
                     {
@@ -550,8 +646,7 @@ class TestSessionEndHook(unittest.TestCase):
                 with (
                     patch.object(_hook_mod, "REPO_ROOT", repo),
                     patch(
-                        "core.run.metadata._get_session_pid",
-                        return_value=SESSION_PID,
+                        "core.run.metadata._get_session_pid", return_value=SESSION_PID
                     ),
                     patch("core.run.metadata._pid_alive", return_value=False),
                 ):
@@ -566,8 +661,7 @@ class TestSessionEndHook(unittest.TestCase):
                 with (
                     patch.object(_hook_mod, "REPO_ROOT", repo),
                     patch(
-                        "core.run.metadata._get_session_pid",
-                        return_value=SESSION_PID,
+                        "core.run.metadata._get_session_pid", return_value=SESSION_PID
                     ),
                     patch("core.run.metadata._pid_alive", return_value=False),
                     _stdin(
@@ -599,24 +693,12 @@ class TestSessionEndHook(unittest.TestCase):
             )
             with (
                 patch.object(sessions, "SESSIONS_DIR", sessions_dir),
-                patch.object(
-                    sessions,
-                    "_pid_running",
-                    lambda pid: pid == SESSION_PID,
-                ),
-                patch.object(
-                    sessions,
-                    "proc_starttime",
-                    lambda _pid: "same-start",
-                ),
+                patch.object(sessions, "_pid_running", lambda pid: pid == SESSION_PID),
+                patch.object(sessions, "proc_starttime", lambda _pid: "same-start"),
                 patch.object(sessions, "boot_id", lambda: "same-boot"),
                 patch.object(sessions, "pidns_id", lambda: "same-ns"),
                 patch.object(sessions, "_comm", lambda _pid: "copilot"),
-                patch.object(
-                    sessions,
-                    "_process_uid",
-                    lambda _pid: os.geteuid(),
-                ),
+                patch.object(sessions, "_process_uid", lambda _pid: os.geteuid()),
                 patch.object(
                     sessions,
                     "_process_executable_identity",
@@ -635,22 +717,14 @@ class TestSessionEndHook(unittest.TestCase):
                     **claim.session_fields(),
                 }
                 (sessions_dir / str(SESSION_PID)).write_text(
-                    "".join(
-                        f"{key}={value}\n" for key, value in fields.items()
-                    ),
+                    "".join(f"{key}={value}\n" for key, value in fields.items()),
                     encoding="utf-8",
                 )
-                run = _make_running_run(
-                    repo / "out",
-                    "scan-legacy",
-                    "scan",
-                    tool_pid=1,
-                )
+                run = _make_running_run(repo / "out", "scan-legacy", "scan", tool_pid=1)
                 with (
                     patch.object(_hook_mod, "REPO_ROOT", repo),
                     patch(
-                        "core.run.metadata._get_session_pid",
-                        return_value=SESSION_PID,
+                        "core.run.metadata._get_session_pid", return_value=SESSION_PID
                     ),
                     patch("core.run.metadata._pid_alive", return_value=False),
                 ):
@@ -670,13 +744,15 @@ class TestLLMOverride(unittest.TestCase):
             (run / FAILURE_MARKER).write_text("")
             # LLM explicitly completes
             from core.run.metadata import complete_run
+
             complete_run(run)
             self.assertEqual(_status(run), STATUS_COMPLETED)
             # Now Stop fires — should skip because not running
-            with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID), \
-                 patch("core.run.metadata._pid_alive", return_value=False):
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", Path(tmp)),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+                patch("core.run.metadata._pid_alive", return_value=False),
+            ):
                 sys.argv = ["hook", "stop"]
                 _hook_mod.main()
             self.assertEqual(_status(run), STATUS_COMPLETED)
@@ -687,12 +763,14 @@ class TestLLMOverride(unittest.TestCase):
             out = Path(tmp) / "out"
             run = _make_running_run(out, "scan-001", "scan", tool_pid=1)
             from core.run.metadata import fail_run
+
             fail_run(run, "analysis found nothing")
             self.assertEqual(_status(run), STATUS_FAILED)
-            with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID), \
-                 patch("core.run.metadata._pid_alive", return_value=False):
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", Path(tmp)),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+                patch("core.run.metadata._pid_alive", return_value=False),
+            ):
                 sys.argv = ["hook", "stop"]
                 _hook_mod.main()
             self.assertEqual(_status(run), STATUS_FAILED)
@@ -711,26 +789,29 @@ class TestProjectDirScan(unittest.TestCase):
         session run ledger names the run dir exactly."""
         import os
         from core.project import sessions
+
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
             proj = repo / "out" / "projects" / "myapp"
             run = _make_running_run(proj, "scan-001", "scan", tool_pid=1)
             sessions_dir = repo / "sessions.d"
-            with patch.object(_hook_mod, "REPO_ROOT", repo), \
-                 patch.object(sessions, "SESSIONS_DIR", sessions_dir), \
-                 patch.object(sessions, "_comm",
-                              lambda pid: "claude"
-                              if pid in (SESSION_PID, os.getpid())
-                              else None), \
-                 patch.object(sessions, "_pid_running",
-                              lambda pid: pid in (SESSION_PID,
-                                                  os.getpid())), \
-                 patch.object(sessions, "proc_starttime",
-                              lambda pid: "7"), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID), \
-                 patch("core.run.metadata._pid_alive",
-                       return_value=False):
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", repo),
+                patch.object(sessions, "SESSIONS_DIR", sessions_dir),
+                patch.object(
+                    sessions,
+                    "_comm",
+                    lambda pid: "claude" if pid in (SESSION_PID, os.getpid()) else None,
+                ),
+                patch.object(
+                    sessions,
+                    "_pid_running",
+                    lambda pid: pid in (SESSION_PID, os.getpid()),
+                ),
+                patch.object(sessions, "proc_starttime", lambda pid: "7"),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+                patch("core.run.metadata._pid_alive", return_value=False),
+            ):
                 sessions.record_session("myapp", pid=SESSION_PID)
                 sessions.ledger_record_start(run, pid=SESSION_PID)
                 sys.argv = ["hook", "stop"]
@@ -742,10 +823,11 @@ class TestProjectDirScan(unittest.TestCase):
             repo = Path(tmp)
             out = repo / "out"
             run = _make_running_run(out, "scan-001", "scan", tool_pid=1)
-            with patch.object(_hook_mod, "REPO_ROOT", repo), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID), \
-                 patch("core.run.metadata._pid_alive", return_value=False):
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", repo),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+                patch("core.run.metadata._pid_alive", return_value=False),
+            ):
                 sys.argv = ["hook", "stop"]
                 _hook_mod.main()
             self.assertEqual(_status(run), STATUS_COMPLETED)
@@ -755,10 +837,11 @@ class TestProjectDirScan(unittest.TestCase):
             repo = Path(tmp)
             out = repo / "out"
             run = _make_running_run(out, ".internal", "scan", tool_pid=1)
-            with patch.object(_hook_mod, "REPO_ROOT", repo), \
-                 patch("core.run.metadata._get_session_pid",
-                       return_value=SESSION_PID), \
-                 patch("core.run.metadata._pid_alive", return_value=False):
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", repo),
+                patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+                patch("core.run.metadata._pid_alive", return_value=False),
+            ):
                 sys.argv = ["hook", "stop"]
                 _hook_mod.main()
             self.assertEqual(_status(run), STATUS_RUNNING)
@@ -780,16 +863,20 @@ class TestMultiTurnGuard(unittest.TestCase):
             with TemporaryDirectory() as tmp:
                 out = Path(tmp) / "out"
                 run = _make_running_run(out, f"{cmd}-001", cmd, tool_pid=1)
-                with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                     patch("core.run.metadata._get_session_pid",
-                           return_value=SESSION_PID), \
-                     patch("core.run.metadata._pid_alive",
-                           return_value=False):
+                with (
+                    patch.object(_hook_mod, "REPO_ROOT", Path(tmp)),
+                    patch(
+                        "core.run.metadata._get_session_pid", return_value=SESSION_PID
+                    ),
+                    patch("core.run.metadata._pid_alive", return_value=False),
+                ):
                     sys.argv = ["hook", "stop"]
                     _hook_mod.main()
                 self.assertEqual(
-                    _status(run), STATUS_RUNNING,
-                    f"Stop should skip multi-turn command '{cmd}'")
+                    _status(run),
+                    STATUS_RUNNING,
+                    f"Stop should skip multi-turn command '{cmd}'",
+                )
 
     def test_all_multi_turn_caught_by_session_end(self):
         """SessionEnd catches every multi-turn command."""
@@ -797,14 +884,237 @@ class TestMultiTurnGuard(unittest.TestCase):
             with TemporaryDirectory() as tmp:
                 out = Path(tmp) / "out"
                 run = _make_running_run(out, f"{cmd}-001", cmd)
-                with patch.object(_hook_mod, "REPO_ROOT", Path(tmp)), \
-                     patch("core.run.metadata._get_session_pid",
-                           return_value=SESSION_PID):
+                with (
+                    patch.object(_hook_mod, "REPO_ROOT", Path(tmp)),
+                    patch(
+                        "core.run.metadata._get_session_pid", return_value=SESSION_PID
+                    ),
+                ):
                     sys.argv = ["hook", "session-end"]
                     _hook_mod.main()
                 self.assertEqual(
-                    _status(run), STATUS_FAILED,
-                    f"SessionEnd should catch multi-turn command '{cmd}'")
+                    _status(run),
+                    STATUS_FAILED,
+                    f"SessionEnd should catch multi-turn command '{cmd}'",
+                )
+
+
+@pytest.mark.parametrize("event", ("tool-failure", "stop", "session-end"))
+@pytest.mark.parametrize(
+    "variant",
+    (
+        "metadata-only",
+        "lineage-only",
+        "valid-lineage",
+        "pending",
+        "rejected",
+        "invalid",
+        "missing-sidecar",
+        "digest",
+        "profile",
+        "stable",
+        "nonce",
+        "session",
+        "exact",
+        "planted-owner-fields",
+    ),
+)
+@pytest.mark.parametrize("marker_present", (False, True), ids=("absent", "present"))
+def test_t24_receipt_metadata_never_drives_lifecycle(
+    tmp_path: Path,
+    event: str,
+    variant: str,
+    marker_present: bool,
+) -> None:
+    repo = tmp_path / "repo"
+    run = _make_running_run(repo / "out", f"scan-{variant}", "scan", tool_pid=1)
+    meta = load_json(run / RUN_METADATA_FILE)
+    if variant == "valid-lineage":
+        meta.update(_valid_exact_lineage_fields())
+    elif variant == "lineage-only":
+        meta[run_metadata.RUN_RUNTIME_RECEIPT_LINEAGE_KEY] = {"entries": []}
+    else:
+        marker_variant = (
+            "exact"
+            if variant
+            in {
+                "metadata-only",
+                "planted-owner-fields",
+            }
+            else variant
+        )
+        meta[run_metadata.RUN_RUNTIME_RECEIPT_KEY] = _receipt_marker_value(
+            marker_variant
+        )
+    if variant == "planted-owner-fields":
+        meta.update(
+            {
+                "session_pid": SESSION_PID,
+                "session_start": "1",
+                "session_boot_id": "boot",
+                "session_pidns": "2",
+                "tool_pid": 1,
+                "host_v": 1,
+                "host_frontend": "claude",
+                "host_uid": os.geteuid(),
+                "host_executable": "/planted/claude",
+                "host_executable_device": 10,
+                "host_executable_inode": 20,
+            }
+        )
+    save_json(run / RUN_METADATA_FILE, meta)
+    before = (run / RUN_METADATA_FILE).read_bytes()
+    failure_marker = run / FAILURE_MARKER
+    if marker_present:
+        failure_marker.write_bytes(b"preserve")
+    ledger = tmp_path / "sessions.d" / f"{SESSION_PID}.run"
+    ledger.parent.mkdir(parents=True)
+    ledger.write_bytes(b"ledger-sentinel\n")
+    ledger_before = ledger.read_bytes()
+
+    with (
+        patch.object(_hook_mod, "REPO_ROOT", repo),
+        patch(
+            "core.config.RaptorConfig.get_out_dir",
+            return_value=repo / "out",
+        ),
+        patch.object(sessions, "SESSIONS_DIR", ledger.parent),
+        patch.object(sessions, "ledger_runs", return_value=[]),
+        patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+        patch("core.run.metadata._pid_alive", return_value=False),
+        patch(
+            "core.run.metadata.complete_run",
+            side_effect=AssertionError("receipt run reached complete_run"),
+        ),
+        patch(
+            "core.run.metadata.fail_run",
+            side_effect=AssertionError("receipt run reached fail_run"),
+        ),
+        patch.object(sys, "argv", ["hook", event]),
+        _receipt_authority_calls_forbidden(),
+    ):
+        _hook_mod.main()
+
+    assert (run / RUN_METADATA_FILE).read_bytes() == before
+    assert _status(run) == STATUS_RUNNING
+    assert failure_marker.exists() is marker_present
+    if marker_present:
+        assert failure_marker.read_bytes() == b"preserve"
+    assert ledger.read_bytes() == ledger_before
+    assert not tuple(tmp_path.rglob("*.receipt.*.json"))
+
+
+@pytest.mark.parametrize("event", ("tool-failure", "stop", "session-end"))
+def test_t24_real_claudecode_resolver_still_denies_registry_only_host_v2(
+    tmp_path: Path,
+    event: str,
+) -> None:
+    repo = tmp_path / "repo"
+    run = _make_running_run(
+        repo / "out",
+        "scan-registry-only",
+        "scan",
+        session_pid=os.getppid(),
+        tool_pid=1,
+    )
+    before = (run / RUN_METADATA_FILE).read_bytes()
+    failure_marker = run / FAILURE_MARKER
+    failure_marker.write_bytes(b"preserve")
+    sessions_dir = tmp_path / "sessions.d"
+    entry = _write_host_v2_entry(sessions_dir)
+    entry_before = entry.read_bytes()
+    env = {
+        "CLAUDECODE": "1",
+        sessions.ENV_SESSION_PID: str(os.getpid()),
+        sessions.ENV_SESSION_TOKEN: _HOST_V2_TOKEN,
+    }
+
+    with (
+        patch.object(_hook_mod, "REPO_ROOT", repo),
+        patch(
+            "core.config.RaptorConfig.get_out_dir",
+            return_value=repo / "out",
+        ),
+        patch.object(sessions, "SESSIONS_DIR", sessions_dir),
+        patch.object(sessions, "ledger_runs", return_value=[]),
+        patch("core.run.metadata.complete_run", side_effect=AssertionError),
+        patch("core.run.metadata.fail_run", side_effect=AssertionError),
+        patch("core.run.metadata._pid_alive", return_value=False),
+        patch.dict(os.environ, env, clear=False),
+        patch.object(sys, "argv", ["hook", event]),
+        _receipt_authority_calls_forbidden(),
+    ):
+        _hook_mod.main()
+
+    assert (run / RUN_METADATA_FILE).read_bytes() == before
+    assert failure_marker.read_bytes() == b"preserve"
+    assert entry.read_bytes() == entry_before
+    assert not tuple(sessions_dir.glob("*.receipt.*.json"))
+
+
+@pytest.mark.parametrize(
+    ("event", "marker_present"),
+    (("stop", False), ("stop", True), ("session-end", True)),
+)
+def test_t24_terminal_wrapper_race_rechecks_reserved_marker(
+    tmp_path: Path,
+    event: str,
+    marker_present: bool,
+) -> None:
+    repo = tmp_path / "repo"
+    run = _make_running_run(repo / "out", "scan-race", "scan", tool_pid=1)
+    failure_marker = run / FAILURE_MARKER
+    if marker_present:
+        failure_marker.write_bytes(b"preserve")
+    mutated: list[bytes] = []
+
+    def insert_marker(_meta, _pid):
+        current = load_json(run / RUN_METADATA_FILE)
+        current[run_metadata.RUN_RUNTIME_RECEIPT_KEY] = {"race": True}
+        save_json(run / RUN_METADATA_FILE, current)
+        mutated.append((run / RUN_METADATA_FILE).read_bytes())
+        return True
+
+    with (
+        patch.object(_hook_mod, "REPO_ROOT", repo),
+        patch(
+            "core.config.RaptorConfig.get_out_dir",
+            return_value=repo / "out",
+        ),
+        patch.object(sessions, "ledger_runs", return_value=[]),
+        patch("core.run.metadata._get_session_pid", return_value=SESSION_PID),
+        patch("core.run.metadata._pid_alive", return_value=False),
+        patch(
+            "core.run.metadata._metadata_owned_by_session",
+            side_effect=insert_marker,
+        ),
+        patch(
+            "core.run.metadata._finalize_sandbox_summary",
+            side_effect=AssertionError(
+                "terminal receipt veto followed finalization side effect"
+            ),
+        ),
+        patch.object(sys, "argv", ["hook", event]),
+        _receipt_authority_calls_forbidden(metadata_lock=False),
+    ):
+        _hook_mod.main()
+
+    assert len(mutated) == 1
+    assert (run / RUN_METADATA_FILE).read_bytes() == mutated[0]
+    assert _status(run) == STATUS_RUNNING
+    assert failure_marker.exists() is marker_present
+    if marker_present:
+        assert failure_marker.read_bytes() == b"preserve"
+
+
+def test_t24_lifecycle_scripts_remain_byte_identical() -> None:
+    shim = REPO_ROOT / "libexec" / "raptor-run-lifecycle"
+    assert hashlib.sha256(HOOK_SCRIPT.read_bytes()).hexdigest() == (
+        "229f6fe1d9a957c528f92ea5497411cc94cd096d6d164c3e8aa4806a7b158853"
+    )
+    assert hashlib.sha256(shim.read_bytes()).hexdigest() == (
+        "7ef2d63e1fd8f218ef6c462b725058f89909181618b5ca6d7cf0c0b8ac9c42d9"
+    )
 
 
 class TestE2EHookScript(unittest.TestCase):
@@ -859,7 +1169,8 @@ class TestE2EHookScript(unittest.TestCase):
     def test_invalid_arg_exits_nonzero(self):
         result = subprocess.run(
             [sys.executable, str(HOOK_SCRIPT), "bogus"],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Usage", result.stderr)
@@ -867,7 +1178,8 @@ class TestE2EHookScript(unittest.TestCase):
     def test_no_args_exits_nonzero(self):
         result = subprocess.run(
             [sys.executable, str(HOOK_SCRIPT)],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
         self.assertNotEqual(result.returncode, 0)
 

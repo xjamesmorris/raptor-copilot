@@ -13,8 +13,10 @@ launcher wiring) that must keep working unchanged.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import io
 import os
+import pickle
 import shutil
 import subprocess
 import sys
@@ -2278,6 +2280,106 @@ class StrongHostSessionTest(unittest.TestCase):
 
 class ReceiptRegistrySafetyTest(_RegistryCase):
 
+    def _install_verified_capture_entry(self):
+        from core.startup.runtime_receipt.canonical import canonical_bytes
+        from core.startup.runtime_receipt.persistence import write_receipt_sidecar
+        from core.startup.runtime_receipt.plumbing_types import (
+            PlumbingFailure,
+            RuntimeReceiptSnapshot,
+            reference_from_receipt,
+        )
+        from core.startup.runtime_receipt.profile import load_profile_store
+        from core.startup.runtime_receipt.reasons import ReceiptRejection
+        from core.startup.runtime_receipt.verify import parse_receipt
+        from core.testing.runtime_receipt_fake import (
+            build_runtime_receipt_document,
+            runtime_receipt_verification_now,
+        )
+
+        receipt = parse_receipt(
+            canonical_bytes(build_runtime_receipt_document())
+        )
+        self.assertNotIsInstance(receipt, ReceiptRejection)
+        reference = reference_from_receipt(receipt)
+        self.assertNotIsInstance(reference, PlumbingFailure)
+        snapshot = RuntimeReceiptSnapshot(
+            reference=reference,
+            receipt=receipt,
+        )
+        profiles = load_profile_store()
+        self.assertNotIsInstance(profiles, ReceiptRejection)
+        host = SessionHostClaim(
+            frontend=Frontend.COPILOT,
+            uid=reference.launcher_euid.value,
+            executable=Path("/owned/copilot"),
+            executable_device=10,
+            executable_inode=20,
+        )
+        self.sessions_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.sessions_dir.chmod(0o700)
+        stored = write_receipt_sidecar(
+            self.sessions_dir,
+            reference,
+            receipt,
+        )
+        self.assertNotIsInstance(stored, PlumbingFailure)
+        raw = sessions._serialize_session_receipt_entry(
+            reference,
+            since="2026-09-12T00:00:00.000000+00:00",
+            host=host,
+            token_hex="00112233445566778899aabbccddeeff",
+        )
+        entry = self.sessions_dir / reference.session_pid.text
+        entry.write_bytes(raw)
+        entry.chmod(0o600)
+        for patcher in (
+            patch.object(sessions, "_pid_running", lambda _pid: True),
+            patch.object(
+                sessions,
+                "proc_starttime",
+                lambda _pid: reference.session_starttime_ticks.text,
+            ),
+            patch.object(sessions, "boot_id", lambda: reference.boot_id.value),
+            patch.object(
+                sessions,
+                "pidns_id",
+                lambda: reference.pid_namespace_inode.text,
+            ),
+            patch.object(
+                sessions,
+                "_current_euid",
+                lambda: reference.launcher_euid.value,
+            ),
+            patch.object(
+                sessions,
+                "_process_uid",
+                lambda _pid: reference.launcher_euid.value,
+            ),
+            patch.object(
+                sessions,
+                "_process_executable_identity",
+                lambda _pid: (10, 20),
+            ),
+            patch.dict(
+                os.environ,
+                {
+                    sessions.ENV_SESSION_PID: reference.session_pid.text,
+                    sessions.ENV_SESSION_TOKEN: (
+                        "00112233445566778899aabbccddeeff"
+                    ),
+                },
+            ),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return (
+            reference,
+            snapshot,
+            profiles,
+            entry,
+            runtime_receipt_verification_now(),
+        )
+
     def _host_v2_fields(
         self,
         pid: int,
@@ -2679,3 +2781,96 @@ class ReceiptRegistrySafetyTest(_RegistryCase):
             check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "False")
+
+    def test_t02_capture_is_exact_redacted_and_non_authorizing(self):
+        reference, snapshot, profiles, _entry, now = (
+            self._install_verified_capture_entry()
+        )
+        capture = sessions.capture_current_session_runtime_receipt(
+            profiles=profiles,
+            now=now,
+        )
+        self.assertIs(type(capture), sessions.SessionRuntimeReceiptCapture)
+        self.assertIs(capture.authoritative, False)
+        self.assertEqual(capture.reference, reference)
+        self.assertEqual(capture.snapshot, snapshot)
+        self.assertEqual(
+            repr(capture),
+            "SessionRuntimeReceiptCapture(<redacted>)",
+        )
+        rendered = repr(dataclasses.asdict(capture))
+        self.assertNotIn("00112233445566778899aabbccddeeff", rendered)
+        self.assertFalse(hasattr(capture, "_entry_bytes"))
+        self.assertFalse(hasattr(capture, "_sidecar_bytes"))
+        with self.assertRaises(TypeError):
+            pickle.dumps(capture)
+        with self.assertRaises(TypeError):
+            type("ForgedCapture", (sessions.SessionRuntimeReceiptCapture,), {})
+        wrapped = sessions.read_current_session_runtime_receipt(
+            profiles=profiles,
+            now=now,
+        )
+        self.assertEqual(wrapped, snapshot)
+        self.assertIsNone(sessions.resolve_session_pid())
+        self.assertIsNone(sessions.resolve_session_owner())
+        self.assertEqual(sessions.session_binding(), (None, "none"))
+
+    def test_t02_capture_credential_state_is_token_authenticated(self):
+        _reference, _snapshot, profiles, _entry, now = (
+            self._install_verified_capture_entry()
+        )
+        self.assertIs(
+            sessions.session_host_v2_credential_state(),
+            sessions.SessionHostV2CredentialState.MATCHING_HOST_V2,
+        )
+        with patch.dict(
+            os.environ,
+            {sessions.ENV_SESSION_TOKEN: "ff" * 16},
+        ):
+            self.assertIs(
+                sessions.session_host_v2_credential_state(),
+                sessions.SessionHostV2CredentialState.ABSENT,
+            )
+            self.assertIsNone(
+                sessions.capture_current_session_runtime_receipt(
+                    profiles=profiles,
+                    now=now,
+                )
+            )
+
+    def test_t07_capture_fence_detects_entry_replacement(self):
+        _reference, _snapshot, profiles, entry, now = (
+            self._install_verified_capture_entry()
+        )
+        capture = sessions.capture_current_session_runtime_receipt(
+            profiles=profiles,
+            now=now,
+        )
+        self.assertIs(type(capture), sessions.SessionRuntimeReceiptCapture)
+        entry.write_bytes(
+            entry.read_bytes().replace(
+                b"since=2026-09-12T00:00:00.000000+00:00",
+                b"since=2026-09-12T00:00:01.000000+00:00",
+            )
+        )
+        entry.chmod(0o600)
+        with self.assertRaises(sessions._SessionReceiptAbort) as raised:
+            with sessions.session_runtime_receipt_fence(capture):
+                self.fail("changed registry entry reached the fenced body")
+        self.assertEqual(
+            raised.exception.failure.reason_codes[0].value,
+            "session_replaced",
+        )
+
+    def test_t02_capture_fence_yields_no_authority(self):
+        _reference, _snapshot, profiles, _entry, now = (
+            self._install_verified_capture_entry()
+        )
+        capture = sessions.capture_current_session_runtime_receipt(
+            profiles=profiles,
+            now=now,
+        )
+        self.assertIs(type(capture), sessions.SessionRuntimeReceiptCapture)
+        with sessions.session_runtime_receipt_fence(capture) as authority:
+            self.assertIsNone(authority)

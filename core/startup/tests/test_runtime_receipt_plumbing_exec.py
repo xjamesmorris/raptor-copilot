@@ -16,9 +16,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from core.json import load_json
 from core.project import sessions
+from core.run import metadata as run_metadata
 from core.startup.runtime_receipt import launch as launch_module
-from core.startup.runtime_receipt.plumbing_types import RuntimeReceiptSnapshot
+from core.startup.runtime_receipt import profile as profile_module
 from core.startup.runtime_receipt.launch import (
     LaunchCancellation,
     LaunchClosed,
@@ -113,6 +115,17 @@ def _fd_set() -> set[int]:
     return {int(item) for item in os.listdir("/proc/self/fd")}
 
 
+def _wait_past_starttime_tick(starttime_ticks: int) -> None:
+    ticks_per_second = os.sysconf("SC_CLK_TCK")
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        uptime = float(Path("/proc/uptime").read_text(encoding="ascii").split()[0])
+        if int(uptime * ticks_per_second) > starttime_ticks:
+            return
+        time.sleep(0.001)
+    raise AssertionError("kernel starttime tick did not advance")
+
+
 def test_two_exec_pending_verified_capture_and_exact_cleanup(
     owned_root: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -148,12 +161,13 @@ def test_two_exec_pending_verified_capture_and_exact_cleanup(
         assert b"host_receipt_state=verified\n" in entries[0].read_bytes()
 
         with _owned_runtime_fake_session_binding(handle):
-            snapshot = sessions.read_current_session_runtime_receipt(
+            capture = sessions.capture_current_session_runtime_receipt(
                 profiles=_owned_runtime_fake_profile_store(handle),
                 now=datetime.now(timezone.utc),
             )
-            assert type(snapshot) is RuntimeReceiptSnapshot
-            assert snapshot.authoritative is False
+            assert type(capture) is sessions.SessionRuntimeReceiptCapture
+            assert capture.authoritative is False
+            assert capture.snapshot.authoritative is False
             assert sessions.resolve_session_owner() is None
 
         closed = _close_owned_runtime_fake(
@@ -169,6 +183,174 @@ def test_two_exec_pending_verified_capture_and_exact_cleanup(
         assert _fd_set() == before
     assert not bundle.exists()
     assert list(owned_root.iterdir()) == []
+
+
+def test_two_owned_launches_resume_one_run_with_non_authorizing_lineage(
+    owned_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_registry = owned_root.parent / "projects"
+    managed_projects = owned_root.parent / "managed-projects"
+    monkeypatch.setattr("core.project.project.PROJECTS_DIR", project_registry)
+    monkeypatch.setattr(
+        "core.project.project.DEFAULT_OUTPUT_BASE",
+        managed_projects,
+    )
+    monkeypatch.setattr(
+        "core.run.provenance.build_start_manifest",
+        lambda **_kwargs: {"provenance": "owned-fake-lineage-test"},
+    )
+    monkeypatch.setattr("core.run.tmp_reaper.reap_stale_tmp", lambda: None)
+    monkeypatch.setattr("core.run.tmp_reaper.reap_stale_logs", lambda: None)
+    monkeypatch.setattr(
+        "core.run.tmp_reaper.reap_stale_runs",
+        lambda _parent: [],
+    )
+    monkeypatch.setattr(
+        "core.sandbox.summary.set_active_run_dir",
+        lambda _value: None,
+    )
+    monkeypatch.setattr(
+        "core.run.pin.freeze_run_pin",
+        lambda *_args, **_kwargs: None,
+    )
+    from core.run.pin import set_process_project
+
+    set_process_project(None)
+    current_profiles = [None]
+
+    def load_current_profiles(_directory=None):
+        assert current_profiles[0] is not None
+        return current_profiles[0]
+
+    monkeypatch.setattr(
+        profile_module,
+        "load_profile_store",
+        load_current_profiles,
+    )
+
+    first_capability, first_bundle = _make_bound(owned_root, monkeypatch)
+    first_registry = first_bundle / "registry/sessions.d"
+    output = owned_root.parent / "lineage-run"
+    with LaunchCancellation() as first_cancellation:
+        first_handle = _launch(first_capability, first_cancellation)
+        assert type(first_handle) is OwnedFakeLaunchHandle
+        first_verified = _finalize(first_handle, first_cancellation)
+        assert type(first_verified) is OwnedFakeVerified
+        current_profiles[0] = _owned_runtime_fake_profile_store(first_handle)
+        monkeypatch.setattr(sessions, "SESSIONS_DIR", first_registry)
+        with _owned_runtime_fake_session_binding(first_handle):
+            first_capture = sessions.capture_current_session_runtime_receipt(
+                profiles=current_profiles[0],
+                now=datetime.now(timezone.utc),
+            )
+            assert type(first_capture) is sessions.SessionRuntimeReceiptCapture
+            run_metadata.start_run(output, "scan")
+
+        _wait_past_starttime_tick(first_capture.reference.session_starttime_ticks.value)
+        second_capability, second_bundle = _make_bound(owned_root, monkeypatch)
+        second_registry = second_bundle / "registry/sessions.d"
+        with LaunchCancellation() as second_cancellation:
+            second_handle = _launch(second_capability, second_cancellation)
+            assert type(second_handle) is OwnedFakeLaunchHandle
+            second_verified = _finalize(second_handle, second_cancellation)
+            assert type(second_verified) is OwnedFakeVerified
+            current_profiles[0] = _owned_runtime_fake_profile_store(second_handle)
+            monkeypatch.setattr(sessions, "SESSIONS_DIR", second_registry)
+            with _owned_runtime_fake_session_binding(second_handle):
+                second_capture = sessions.capture_current_session_runtime_receipt(
+                    profiles=current_profiles[0],
+                    now=datetime.now(timezone.utc),
+                )
+                assert type(second_capture) is sessions.SessionRuntimeReceiptCapture
+                assert run_metadata.resume_run(output) == 2
+
+            assert (
+                first_capture.snapshot.receipt.stable_identity
+                == second_capture.snapshot.receipt.stable_identity
+            )
+            assert (
+                first_capture.reference.profile_id
+                == second_capture.reference.profile_id
+            )
+            assert (
+                first_capture.reference.session_id
+                != second_capture.reference.session_id
+            )
+            assert (
+                first_capture.reference.launch_id != second_capture.reference.launch_id
+            )
+            assert (
+                first_capture.reference.session_pid
+                != second_capture.reference.session_pid
+            )
+            assert (
+                first_capture.reference.session_starttime_ticks
+                != second_capture.reference.session_starttime_ticks
+            )
+            assert (
+                first_capture.reference.session_token_commitment_sha256
+                != second_capture.reference.session_token_commitment_sha256
+            )
+            assert (
+                first_capture.reference.launch_nonce
+                != second_capture.reference.launch_nonce
+            )
+            assert (
+                first_capture.reference.launch_instance_sha256
+                != second_capture.reference.launch_instance_sha256
+            )
+            assert (
+                first_capture.reference.launch_binding_sha256
+                != second_capture.reference.launch_binding_sha256
+            )
+            assert (
+                first_capture.reference.process_corroboration_sha256
+                != second_capture.reference.process_corroboration_sha256
+            )
+            assert (
+                first_capture.reference.receipt_sha256
+                != second_capture.reference.receipt_sha256
+            )
+
+            meta = load_json(output / run_metadata.RUN_METADATA_FILE)
+            assert meta["status"] == "running"
+            lineage = meta[run_metadata.RUN_RUNTIME_RECEIPT_LINEAGE_KEY]
+            assert len(lineage["entries"]) == 1
+            assert lineage["entries"][0]["relation"] == ("new_launch_same_stable")
+            assert (
+                lineage["entries"][0]["current_reference"]["reference"][
+                    "receipt_sha256"
+                ]
+                == second_capture.reference.receipt_sha256.value
+            )
+            assert sessions.resolve_session_owner() is None
+
+            current_profiles[0] = _owned_runtime_fake_profile_store(first_handle)
+            monkeypatch.setattr(sessions, "SESSIONS_DIR", first_registry)
+            with _owned_runtime_fake_session_binding(first_handle):
+                with pytest.raises(run_metadata.RunRuntimeReceiptError) as raised:
+                    run_metadata.resume_run(output)
+            assert raised.value.reason is run_metadata.RunReceiptReason.LAUNCH_REPLAY
+
+            monkeypatch.setattr(sessions, "SESSIONS_DIR", second_registry)
+            second_closed = _close_owned_runtime_fake(
+                second_handle,
+                deadline=MonotonicDeadline.after(10),
+            )
+            assert type(second_closed) is LaunchClosed
+            assert second_closed.receipt_removed is True
+
+        monkeypatch.setattr(sessions, "SESSIONS_DIR", first_registry)
+        first_closed = _close_owned_runtime_fake(
+            first_handle,
+            deadline=MonotonicDeadline.after(10),
+        )
+        assert type(first_closed) is LaunchClosed
+        assert first_closed.receipt_removed is True
+    set_process_project(None)
+    assert not first_bundle.exists()
+    assert not second_bundle.exists()
 
 
 def test_delayed_ready_uses_virtual_clock_not_a_fixed_protocol_limit(
