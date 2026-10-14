@@ -1923,6 +1923,11 @@
     "kind": "literal",
     "note": "family\u2192provider routing map paired 1:1 with the Family taxonomy above (each family's ModelConfig provider string); same closed security-control taxonomy, not a learned name vocabulary"
   },
+  "core/security/fake_executable.py::payload": {
+    "count": 21,
+    "kind": "literal",
+    "note": "MAC proof payload field names binding an issued fixture executable (device/inode identities, hashes, mode, size, nonce); integrity schema, not a name vocabulary"
+  },
   "core/security/prompt_envelope_audit.py::_NON_LLM_CALLS": {
     "count": 18,
     "kind": "literal"
@@ -2007,6 +2012,26 @@
     "count": 17,
     "kind": "literal",
     "note": "summary serialization field names (FunctionSummary.to_dict JSON keys, shape-validated on cache load), not name vocabulary \u2014 same class as the finding-dict field-name entries"
+  },
+  "core/testing/fake_cli.py::_PROTECTED_ENV_KEYS": {
+    "count": 21,
+    "kind": "literal",
+    "note": "protected environment-key denylist that fixture callers cannot override (loader/shell/interpreter/Git controls); security denylist \u2014 same class as DANGEROUS_ENV_VARS"
+  },
+  "core/testing/fake_cli.py::as_config": {
+    "count": 12,
+    "kind": "literal",
+    "note": "fixture behaviour configuration schema (schema_version 2) consumed by the generated child; closed schema, not a name vocabulary"
+  },
+  "core/testing/fake_cli.py::directories": {
+    "count": 13,
+    "kind": "literal",
+    "note": "fixture workspace layout schema (bin/config/log/home/XDG roots); layout keys, not a name vocabulary"
+  },
+  "core/testing/fake_cli.py::env": {
+    "count": 17,
+    "kind": "literal",
+    "note": "fixture child-environment allowlist (private roots, PATH pinned to the owned bin dir); security allowlist \u2014 same class as SAFE_ENV_ALLOWLIST"
   },
   "core/testing/git_hermeticity.py::GIT_ENV_STRIP": {
     "count": 18,
