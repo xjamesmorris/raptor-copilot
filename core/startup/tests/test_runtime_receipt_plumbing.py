@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import copy
 import dataclasses
 import importlib
@@ -70,6 +71,7 @@ from core.startup.runtime_receipt.plumbing_types import (
     compare_receipt_snapshot,
     parse_reference,
     parse_snapshot,
+    plumbing_failure,
     reference_receipt_mismatch,
     reference_transition_mismatch,
     serialize_reference,
@@ -2190,7 +2192,15 @@ def test_no_authority_or_production_wiring_and_no_ambient_discovery() -> None:
                 )
 
     repository = Path(__file__).parents[3]
-    allowed = {path.resolve() for path in (*modules, Path(__file__))}
+    allowed = {
+        path.resolve()
+        for path in (
+            *modules,
+            Path(__file__),
+            repository / "core/project/sessions.py",
+            repository / "core/project/tests/test_sessions.py",
+        )
+    }
     for path in repository.rglob("*.py"):
         if path.resolve() in allowed or any(
             part in {".git", ".venv", "__pycache__", "out", ".out"}
@@ -2218,3 +2228,1131 @@ def test_no_generic_registry_or_authority_surface_is_exposed(
         assert not hasattr(value, "provider")
         assert not hasattr(value, "model")
         assert not hasattr(value, "effects_enabled")
+
+
+def _registry_setup(
+    tmp_path: Path,
+    issued: _IssuedSet,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from core.project import sessions
+    from core.startup.host import Frontend as HostFrontend
+    from core.startup.host import SessionHostClaim
+
+    root = tmp_path / "sessions.d"
+    root.mkdir(mode=0o700)
+    reference = issued.pending.reference
+    host = SessionHostClaim(
+        frontend=HostFrontend.COPILOT,
+        uid=reference.launcher_euid.value,
+        executable=Path("/owned/copilot"),
+        executable_device=10,
+        executable_inode=20,
+    )
+    monkeypatch.setattr(sessions, "SESSIONS_DIR", root)
+    monkeypatch.setattr(sessions, "_pid_running", lambda _pid: True)
+    monkeypatch.setattr(
+        sessions,
+        "proc_starttime",
+        lambda _pid: reference.session_starttime_ticks.text,
+    )
+    monkeypatch.setattr(sessions, "boot_id", lambda: reference.boot_id.value)
+    monkeypatch.setattr(
+        sessions,
+        "pidns_id",
+        lambda: reference.pid_namespace_inode.text,
+    )
+    monkeypatch.setattr(
+        sessions,
+        "_current_euid",
+        lambda: reference.launcher_euid.value,
+    )
+    monkeypatch.setattr(
+        sessions,
+        "_process_uid",
+        lambda _pid: reference.launcher_euid.value,
+    )
+    monkeypatch.setattr(
+        sessions,
+        "_process_executable_identity",
+        lambda _pid: (host.executable_device, host.executable_inode),
+    )
+    return sessions, root, host
+
+
+def _install_registry_pending(
+    tmp_path: Path,
+    issued: _IssuedSet,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    sessions, root, host = _registry_setup(tmp_path, issued, monkeypatch)
+    result = sessions.install_pending_session_receipt(
+        issued.pending,
+        token_hex=TOKEN_BYTES.hex(),
+        expected_host=host,
+    )
+    assert isinstance(result, StoredReceipt)
+    return sessions, root, host
+
+
+def test_real_registry_entry_is_exact_projectless_and_non_authorizing(
+    tmp_path: Path,
+    issued: _IssuedSet,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, root, _host = _install_registry_pending(
+        tmp_path,
+        issued,
+        monkeypatch,
+    )
+    entry_path = root / issued.pending.reference.session_pid.text
+    raw = entry_path.read_bytes()
+    assert (
+        tuple(line.partition(b"=")[0].decode("ascii") for line in raw[:-1].split(b"\n"))
+        == sessions._HOST_V2_ENTRY_KEYS
+    )
+    parsed = sessions._parse_session_receipt_entry(
+        raw,
+        pid=issued.pending.reference.session_pid.value,
+    )
+    assert not isinstance(parsed, PlumbingFailure)
+    assert parsed.reference == issued.pending.reference
+    assert sessions._host_claim_state(
+        sessions._parse_entry(entry_path),
+        pid=issued.pending.reference.session_pid.value,
+    ) == ("invalid", None)
+    with monkeypatch.context() as env_patch:
+        env_patch.setenv(
+            sessions.ENV_SESSION_PID,
+            issued.pending.reference.session_pid.text,
+        )
+        env_patch.setenv(sessions.ENV_SESSION_TOKEN, TOKEN_BYTES.hex())
+        assert sessions._env_session_pid() is None
+        assert sessions.resolve_session_pid() is None
+        assert sessions.resolve_session_owner() is None
+        assert sessions.session_binding() == (None, "none")
+    assert (
+        sessions.session_host_claim(issued.pending.reference.session_pid.value) is None
+    )
+    assert sessions.read_sessions() == {}
+
+
+def _mutate_registry_entry(raw: bytes, case: str) -> bytes:
+    lines = raw[:-1].split(b"\n")
+    if case == "bom":
+        return b"\xef\xbb\xbf" + raw
+    if case == "cr":
+        return raw.replace(b"\n", b"\r\n", 1)
+    if case == "duplicate":
+        return b"\n".join((lines[0], lines[0], *lines[1:])) + b"\n"
+    if case == "reordered":
+        lines[0], lines[1] = lines[1], lines[0]
+        return b"\n".join(lines) + b"\n"
+    if case == "unknown":
+        return b"\n".join((*lines, b"host_receipt_extra=x")) + b"\n"
+    if case == "missing":
+        return (
+            b"\n".join(
+                line for line in lines if not line.startswith(b"host_receipt_v=")
+            )
+            + b"\n"
+        )
+    if case == "blank":
+        return b"\n".join((*lines[:5], b"", *lines[5:])) + b"\n"
+    if case == "no-final-newline":
+        return raw[:-1]
+    if case == "non-utf8":
+        return raw[:-2] + b"\xff\n"
+    if case == "oversized":
+        return raw + b"x" * 16_385
+    if case == "long-line":
+        return (
+            b"\n".join(
+                b"host_exe=/" + b"x" * 8_192 if line.startswith(b"host_exe=") else line
+                for line in lines
+            )
+            + b"\n"
+        )
+    if case == "bad-since":
+        return (
+            b"\n".join(
+                b"since=2026-09-12T00:00:00Z" if line.startswith(b"since=") else line
+                for line in lines
+            )
+            + b"\n"
+        )
+    raise AssertionError(case)
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "bom",
+        "cr",
+        "duplicate",
+        "reordered",
+        "unknown",
+        "missing",
+        "blank",
+        "no-final-newline",
+        "non-utf8",
+        "oversized",
+        "long-line",
+        "bad-since",
+    ),
+)
+def test_matching_token_invalid_host_v2_is_projectless_without_walk(
+    tmp_path: Path,
+    issued: _IssuedSet,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    sessions, root, _host = _install_registry_pending(
+        tmp_path,
+        issued,
+        monkeypatch,
+    )
+    pid = issued.pending.reference.session_pid.value
+    entry = root / str(pid)
+    entry.write_bytes(_mutate_registry_entry(entry.read_bytes(), case))
+    entry.chmod(0o600)
+    walked = False
+
+    def walk() -> int | None:
+        nonlocal walked
+        walked = True
+        return 7
+
+    monkeypatch.setattr(sessions, "_walk_session_pid", walk)
+    monkeypatch.setenv(sessions.ENV_SESSION_PID, str(pid))
+    monkeypatch.setenv(sessions.ENV_SESSION_TOKEN, TOKEN_BYTES.hex())
+    from core.startup.host import HostClaimError, parse_session_host_claim
+
+    try:
+        old_reader_claim = parse_session_host_claim(sessions._parse_entry(entry))
+    except HostClaimError:
+        old_reader_claim = None
+    assert old_reader_claim is None
+    assert sessions.resolve_session_pid() is None
+    assert sessions.resolve_session_owner() is None
+    assert sessions.session_binding() == (None, "none")
+    assert walked is False
+
+
+def test_wrong_host_v2_token_keeps_legacy_walk_behavior(
+    tmp_path: Path,
+    issued: _IssuedSet,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, _root, _host = _install_registry_pending(
+        tmp_path,
+        issued,
+        monkeypatch,
+    )
+    monkeypatch.setenv(
+        sessions.ENV_SESSION_PID,
+        issued.pending.reference.session_pid.text,
+    )
+    monkeypatch.setenv(sessions.ENV_SESSION_TOKEN, "ff" * 16)
+    monkeypatch.setattr(sessions, "_walk_session_pid", lambda: 77)
+    assert sessions.resolve_session_pid() == 77
+
+
+def test_missing_host_v2_token_never_authorizes(
+    tmp_path: Path,
+    issued: _IssuedSet,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, root, _host = _install_registry_pending(
+        tmp_path,
+        issued,
+        monkeypatch,
+    )
+    pid = issued.pending.reference.session_pid.value
+    entry = root / str(pid)
+    entry.write_bytes(
+        b"\n".join(
+            line
+            for line in entry.read_bytes().splitlines()
+            if not line.startswith(b"token=")
+        )
+        + b"\n"
+    )
+    entry.chmod(0o600)
+    monkeypatch.setenv(sessions.ENV_SESSION_PID, str(pid))
+    monkeypatch.setenv(sessions.ENV_SESSION_TOKEN, TOKEN_BYTES.hex())
+    assert sessions._env_session_pid() is None
+    assert sessions.resolve_session_owner() is None
+    assert sessions.session_binding(pid=pid) == (None, "none")
+    assert (
+        sessions.read_current_session_runtime_receipt(
+            profiles=issued.profiles,
+            now=_verification_now(),
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("state", "expected_reason"),
+    (
+        (ReceiptState.PENDING, PlumbingReason.STATE_NOT_FINAL),
+        (ReceiptState.REJECTED, PlumbingReason.RECEIPT_STATE_REJECTED),
+    ),
+)
+def test_registry_nonfinal_states_are_typed_and_non_authorizing(
+    tmp_path: Path,
+    issued: _IssuedSet,
+    monkeypatch: pytest.MonkeyPatch,
+    state: ReceiptState,
+    expected_reason: PlumbingReason,
+) -> None:
+    sessions, _root, _host = _install_registry_pending(
+        tmp_path,
+        issued,
+        monkeypatch,
+    )
+    if state is ReceiptState.REJECTED:
+        result = sessions.compare_and_swap_session_receipt(
+            issued.pending.reference,
+            issued.rejected.reference,
+            issued.rejected.receipt,
+            token_hex=TOKEN_BYTES.hex(),
+        )
+        assert isinstance(result, CasApplied)
+    monkeypatch.setenv(
+        sessions.ENV_SESSION_PID,
+        issued.pending.reference.session_pid.text,
+    )
+    monkeypatch.setenv(sessions.ENV_SESSION_TOKEN, TOKEN_BYTES.hex())
+    result = sessions.read_current_session_runtime_receipt(
+        profiles=issued.profiles,
+        now=_verification_now(),
+    )
+    assert isinstance(result, PlumbingFailure)
+    assert result.reason_codes == (expected_reason,)
+    listed = sessions.read_sessions(prune=False, include_stale=True)
+    assert listed[issued.pending.reference.session_pid.value]["_state"] == (
+        f"receipt-{state.value}"
+    )
+    assert sessions.read_sessions(prune=False) == {}
+    assert sessions.resolve_session_owner() is None
+    assert sessions.session_binding() == (None, "none")
+
+
+def test_registry_verified_read_returns_only_non_authorizing_snapshot(
+    tmp_path: Path,
+    issued: _IssuedSet,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, _root, _host = _install_registry_pending(
+        tmp_path,
+        issued,
+        monkeypatch,
+    )
+    swapped = sessions.compare_and_swap_session_receipt(
+        issued.pending.reference,
+        issued.verified.reference,
+        issued.verified.receipt,
+        token_hex=TOKEN_BYTES.hex(),
+    )
+    assert isinstance(swapped, CasApplied)
+    monkeypatch.setenv(
+        sessions.ENV_SESSION_PID,
+        issued.pending.reference.session_pid.text,
+    )
+    monkeypatch.setenv(sessions.ENV_SESSION_TOKEN, TOKEN_BYTES.hex())
+    snapshot = sessions.read_current_session_runtime_receipt(
+        profiles=issued.profiles,
+        now=_verification_now(),
+    )
+    assert isinstance(snapshot, RuntimeReceiptSnapshot)
+    assert snapshot.authoritative is False
+    listed = sessions.read_sessions(prune=False, include_stale=True)
+    assert listed[issued.pending.reference.session_pid.value]["_state"] == (
+        "receipt-verified"
+    )
+    assert sessions.read_sessions(prune=False) == {}
+    assert sessions.resolve_session_owner() is None
+    assert sessions.session_binding() == (None, "none")
+
+
+def test_registry_install_replay_is_rejected_without_rewriting(
+    tmp_path: Path,
+    issued: _IssuedSet,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, root, host = _install_registry_pending(
+        tmp_path,
+        issued,
+        monkeypatch,
+    )
+    entry = root / issued.pending.reference.session_pid.text
+    before = entry.read_bytes()
+    result = sessions.install_pending_session_receipt(
+        issued.pending,
+        token_hex=TOKEN_BYTES.hex(),
+        expected_host=host,
+    )
+    assert isinstance(result, PlumbingFailure)
+    assert result.reason_codes == (PlumbingReason.REPLAYED_TRANSITION,)
+    assert entry.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "shape",
+    (
+        "missing",
+        "malformed",
+        "oversized",
+        "symlink",
+        "fifo",
+        "directory",
+        "hardlink",
+        "wrong-mode",
+        "wrong-owner",
+    ),
+)
+def test_registry_sidecar_policy_failures_are_typed(
+    tmp_path: Path,
+    issued: _IssuedSet,
+    monkeypatch: pytest.MonkeyPatch,
+    shape: str,
+) -> None:
+    sessions, root, _host = _install_registry_pending(
+        tmp_path,
+        issued,
+        monkeypatch,
+    )
+    reference = issued.pending.reference
+    sidecar = root / reference.sidecar_name
+    original = sidecar.read_bytes()
+    if shape == "missing":
+        sidecar.unlink()
+    elif shape == "malformed":
+        sidecar.write_bytes(b"{}")
+    elif shape == "oversized":
+        sidecar.write_bytes(b"x" * (MAX_RECEIPT_BYTES + 1))
+    elif shape == "symlink":
+        sidecar.unlink()
+        peer = root / "peer"
+        peer.write_bytes(original)
+        peer.chmod(0o600)
+        sidecar.symlink_to(peer)
+    elif shape == "fifo":
+        sidecar.unlink()
+        os.mkfifo(sidecar, 0o600)
+    elif shape == "directory":
+        sidecar.unlink()
+        sidecar.mkdir(mode=0o700)
+    elif shape == "hardlink":
+        sidecar.unlink()
+        peer = root / "peer"
+        peer.write_bytes(original)
+        peer.chmod(0o600)
+        os.link(peer, sidecar)
+    elif shape == "wrong-mode":
+        sidecar.chmod(0o644)
+    elif shape == "wrong-owner":
+        sidecar_inode = sidecar.stat().st_ino
+        original_owner = _persistence._entry_owner_matches
+        monkeypatch.setattr(
+            _persistence,
+            "_entry_owner_matches",
+            lambda value: (
+                False if value.st_ino == sidecar_inode else original_owner(value)
+            ),
+        )
+    monkeypatch.setenv(sessions.ENV_SESSION_PID, reference.session_pid.text)
+    monkeypatch.setenv(sessions.ENV_SESSION_TOKEN, TOKEN_BYTES.hex())
+    result = sessions.read_current_session_runtime_receipt(
+        profiles=issued.profiles,
+        now=_verification_now(),
+    )
+    assert isinstance(result, PlumbingFailure)
+    assert sessions.session_binding() == (None, "none")
+
+
+def test_registry_copied_or_forged_sidecar_fails_closed(
+    tmp_path: Path,
+    issued: _IssuedSet,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, root, _host = _install_registry_pending(
+        tmp_path,
+        issued,
+        monkeypatch,
+    )
+    sidecar = root / issued.pending.reference.sidecar_name
+    sidecar.write_bytes(serialize_receipt(issued.verified.receipt))
+    sidecar.chmod(0o600)
+    monkeypatch.setenv(
+        sessions.ENV_SESSION_PID,
+        issued.pending.reference.session_pid.text,
+    )
+    monkeypatch.setenv(sessions.ENV_SESSION_TOKEN, TOKEN_BYTES.hex())
+    result = sessions.read_current_session_runtime_receipt(
+        profiles=issued.profiles,
+        now=_verification_now(),
+    )
+    assert isinstance(result, PlumbingFailure)
+    assert result.reason_codes[0] in {
+        PlumbingReason.STATE_NOT_FINAL,
+        PlumbingReason.SIDECAR_DIGEST_MISMATCH,
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("session_id", UuidText("22222222-2222-4222-8222-222222222222")),
+        ("launch_id", UuidText("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")),
+        ("session_pid", CanonicalPid(4243)),
+        ("session_starttime_ticks", U64Decimal(9002)),
+        ("boot_id", UuidText("87654321-4321-4321-8321-cba987654321")),
+        ("pid_namespace_inode", U64Decimal(4026531837)),
+        ("launcher_euid", U64Decimal(1001)),
+        ("session_token_commitment_sha256", Sha256("d" * 64)),
+        ("launch_nonce", NonceHex("f" * 32)),
+        ("profile_id", Identifier("other-profile")),
+        ("stable_identity_sha256", Sha256("e" * 64)),
+        ("process_corroboration_sha256", Sha256("c" * 64)),
+    ),
+)
+def test_registry_reference_entry_or_sidecar_mismatch_is_rejected(
+    tmp_path: Path,
+    issued: _IssuedSet,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    sessions, root, _host = _install_registry_pending(
+        tmp_path,
+        issued,
+        monkeypatch,
+    )
+    pid = issued.pending.reference.session_pid.value
+    entry = root / str(pid)
+    fields = sessions._parse_entry(entry)
+    forged = dataclasses.replace(
+        issued.pending.reference,
+        **{field: value},
+    )
+    fields["host_receipt_reference"] = serialize_reference(forged).decode("ascii")
+    entry.write_text(
+        "".join(f"{key}={fields[key]}\n" for key in sessions._HOST_V2_ENTRY_KEYS),
+        encoding="utf-8",
+    )
+    entry.chmod(0o600)
+    monkeypatch.setenv(sessions.ENV_SESSION_PID, str(pid))
+    monkeypatch.setenv(sessions.ENV_SESSION_TOKEN, TOKEN_BYTES.hex())
+    result = sessions.read_current_session_runtime_receipt(
+        profiles=issued.profiles,
+        now=_verification_now(),
+    )
+    assert isinstance(result, PlumbingFailure)
+    assert sessions.session_binding() == (None, "none")
+
+
+def test_registry_full_byte_cas_detects_in_lock_entry_mutation(
+    tmp_path: Path,
+    issued: _IssuedSet,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, root, _host = _install_registry_pending(
+        tmp_path,
+        issued,
+        monkeypatch,
+    )
+    entry = root / issued.pending.reference.session_pid.text
+    original = entry.read_bytes()
+    lines = original[:-1].split(b"\n")
+    changed = (
+        b"\n".join(
+            b"since=2026-09-12T00:00:00.000000+00:00"
+            if line.startswith(b"since=")
+            else line
+            for line in lines
+        )
+        + b"\n"
+    )
+    assert changed != original
+    fired = False
+
+    def mutate(_pid: int, _fd: int) -> None:
+        nonlocal fired
+        if not fired:
+            fired = True
+            entry.write_bytes(changed)
+            entry.chmod(0o600)
+
+    monkeypatch.setattr(sessions, "_after_session_lock_open", mutate)
+    result = sessions.compare_and_swap_session_receipt(
+        issued.pending.reference,
+        issued.verified.reference,
+        issued.verified.receipt,
+        token_hex=TOKEN_BYTES.hex(),
+    )
+    assert isinstance(result, PlumbingFailure)
+    assert result.reason_codes == (PlumbingReason.SESSION_REPLACED,)
+    assert entry.read_bytes() == changed
+    assert not (root / issued.verified.reference.sidecar_name).exists()
+
+
+def test_registry_takeover_token_is_refused_without_mutation(
+    tmp_path: Path,
+    issued: _IssuedSet,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, root, _host = _install_registry_pending(
+        tmp_path,
+        issued,
+        monkeypatch,
+    )
+    entry = root / issued.pending.reference.session_pid.text
+    before = entry.read_bytes()
+    result = sessions.compare_and_swap_session_receipt(
+        issued.pending.reference,
+        issued.verified.reference,
+        issued.verified.receipt,
+        token_hex="ff" * 16,
+    )
+    assert isinstance(result, PlumbingFailure)
+    assert result.reason_codes == (PlumbingReason.TOKEN_MISMATCH,)
+    assert entry.read_bytes() == before
+    assert not (root / issued.verified.reference.sidecar_name).exists()
+
+
+def test_registry_liveness_bracket_blocks_executable_replacement(
+    tmp_path: Path,
+    issued: _IssuedSet,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, root, host = _registry_setup(tmp_path, issued, monkeypatch)
+    identities = iter(((10, 20), (30, 40)))
+    monkeypatch.setattr(
+        sessions,
+        "_process_executable_identity",
+        lambda _pid: next(identities),
+    )
+    result = sessions.install_pending_session_receipt(
+        issued.pending,
+        token_hex=TOKEN_BYTES.hex(),
+        expected_host=host,
+    )
+    assert isinstance(result, PlumbingFailure)
+    assert result.reason_codes == (PlumbingReason.PROCESS_BINDING_MISMATCH,)
+    assert not (root / issued.pending.reference.session_pid.text).exists()
+    assert not (root / issued.pending.reference.sidecar_name).exists()
+
+
+@pytest.mark.parametrize(
+    "probe",
+    (
+        "dead",
+        "starttime",
+        "boot",
+        "pidns",
+        "euid",
+        "process-uid",
+        "executable",
+    ),
+)
+def test_registry_install_requires_complete_live_binding(
+    tmp_path: Path,
+    issued: _IssuedSet,
+    monkeypatch: pytest.MonkeyPatch,
+    probe: str,
+) -> None:
+    sessions, root, host = _registry_setup(tmp_path, issued, monkeypatch)
+    reference = issued.pending.reference
+    if probe == "dead":
+        monkeypatch.setattr(sessions, "_pid_running", lambda _pid: False)
+    elif probe == "starttime":
+        monkeypatch.setattr(sessions, "proc_starttime", lambda _pid: "1")
+    elif probe == "boot":
+        monkeypatch.setattr(
+            sessions,
+            "boot_id",
+            lambda: "87654321-4321-4321-8321-cba987654321",
+        )
+    elif probe == "pidns":
+        monkeypatch.setattr(sessions, "pidns_id", lambda: "1")
+    elif probe == "euid":
+        monkeypatch.setattr(
+            sessions,
+            "_current_euid",
+            lambda: reference.launcher_euid.value + 1,
+        )
+    elif probe == "process-uid":
+        monkeypatch.setattr(
+            sessions,
+            "_process_uid",
+            lambda _pid: reference.launcher_euid.value + 1,
+        )
+    else:
+        monkeypatch.setattr(
+            sessions,
+            "_process_executable_identity",
+            lambda _pid: (30, 40),
+        )
+    result = sessions.install_pending_session_receipt(
+        issued.pending,
+        token_hex=TOKEN_BYTES.hex(),
+        expected_host=host,
+    )
+    assert isinstance(result, PlumbingFailure)
+    assert result.reason_codes == (PlumbingReason.PROCESS_BINDING_MISMATCH,)
+    assert not (root / reference.session_pid.text).exists()
+    assert not (root / reference.sidecar_name).exists()
+
+
+def test_concurrent_real_registry_finalizers_have_one_winner(
+    tmp_path: Path,
+    issued: _IssuedSet,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, root, _host = _install_registry_pending(
+        tmp_path,
+        issued,
+        monkeypatch,
+    )
+    barrier = threading.Barrier(2)
+
+    def finalize(item):
+        barrier.wait()
+        return sessions.compare_and_swap_session_receipt(
+            issued.pending.reference,
+            item.reference,
+            item.receipt,
+            token_hex=TOKEN_BYTES.hex(),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = tuple(pool.map(finalize, (issued.verified, issued.rejected)))
+    assert sum(isinstance(result, CasApplied) for result in results) == 1
+    assert sum(isinstance(result, PlumbingFailure) for result in results) == 1
+    parsed = sessions._parse_session_receipt_entry(
+        (root / issued.pending.reference.session_pid.text).read_bytes(),
+        pid=issued.pending.reference.session_pid.value,
+    )
+    assert not isinstance(parsed, PlumbingFailure)
+    assert parsed.reference.state in {ReceiptState.VERIFIED, ReceiptState.REJECTED}
+    sidecars = tuple(
+        root.glob(f"{issued.pending.reference.session_pid.text}.receipt.*.json")
+    )
+    assert len(sidecars) == 1
+    assert sidecars[0].name == parsed.reference.sidecar_name
+
+
+def test_registry_crash_boundaries_leave_only_inert_orphans(
+    tmp_path: Path,
+    issued: _IssuedSet,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, root, host = _registry_setup(tmp_path, issued, monkeypatch)
+
+    def crash_write(*_args, **_kwargs):
+        raise _Crash("entry-write")
+
+    monkeypatch.setattr(_persistence, "write_session_entry_bytes", crash_write)
+    with pytest.raises(_Crash):
+        sessions.install_pending_session_receipt(
+            issued.pending,
+            token_hex=TOKEN_BYTES.hex(),
+            expected_host=host,
+        )
+    assert not (root / issued.pending.reference.session_pid.text).exists()
+    assert (root / issued.pending.reference.sidecar_name).exists()
+
+
+def test_registry_cas_crash_seams_keep_a_complete_generation(
+    tmp_path: Path,
+    issued: _IssuedSet,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, root, _host = _install_registry_pending(
+        tmp_path,
+        issued,
+        monkeypatch,
+    )
+    entry = root / issued.pending.reference.session_pid.text
+    pending_raw = entry.read_bytes()
+
+    def crash_write(*_args, **_kwargs):
+        raise _Crash("before-entry-swing")
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(
+            _persistence,
+            "write_session_entry_bytes",
+            crash_write,
+        )
+        with pytest.raises(_Crash):
+            sessions.compare_and_swap_session_receipt(
+                issued.pending.reference,
+                issued.verified.reference,
+                issued.verified.receipt,
+                token_hex=TOKEN_BYTES.hex(),
+            )
+    assert entry.read_bytes() == pending_raw
+    assert (root / issued.pending.reference.sidecar_name).exists()
+    assert not (root / issued.verified.reference.sidecar_name).exists()
+    orphan = write_receipt_sidecar(
+        root,
+        issued.verified.reference,
+        issued.verified.receipt,
+    )
+    assert isinstance(orphan, StoredReceipt)
+    parsed = sessions._parse_session_receipt_entry(
+        entry.read_bytes(),
+        pid=issued.pending.reference.session_pid.value,
+    )
+    assert not isinstance(parsed, PlumbingFailure)
+    assert parsed.reference == issued.pending.reference
+
+    def crash_cleanup(*_args, **_kwargs):
+        raise _Crash("after-entry-swing")
+
+    monkeypatch.setattr(
+        sessions,
+        "_cleanup_exact_receipt_file",
+        crash_cleanup,
+    )
+    with pytest.raises(_Crash):
+        sessions.compare_and_swap_session_receipt(
+            issued.pending.reference,
+            issued.verified.reference,
+            issued.verified.receipt,
+            token_hex=TOKEN_BYTES.hex(),
+        )
+    parsed = sessions._parse_session_receipt_entry(
+        entry.read_bytes(),
+        pid=issued.pending.reference.session_pid.value,
+    )
+    assert not isinstance(parsed, PlumbingFailure)
+    assert parsed.reference is issued.verified.reference or (
+        parsed.reference == issued.verified.reference
+    )
+    assert (root / issued.pending.reference.sidecar_name).exists()
+    assert (root / issued.verified.reference.sidecar_name).exists()
+
+
+def test_registry_remove_revokes_before_cleanup_failure(
+    tmp_path: Path,
+    issued: _IssuedSet,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, root, _host = _install_registry_pending(
+        tmp_path,
+        issued,
+        monkeypatch,
+    )
+    monkeypatch.setattr(
+        sessions,
+        "_cleanup_exact_receipt_file",
+        lambda *_args, **_kwargs: plumbing_failure(
+            PlumbingDisposition.CLEANUP_FAILED,
+            PlumbingReason.SIDECAR_CLEANUP_INCOMPLETE,
+        ),
+    )
+    result = sessions.remove_session_receipt(
+        issued.pending.reference,
+        token_hex=TOKEN_BYTES.hex(),
+    )
+    assert isinstance(result, PlumbingFailure)
+    assert result.disposition is PlumbingDisposition.CLEANUP_FAILED
+    assert not (root / issued.pending.reference.session_pid.text).exists()
+    assert (root / issued.pending.reference.sidecar_name).exists()
+
+
+def test_registry_install_enforces_bounded_sidecar_population(
+    tmp_path: Path,
+    issued: _IssuedSet,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, root, host = _registry_setup(tmp_path, issued, monkeypatch)
+    pid = issued.pending.reference.session_pid.text
+    for digit in "0123":
+        path = root / f"{pid}.receipt.{digit * 64}.json"
+        path.write_bytes(b"x")
+        path.chmod(0o600)
+    result = sessions.install_pending_session_receipt(
+        issued.pending,
+        token_hex=TOKEN_BYTES.hex(),
+        expected_host=host,
+    )
+    assert isinstance(result, PlumbingFailure)
+    assert result.reason_codes == (PlumbingReason.SIDECAR_LIMIT_EXCEEDED,)
+    assert TOKEN_BYTES.hex() not in repr(result)
+    assert "/owned/copilot" not in repr(result)
+
+
+def test_persistence_entry_policy_rejects_unsafe_shapes(
+    tmp_path: Path,
+    issued: _IssuedSet,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from core.startup.runtime_receipt.persistence import (
+        read_session_entry_bytes,
+    )
+
+    root = _store_root(tmp_path)
+    pid = issued.pending.reference.session_pid
+    entry = root / pid.text
+    peer = root / "peer"
+    peer.write_bytes(b"x")
+    peer.chmod(0o600)
+    cases = ("symlink", "fifo", "directory", "hardlink", "mode", "oversize")
+    for case in cases:
+        if entry.exists() or entry.is_symlink():
+            if entry.is_dir():
+                entry.rmdir()
+            else:
+                entry.unlink()
+        if case == "symlink":
+            entry.symlink_to(peer)
+        elif case == "fifo":
+            os.mkfifo(entry, 0o600)
+        elif case == "directory":
+            entry.mkdir(mode=0o700)
+        elif case == "hardlink":
+            os.link(peer, entry)
+        elif case == "mode":
+            entry.write_bytes(b"x")
+            entry.chmod(0o644)
+        else:
+            entry.write_bytes(b"x" * 16_385)
+            entry.chmod(0o600)
+        result = read_session_entry_bytes(root, pid)
+        assert isinstance(result, PlumbingFailure), case
+    if entry.exists() or entry.is_symlink():
+        if entry.is_dir():
+            entry.rmdir()
+        else:
+            entry.unlink()
+    entry.write_bytes(b"x")
+    entry.chmod(0o600)
+    entry_inode = entry.stat().st_ino
+    original_owner = _persistence._entry_owner_matches
+    monkeypatch.setattr(
+        _persistence,
+        "_entry_owner_matches",
+        lambda value: False if value.st_ino == entry_inode else original_owner(value),
+    )
+    result = read_session_entry_bytes(root, pid)
+    assert isinstance(result, PlumbingFailure)
+
+
+@pytest.mark.parametrize(
+    ("point", "final_exists", "temporary_exists"),
+    (
+        (PersistenceCrashPoint.BEFORE_ENTRY_TEMP_CREATE, False, False),
+        (PersistenceCrashPoint.AFTER_ENTRY_TEMP_WRITE, False, True),
+        (PersistenceCrashPoint.AFTER_ENTRY_TEMP_FSYNC, False, True),
+        (PersistenceCrashPoint.AFTER_ENTRY_RENAME, True, False),
+        (PersistenceCrashPoint.AFTER_ENTRY_PARENT_FSYNC, True, False),
+        (PersistenceCrashPoint.AFTER_ENTRY_REREAD, True, False),
+    ),
+)
+def test_session_entry_write_crash_points_are_total(
+    tmp_path: Path,
+    issued: _IssuedSet,
+    point: PersistenceCrashPoint,
+    final_exists: bool,
+    temporary_exists: bool,
+) -> None:
+    from core.startup.runtime_receipt.persistence import (
+        session_entry_temporary_name,
+        write_session_entry_bytes,
+    )
+
+    root = _store_root(tmp_path)
+    pid = issued.pending.reference.session_pid
+    raw = b"v=2\n"
+
+    def crash(observed: PersistenceCrashPoint) -> None:
+        if observed is point:
+            raise _Crash(point.value)
+
+    with pytest.raises(_Crash):
+        write_session_entry_bytes(root, pid, raw, fault=crash)
+    assert (root / pid.text).exists() is final_exists
+    assert (root / session_entry_temporary_name(pid)).exists() is temporary_exists
+
+
+@pytest.mark.parametrize(
+    ("point", "entry_exists"),
+    (
+        (PersistenceCrashPoint.BEFORE_ENTRY_UNLINK, True),
+        (PersistenceCrashPoint.AFTER_ENTRY_UNLINK, False),
+    ),
+)
+def test_session_entry_unlink_crash_points_are_total(
+    tmp_path: Path,
+    issued: _IssuedSet,
+    point: PersistenceCrashPoint,
+    entry_exists: bool,
+) -> None:
+    from core.startup.runtime_receipt.persistence import (
+        unlink_session_entry_if_bytes,
+        write_session_entry_bytes,
+    )
+
+    root = _store_root(tmp_path)
+    pid = issued.pending.reference.session_pid
+    raw = b"v=2\n"
+    assert write_session_entry_bytes(root, pid, raw) == raw
+
+    def crash(observed: PersistenceCrashPoint) -> None:
+        if observed is point:
+            raise _Crash(point.value)
+
+    with pytest.raises(_Crash):
+        unlink_session_entry_if_bytes(root, pid, raw, fault=crash)
+    assert (root / pid.text).exists() is entry_exists
+
+
+def test_hashing_and_receipt_parsing_stay_outside_storage_locks(
+    tmp_path: Path,
+    issued: _IssuedSet,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _store_root(tmp_path)
+    depth = 0
+    original_lock = _persistence._strict_lock
+
+    @contextlib.contextmanager
+    def tracked_lock(*args, **kwargs):
+        nonlocal depth
+        with original_lock(*args, **kwargs):
+            depth += 1
+            try:
+                yield
+            finally:
+                depth -= 1
+
+    monkeypatch.setattr(_persistence, "_strict_lock", tracked_lock)
+    for name in (
+        "parse_receipt",
+        "serialize_receipt",
+        "parse_reference",
+        "serialize_reference",
+        "reference_receipt_mismatch",
+        "reference_transition_mismatch",
+    ):
+        original = getattr(_persistence, name)
+
+        def checked(*args, __original=original, **kwargs):
+            assert depth == 0
+            return __original(*args, **kwargs)
+
+        monkeypatch.setattr(_persistence, name, checked)
+    assert isinstance(
+        write_receipt_sidecar(
+            root,
+            issued.pending.reference,
+            issued.pending.receipt,
+        ),
+        StoredReceipt,
+    )
+    assert isinstance(
+        read_receipt_sidecar(root, issued.pending.reference),
+        StoredReceipt,
+    )
+    assert isinstance(
+        initialize_modeled_pointer(root, issued.pending.reference),
+        ModeledPointer,
+    )
+    assert isinstance(
+        write_receipt_sidecar(
+            root,
+            issued.verified.reference,
+            issued.verified.receipt,
+        ),
+        StoredReceipt,
+    )
+    assert isinstance(
+        compare_and_swap_modeled_pointer(
+            root,
+            expected=issued.pending.reference,
+            replacement=issued.verified.reference,
+        ),
+        CasApplied,
+    )
+
+
+def test_registry_lock_domains_never_nest_and_parsing_stays_outside(
+    tmp_path: Path,
+    issued: _IssuedSet,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, _root, host = _registry_setup(tmp_path, issued, monkeypatch)
+    depth = {"run": 0, "receipt": 0}
+    original_run_lock = sessions._strict_session_lock
+    original_receipt_lock = _persistence._strict_lock
+
+    @contextlib.contextmanager
+    def tracked_run_lock(*args, **kwargs):
+        assert depth["receipt"] == 0
+        with original_run_lock(*args, **kwargs):
+            depth["run"] += 1
+            try:
+                yield
+            finally:
+                depth["run"] -= 1
+
+    @contextlib.contextmanager
+    def tracked_receipt_lock(*args, **kwargs):
+        assert depth["run"] == 0
+        with original_receipt_lock(*args, **kwargs):
+            depth["receipt"] += 1
+            try:
+                yield
+            finally:
+                depth["receipt"] -= 1
+
+    monkeypatch.setattr(sessions, "_strict_session_lock", tracked_run_lock)
+    monkeypatch.setattr(_persistence, "_strict_lock", tracked_receipt_lock)
+    types_module = importlib.import_module(
+        "core.startup.runtime_receipt.plumbing_types"
+    )
+    original_sha256 = types_module.hashlib.sha256
+
+    def checked_sha256(*args, **kwargs):
+        assert depth["run"] == 0
+        assert depth["receipt"] == 0
+        return original_sha256(*args, **kwargs)
+
+    monkeypatch.setattr(types_module.hashlib, "sha256", checked_sha256)
+    for name in (
+        "_parse_session_receipt_entry",
+        "_serialize_session_receipt_entry",
+    ):
+        original = getattr(sessions, name)
+
+        def checked(*args, __original=original, **kwargs):
+            assert depth["run"] == 0
+            assert depth["receipt"] == 0
+            return __original(*args, **kwargs)
+
+        monkeypatch.setattr(sessions, name, checked)
+    installed = sessions.install_pending_session_receipt(
+        issued.pending,
+        token_hex=TOKEN_BYTES.hex(),
+        expected_host=host,
+    )
+    assert isinstance(installed, StoredReceipt)
+    swapped = sessions.compare_and_swap_session_receipt(
+        issued.pending.reference,
+        issued.verified.reference,
+        issued.verified.receipt,
+        token_hex=TOKEN_BYTES.hex(),
+    )
+    assert isinstance(swapped, CasApplied)
+    removed = sessions.remove_session_receipt(
+        issued.verified.reference,
+        token_hex=TOKEN_BYTES.hex(),
+    )
+    assert isinstance(removed, CleanupApplied)
+    assert depth == {"run": 0, "receipt": 0}

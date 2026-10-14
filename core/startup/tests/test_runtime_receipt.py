@@ -5,6 +5,9 @@ from __future__ import annotations
 import ast
 import copy
 import dataclasses
+import re
+import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
@@ -1546,10 +1549,1607 @@ def test_package_has_no_forbidden_runtime_imports_or_frozen_wiring() -> None:
     repository_root = Path(__file__).parents[3]
     for relative in (
         "bin/raptor",
-        "core/project/sessions.py",
+        "core/coverage/track_read.py",
         "core/run/metadata.py",
+        "core/run/pin.py",
         "libexec/raptor-lifecycle-hook",
     ):
         assert "runtime_receipt" not in (repository_root / relative).read_text(
             encoding="utf-8"
         )
+
+
+# Stage 3A.1 exact receipt-import policy.
+_RECEIPT_IMPORT_PREFIX = "core.startup.runtime_receipt"
+_RECEIPT_ISSUANCE_MODULE = f"{_RECEIPT_IMPORT_PREFIX}.issuance"
+_RECEIPT_PERSISTENCE_MODULE = f"{_RECEIPT_IMPORT_PREFIX}.persistence"
+_RECEIPT_PLUMBING_TYPES_MODULE = f"{_RECEIPT_IMPORT_PREFIX}.plumbing_types"
+_RECEIPT_PROFILE_MODULE = f"{_RECEIPT_IMPORT_PREFIX}.profile"
+_RECEIPT_REASONS_MODULE = f"{_RECEIPT_IMPORT_PREFIX}.reasons"
+_RECEIPT_SCHEMA_MODULE = f"{_RECEIPT_IMPORT_PREFIX}.schema"
+_RECEIPT_VERIFY_MODULE = f"{_RECEIPT_IMPORT_PREFIX}.verify"
+_SESSIONS_PATH = "core/project/sessions.py"
+_DYNAMIC_IMPORT_NAME = "<dynamic module>"
+_UNRESOLVED_RECEIPT_MODULE = f"{_RECEIPT_IMPORT_PREFIX}.<unresolved>"
+_UNKNOWN_BINDING = object()
+_IMPORTLIB_MODULE_BINDING = object()
+_BUILTINS_MODULE_BINDING = object()
+_IMPORT_MODULE_BINDING = object()
+_BUILTIN_IMPORT_BINDING = object()
+_REVIEWED_STAGE_3A1_TYPE_IMPORTS = frozenset(
+    {
+        (_RECEIPT_ISSUANCE_MODULE, "PendingReceiptIssued"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "CasApplied"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "CleanupApplied"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "PlumbingFailure"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "ReceiptReference"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "RuntimeReceiptSnapshot"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "StoredReceipt"),
+        (_RECEIPT_PROFILE_MODULE, "ProfileStore"),
+        (_RECEIPT_SCHEMA_MODULE, "RuntimeReceipt"),
+    }
+)
+_REVIEWED_STAGE_3A1_RUNTIME_IMPORTS = frozenset(
+    {
+        (_RECEIPT_ISSUANCE_MODULE, "PendingReceiptIssued"),
+        (_RECEIPT_PERSISTENCE_MODULE, "read_receipt_file_bytes"),
+        (_RECEIPT_PERSISTENCE_MODULE, "read_receipt_sidecar"),
+        (
+            _RECEIPT_PERSISTENCE_MODULE,
+            "read_receipt_sidecar_bytes_for_registry",
+        ),
+        (_RECEIPT_PERSISTENCE_MODULE, "read_session_entry_bytes"),
+        (_RECEIPT_PERSISTENCE_MODULE, "unlink_receipt_file_exact"),
+        (
+            _RECEIPT_PERSISTENCE_MODULE,
+            "unlink_session_entry_if_bytes",
+        ),
+        (
+            _RECEIPT_PERSISTENCE_MODULE,
+            "unlink_session_entry_temporary",
+        ),
+        (_RECEIPT_PERSISTENCE_MODULE, "write_receipt_sidecar"),
+        (_RECEIPT_PERSISTENCE_MODULE, "write_session_entry_bytes"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "CanonicalPid"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "CasApplied"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "CleanupApplied"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "PlumbingDisposition"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "PlumbingFailure"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "PlumbingReason"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "ReceiptReference"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "ReceiptState"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "ReceiptStateRecord"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "RuntimeReceiptSnapshot"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "StoredReceipt"),
+        (
+            _RECEIPT_PLUMBING_TYPES_MODULE,
+            "authority_invariant_failure",
+        ),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "parse_reference"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "plumbing_failure"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "reference_from_receipt"),
+        (
+            _RECEIPT_PLUMBING_TYPES_MODULE,
+            "reference_receipt_mismatch",
+        ),
+        (
+            _RECEIPT_PLUMBING_TYPES_MODULE,
+            "reference_transition_mismatch",
+        ),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "serialize_reference"),
+        (
+            _RECEIPT_PLUMBING_TYPES_MODULE,
+            "snapshot_from_static_verification",
+        ),
+        (
+            _RECEIPT_PLUMBING_TYPES_MODULE,
+            "token_commitment_matches",
+        ),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "transition_state"),
+        (_RECEIPT_PROFILE_MODULE, "ProfileStore"),
+        (_RECEIPT_REASONS_MODULE, "ReceiptRejection"),
+        (_RECEIPT_SCHEMA_MODULE, "AbsolutePath"),
+        (_RECEIPT_SCHEMA_MODULE, "ExpectedBinding"),
+        (_RECEIPT_SCHEMA_MODULE, "RuntimeReceipt"),
+        (_RECEIPT_SCHEMA_MODULE, "UuidText"),
+        (_RECEIPT_VERIFY_MODULE, "parse_receipt"),
+        (_RECEIPT_VERIFY_MODULE, "serialize_receipt"),
+        (_RECEIPT_VERIFY_MODULE, "verify_receipt_static"),
+    }
+)
+
+_REVIEWED_RECEIPT_IMPORTS = {
+    _SESSIONS_PATH: (
+        _REVIEWED_STAGE_3A1_TYPE_IMPORTS,
+        _REVIEWED_STAGE_3A1_RUNTIME_IMPORTS,
+    ),
+}
+
+_REFLECTIVE_IMPORT_TOKENS = (
+    "importlib",
+    "__import__",
+    "builtins",
+    "exec(",
+    "eval(",
+    "pkgutil",
+    "sys.modules",
+    "runpy",
+    "zipimport",
+    "globals()",
+    "vars(",
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class _GuardString:
+    parts: tuple[str | None, ...]
+
+    @property
+    def exact(self) -> str | None:
+        if any(part is None for part in self.parts):
+            return None
+        return "".join(cast(str, part) for part in self.parts)
+
+
+@dataclasses.dataclass(frozen=True)
+class _GuardSequence:
+    items: tuple[_GuardString, ...]
+
+
+class _GuardScope:
+    def __init__(self, parent: _GuardScope | None = None) -> None:
+        self.parent = parent
+        self.bindings: dict[str, object] = {}
+
+    def lookup(self, name: str) -> object:
+        if name in self.bindings:
+            return self.bindings[name]
+        if self.parent is not None:
+            return self.parent.lookup(name)
+        if name == "__import__":
+            return _BUILTIN_IMPORT_BINDING
+        return _UNKNOWN_BINDING
+
+    def clone(self) -> _GuardScope:
+        clone = _GuardScope(self.parent)
+        clone.bindings = dict(self.bindings)
+        return clone
+
+    def merge(self, alternatives: tuple[_GuardScope, ...]) -> None:
+        names = set(self.bindings)
+        for alternative in alternatives:
+            names.update(alternative.bindings)
+        merged: dict[str, object] = {}
+        for name in names:
+            values = tuple(
+                alternative.bindings.get(
+                    name,
+                    self.bindings.get(name, _UNKNOWN_BINDING),
+                )
+                for alternative in alternatives
+            )
+            first = values[0]
+            merged[name] = (
+                first
+                if all(value == first for value in values[1:])
+                else _UNKNOWN_BINDING
+            )
+        self.bindings = merged
+
+
+def _function_local_names(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> set[str]:
+    class _Collector(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.names: set[str] = set()
+            self.global_names: set[str] = set()
+            self.nonlocal_names: set[str] = set()
+
+        def visit_Name(self, node: ast.Name) -> None:
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                self.names.add(node.id)
+
+        def visit_Import(self, node: ast.Import) -> None:
+            self.names.update(
+                alias.asname or alias.name.split(".", 1)[0] for alias in node.names
+            )
+
+        def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+            self.names.update(
+                alias.asname or alias.name for alias in node.names if alias.name != "*"
+            )
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self.names.add(node.name)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            self.names.add(node.name)
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            self.names.add(node.name)
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            return
+
+        def visit_ListComp(self, node: ast.ListComp) -> None:
+            return
+
+        def visit_SetComp(self, node: ast.SetComp) -> None:
+            return
+
+        def visit_DictComp(self, node: ast.DictComp) -> None:
+            return
+
+        def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+            return
+
+        def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+            if node.name:
+                self.names.add(node.name)
+            self.generic_visit(node)
+
+        def visit_Global(self, node: ast.Global) -> None:
+            self.global_names.update(node.names)
+
+        def visit_Nonlocal(self, node: ast.Nonlocal) -> None:
+            self.nonlocal_names.update(node.names)
+
+    collector = _Collector()
+    for statement in node.body:
+        collector.visit(statement)
+    return collector.names - collector.global_names - collector.nonlocal_names
+
+
+def _guard_string(parts: tuple[str | None, ...]) -> _GuardString:
+    normalized: list[str | None] = []
+    for part in parts:
+        if part == "":
+            continue
+        if part is None:
+            if not normalized or normalized[-1] is not None:
+                normalized.append(None)
+            continue
+        if normalized and isinstance(normalized[-1], str):
+            normalized[-1] = cast(str, normalized[-1]) + part
+        else:
+            normalized.append(part)
+    return _GuardString(tuple(normalized) or ("",))
+
+
+def _guard_literal_value(node: ast.AST, scope: _GuardScope) -> object:
+    if isinstance(node, ast.Constant) and isinstance(
+        node.value,
+        (str, int, float, bool, type(None)),
+    ):
+        return node.value
+    pattern = _guard_string_pattern(node, scope)
+    return pattern.exact if pattern.exact is not None else _UNKNOWN_BINDING
+
+
+def _guard_sequence(node: ast.AST, scope: _GuardScope) -> _GuardSequence | None:
+    if isinstance(node, ast.Name):
+        value = scope.lookup(node.id)
+        return value if isinstance(value, _GuardSequence) else None
+    if not isinstance(node, (ast.List, ast.Tuple)):
+        return None
+    return _GuardSequence(
+        tuple(_guard_string_pattern(element, scope) for element in node.elts)
+    )
+
+
+def _guard_string_pattern(node: ast.AST, scope: _GuardScope) -> _GuardString:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return _guard_string((node.value,))
+    if isinstance(node, ast.Name):
+        value = scope.lookup(node.id)
+        if isinstance(value, _GuardString):
+            return value
+        return _guard_string((None,))
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _guard_string_pattern(node.left, scope)
+        right = _guard_string_pattern(node.right, scope)
+        return _guard_string(left.parts + right.parts)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
+        template = _guard_string_pattern(node.left, scope).exact
+        if template is not None:
+            if isinstance(node.right, (ast.List, ast.Tuple)):
+                values = tuple(
+                    _guard_literal_value(element, scope) for element in node.right.elts
+                )
+                operand: object = values
+            else:
+                operand = _guard_literal_value(node.right, scope)
+            if operand is not _UNKNOWN_BINDING:
+                try:
+                    formatted = template % operand
+                except (TypeError, ValueError):
+                    pass
+                else:
+                    if isinstance(formatted, str):
+                        return _guard_string((formatted,))
+        return _guard_string((None,))
+    if isinstance(node, ast.JoinedStr):
+        fstring_parts: list[str | None] = []
+        for value in node.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                fstring_parts.append(value.value)
+                continue
+            if isinstance(value, ast.FormattedValue):
+                literal = _guard_literal_value(value.value, scope)
+                if literal is _UNKNOWN_BINDING:
+                    fstring_parts.append(None)
+                    continue
+                if value.conversion == ord("r"):
+                    text = repr(literal)
+                elif value.conversion == ord("a"):
+                    text = ascii(literal)
+                else:
+                    text = str(literal)
+                if value.format_spec is not None:
+                    format_spec = _guard_string_pattern(
+                        value.format_spec,
+                        scope,
+                    ).exact
+                    if format_spec is None:
+                        fstring_parts.append(None)
+                        continue
+                    try:
+                        text = format(literal, format_spec)
+                    except (TypeError, ValueError):
+                        fstring_parts.append(None)
+                        continue
+                fstring_parts.append(text)
+                continue
+            fstring_parts.append(None)
+        return _guard_string(tuple(fstring_parts))
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+        if node.func.attr == "join" and len(node.args) == 1 and not node.keywords:
+            separator = _guard_string_pattern(node.func.value, scope).exact
+            sequence = _guard_sequence(node.args[0], scope)
+            if separator is not None and sequence is not None:
+                joined_parts: list[str | None] = []
+                for index, item in enumerate(sequence.items):
+                    if index:
+                        joined_parts.append(separator)
+                    joined_parts.extend(item.parts)
+                return _guard_string(tuple(joined_parts))
+        if node.func.attr == "format":
+            template = _guard_string_pattern(node.func.value, scope).exact
+            if template is not None:
+                args = tuple(_guard_literal_value(arg, scope) for arg in node.args)
+                keywords = {
+                    keyword.arg: _guard_literal_value(keyword.value, scope)
+                    for keyword in node.keywords
+                    if keyword.arg is not None
+                }
+                if (
+                    all(value is not _UNKNOWN_BINDING for value in args)
+                    and len(keywords) == len(node.keywords)
+                    and all(
+                        value is not _UNKNOWN_BINDING for value in keywords.values()
+                    )
+                ):
+                    try:
+                        formatted = template.format(*args, **keywords)
+                    except (IndexError, KeyError, TypeError, ValueError):
+                        pass
+                    else:
+                        return _guard_string((formatted,))
+    return _guard_string((None,))
+
+
+def _guard_binding(node: ast.AST, scope: _GuardScope) -> object:
+    if isinstance(node, ast.Name):
+        return scope.lookup(node.id)
+    if isinstance(node, ast.Attribute):
+        owner = _guard_binding(node.value, scope)
+        if owner is _IMPORTLIB_MODULE_BINDING and node.attr == "import_module":
+            return _IMPORT_MODULE_BINDING
+        if owner is _BUILTINS_MODULE_BINDING and node.attr == "__import__":
+            return _BUILTIN_IMPORT_BINDING
+        return _UNKNOWN_BINDING
+    sequence = _guard_sequence(node, scope)
+    if sequence is not None:
+        return sequence
+    return _guard_string_pattern(node, scope)
+
+
+def _receipt_import_context(
+    *,
+    in_function: bool,
+    in_type_checking: bool,
+) -> str:
+    if in_type_checking and not in_function:
+        return "type_checking"
+    if in_function and not in_type_checking:
+        return "function"
+    return "invalid"
+
+
+def _is_receipt_module(module: str) -> bool:
+    return module == _RECEIPT_IMPORT_PREFIX or module.startswith(
+        _RECEIPT_IMPORT_PREFIX + "."
+    )
+
+
+def _resolve_relative_module(module: str, package: str) -> str | None:
+    level = len(module) - len(module.lstrip("."))
+    if level == 0:
+        return module
+    package_parts = package.split(".")
+    if not package or level > len(package_parts):
+        return None
+    base = package_parts[: len(package_parts) - level + 1]
+    suffix = module[level:]
+    if suffix:
+        base.extend(suffix.split("."))
+    return ".".join(base)
+
+
+def _relative_import_module(node: ast.ImportFrom, *, filename: str) -> str | None:
+    if node.level == 0:
+        return node.module
+    package_parts = list(Path(filename).with_suffix("").parts[:-1])
+    if node.level > len(package_parts):
+        return None
+    base = package_parts[: len(package_parts) - node.level + 1]
+    if node.module:
+        base.extend(node.module.split("."))
+    return ".".join(base)
+
+
+def _module_matches_roots(module: str, roots: tuple[str, ...]) -> bool:
+    return any(module == root or module.startswith(root + ".") for root in roots)
+
+
+def _pattern_may_resolve_to_roots(
+    pattern: _GuardString,
+    roots: tuple[str, ...],
+) -> bool:
+    exact = pattern.exact
+    if exact is not None:
+        return _module_matches_roots(exact, roots)
+    literals = tuple(part for part in pattern.parts if isinstance(part, str) and part)
+    if not literals:
+        return False
+    expression = "".join(
+        ".*" if part is None else re.escape(part) for part in pattern.parts
+    )
+    candidates = {candidate for root in roots for candidate in (root, f"{root}.x")}
+    return any(re.fullmatch(expression, candidate) for candidate in candidates)
+
+
+class _DynamicReceiptImportScanner:
+    def __init__(
+        self,
+        *,
+        module_roots: tuple[str, ...] = (_RECEIPT_IMPORT_PREFIX,),
+        unresolved_module: str = _UNRESOLVED_RECEIPT_MODULE,
+    ) -> None:
+        self.records: set[tuple[str, str, str]] = set()
+        self.module_roots = module_roots
+        self.unresolved_module = unresolved_module
+
+    def scan(self, tree: ast.Module) -> set[tuple[str, str, str]]:
+        self._statements(
+            tree.body,
+            _GuardScope(),
+            in_function=False,
+            in_type_checking=False,
+        )
+        return self.records
+
+    def _record_call(
+        self,
+        node: ast.Call,
+        scope: _GuardScope,
+        *,
+        in_function: bool,
+        in_type_checking: bool,
+    ) -> None:
+        binding = _guard_binding(node.func, scope)
+        if binding not in {_IMPORT_MODULE_BINDING, _BUILTIN_IMPORT_BINDING}:
+            return
+        target_node = node.args[0] if node.args else None
+        if target_node is None:
+            target_node = next(
+                (keyword.value for keyword in node.keywords if keyword.arg == "name"),
+                None,
+            )
+        if target_node is None:
+            return
+        target = _guard_string_pattern(target_node, scope)
+        exact_target = target.exact
+        unresolved_relative_target = False
+        if (
+            binding is _IMPORT_MODULE_BINDING
+            and exact_target is not None
+            and exact_target.startswith(".")
+        ):
+            relative_target = exact_target
+            package_node = node.args[1] if len(node.args) > 1 else None
+            if package_node is None:
+                package_node = next(
+                    (
+                        keyword.value
+                        for keyword in node.keywords
+                        if keyword.arg == "package"
+                    ),
+                    None,
+                )
+            package = (
+                _guard_string_pattern(package_node, scope).exact
+                if package_node is not None
+                else None
+            )
+            exact_target = (
+                _resolve_relative_module(exact_target, package)
+                if package is not None
+                else None
+            )
+            unresolved_relative_target = exact_target is None and any(
+                relative_target.lstrip(".") in root
+                or root.rsplit(".", 1)[-1] in relative_target
+                for root in self.module_roots
+            )
+        if exact_target is not None:
+            if not _module_matches_roots(exact_target, self.module_roots):
+                return
+            module = exact_target
+        elif unresolved_relative_target or _pattern_may_resolve_to_roots(
+            target,
+            self.module_roots,
+        ):
+            module = self.unresolved_module
+        else:
+            return
+        self.records.add(
+            (
+                _receipt_import_context(
+                    in_function=in_function,
+                    in_type_checking=in_type_checking,
+                ),
+                module,
+                _DYNAMIC_IMPORT_NAME,
+            )
+        )
+
+    def _expression(
+        self,
+        node: ast.AST,
+        scope: _GuardScope,
+        *,
+        in_function: bool,
+        in_type_checking: bool,
+    ) -> None:
+        if isinstance(node, ast.Call):
+            self._record_call(
+                node,
+                scope,
+                in_function=in_function,
+                in_type_checking=in_type_checking,
+            )
+        if isinstance(node, ast.Lambda):
+            lambda_scope = _GuardScope(scope)
+            self._bind_arguments(node.args, lambda_scope)
+            self._expression(
+                node.body,
+                lambda_scope,
+                in_function=True,
+                in_type_checking=in_type_checking,
+            )
+            return
+        if isinstance(node, ast.NamedExpr):
+            self._expression(
+                node.value,
+                scope,
+                in_function=in_function,
+                in_type_checking=in_type_checking,
+            )
+            self._bind_target(node.target, _guard_binding(node.value, scope), scope)
+            return
+        for descendant in ast.iter_child_nodes(node):
+            self._expression(
+                descendant,
+                scope,
+                in_function=in_function,
+                in_type_checking=in_type_checking,
+            )
+
+    def _bind_arguments(self, arguments: ast.arguments, scope: _GuardScope) -> None:
+        for argument in (
+            *arguments.posonlyargs,
+            *arguments.args,
+            *arguments.kwonlyargs,
+        ):
+            scope.bindings[argument.arg] = _UNKNOWN_BINDING
+        if arguments.vararg is not None:
+            scope.bindings[arguments.vararg.arg] = _UNKNOWN_BINDING
+        if arguments.kwarg is not None:
+            scope.bindings[arguments.kwarg.arg] = _UNKNOWN_BINDING
+
+    def _bind_target(
+        self,
+        target: ast.AST,
+        value: object,
+        scope: _GuardScope,
+    ) -> None:
+        if isinstance(target, ast.Name):
+            scope.bindings[target.id] = value
+            return
+        if isinstance(target, (ast.List, ast.Tuple)):
+            for element in target.elts:
+                self._bind_target(element, _UNKNOWN_BINDING, scope)
+
+    def _import(self, node: ast.Import, scope: _GuardScope) -> None:
+        for alias in node.names:
+            bound_name = alias.asname or alias.name.split(".", 1)[0]
+            if alias.name == "importlib":
+                value = _IMPORTLIB_MODULE_BINDING
+            elif alias.name == "builtins":
+                value = _BUILTINS_MODULE_BINDING
+            elif alias.asname is None and alias.name.startswith("importlib."):
+                value = _IMPORTLIB_MODULE_BINDING
+            elif alias.asname is None and alias.name.startswith("builtins."):
+                value = _BUILTINS_MODULE_BINDING
+            else:
+                value = _UNKNOWN_BINDING
+            scope.bindings[bound_name] = value
+
+    def _import_from(self, node: ast.ImportFrom, scope: _GuardScope) -> None:
+        for alias in node.names:
+            if alias.name == "*":
+                continue
+            bound_name = alias.asname or alias.name
+            if node.level == 0 and node.module == "importlib":
+                value = (
+                    _IMPORT_MODULE_BINDING
+                    if alias.name == "import_module"
+                    else _UNKNOWN_BINDING
+                )
+            elif node.level == 0 and node.module == "builtins":
+                value = (
+                    _BUILTIN_IMPORT_BINDING
+                    if alias.name == "__import__"
+                    else _UNKNOWN_BINDING
+                )
+            else:
+                value = _UNKNOWN_BINDING
+            scope.bindings[bound_name] = value
+
+    def _function_header(
+        self,
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+        scope: _GuardScope,
+        *,
+        in_function: bool,
+        in_type_checking: bool,
+    ) -> None:
+        for expression in (
+            *node.decorator_list,
+            *node.args.defaults,
+            *(default for default in node.args.kw_defaults if default is not None),
+        ):
+            self._expression(
+                expression,
+                scope,
+                in_function=in_function,
+                in_type_checking=in_type_checking,
+            )
+        scope.bindings[node.name] = _UNKNOWN_BINDING
+
+    def _function_body(
+        self,
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+        scope: _GuardScope,
+        *,
+        in_type_checking: bool,
+    ) -> None:
+        child = _GuardScope(scope)
+        for name in _function_local_names(node):
+            child.bindings[name] = _UNKNOWN_BINDING
+        self._bind_arguments(node.args, child)
+        self._statements(
+            node.body,
+            child,
+            in_function=True,
+            in_type_checking=in_type_checking,
+        )
+
+    def _statements(
+        self,
+        statements: list[ast.stmt],
+        scope: _GuardScope,
+        *,
+        in_function: bool,
+        in_type_checking: bool,
+    ) -> None:
+        deferred_functions: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
+        for node in statements:
+            if isinstance(node, ast.Import):
+                self._import(node, scope)
+                continue
+            if isinstance(node, ast.ImportFrom):
+                self._import_from(node, scope)
+                continue
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                self._function_header(
+                    node,
+                    scope,
+                    in_function=in_function,
+                    in_type_checking=in_type_checking,
+                )
+                deferred_functions.append(node)
+                continue
+            if isinstance(node, ast.ClassDef):
+                for expression in (*node.decorator_list, *node.bases):
+                    self._expression(
+                        expression,
+                        scope,
+                        in_function=in_function,
+                        in_type_checking=in_type_checking,
+                    )
+                scope.bindings[node.name] = _UNKNOWN_BINDING
+                self._statements(
+                    node.body,
+                    _GuardScope(scope),
+                    in_function=in_function,
+                    in_type_checking=in_type_checking,
+                )
+                continue
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                value_node = node.value
+                if value_node is not None:
+                    self._expression(
+                        value_node,
+                        scope,
+                        in_function=in_function,
+                        in_type_checking=in_type_checking,
+                    )
+                    value = _guard_binding(value_node, scope)
+                else:
+                    value = _UNKNOWN_BINDING
+                targets = (
+                    node.targets if isinstance(node, ast.Assign) else [node.target]
+                )
+                for target in targets:
+                    self._bind_target(target, value, scope)
+                continue
+            if isinstance(node, ast.AugAssign):
+                self._expression(
+                    node.value,
+                    scope,
+                    in_function=in_function,
+                    in_type_checking=in_type_checking,
+                )
+                self._bind_target(node.target, _UNKNOWN_BINDING, scope)
+                continue
+            if isinstance(node, ast.If):
+                self._expression(
+                    node.test,
+                    scope,
+                    in_function=in_function,
+                    in_type_checking=in_type_checking,
+                )
+                type_checking_body = (
+                    isinstance(node.test, ast.Name) and node.test.id == "TYPE_CHECKING"
+                )
+                body_scope = scope.clone()
+                self._statements(
+                    node.body,
+                    body_scope,
+                    in_function=in_function,
+                    in_type_checking=in_type_checking or type_checking_body,
+                )
+                else_scope = scope.clone()
+                self._statements(
+                    node.orelse,
+                    else_scope,
+                    in_function=in_function,
+                    in_type_checking=in_type_checking,
+                )
+                scope.merge((body_scope, else_scope))
+                continue
+            if isinstance(node, (ast.For, ast.AsyncFor)):
+                self._expression(
+                    node.iter,
+                    scope,
+                    in_function=in_function,
+                    in_type_checking=in_type_checking,
+                )
+                self._bind_target(node.target, _UNKNOWN_BINDING, scope)
+                self._statements(
+                    node.body,
+                    scope,
+                    in_function=in_function,
+                    in_type_checking=in_type_checking,
+                )
+                self._statements(
+                    node.orelse,
+                    scope,
+                    in_function=in_function,
+                    in_type_checking=in_type_checking,
+                )
+                continue
+            if isinstance(node, ast.While):
+                self._expression(
+                    node.test,
+                    scope,
+                    in_function=in_function,
+                    in_type_checking=in_type_checking,
+                )
+                self._statements(
+                    node.body,
+                    scope,
+                    in_function=in_function,
+                    in_type_checking=in_type_checking,
+                )
+                self._statements(
+                    node.orelse,
+                    scope,
+                    in_function=in_function,
+                    in_type_checking=in_type_checking,
+                )
+                continue
+            if isinstance(node, (ast.With, ast.AsyncWith)):
+                for item in node.items:
+                    self._expression(
+                        item.context_expr,
+                        scope,
+                        in_function=in_function,
+                        in_type_checking=in_type_checking,
+                    )
+                    if item.optional_vars is not None:
+                        self._bind_target(
+                            item.optional_vars,
+                            _UNKNOWN_BINDING,
+                            scope,
+                        )
+                self._statements(
+                    node.body,
+                    scope,
+                    in_function=in_function,
+                    in_type_checking=in_type_checking,
+                )
+                continue
+            try_star = getattr(ast, "TryStar", None)
+            if isinstance(node, ast.Try) or (
+                try_star is not None and isinstance(node, try_star)
+            ):
+                self._statements(
+                    node.body,
+                    scope,
+                    in_function=in_function,
+                    in_type_checking=in_type_checking,
+                )
+                for handler in node.handlers:
+                    if handler.name:
+                        scope.bindings[handler.name] = _UNKNOWN_BINDING
+                    self._statements(
+                        handler.body,
+                        scope,
+                        in_function=in_function,
+                        in_type_checking=in_type_checking,
+                    )
+                self._statements(
+                    node.orelse,
+                    scope,
+                    in_function=in_function,
+                    in_type_checking=in_type_checking,
+                )
+                self._statements(
+                    node.finalbody,
+                    scope,
+                    in_function=in_function,
+                    in_type_checking=in_type_checking,
+                )
+                continue
+            if isinstance(node, ast.Match):
+                self._expression(
+                    node.subject,
+                    scope,
+                    in_function=in_function,
+                    in_type_checking=in_type_checking,
+                )
+                alternatives: list[_GuardScope] = []
+                for case in node.cases:
+                    case_scope = scope.clone()
+                    if case.guard is not None:
+                        self._expression(
+                            case.guard,
+                            case_scope,
+                            in_function=in_function,
+                            in_type_checking=in_type_checking,
+                        )
+                    self._statements(
+                        case.body,
+                        case_scope,
+                        in_function=in_function,
+                        in_type_checking=in_type_checking,
+                    )
+                    alternatives.append(case_scope)
+                if alternatives:
+                    scope.merge(tuple(alternatives))
+                continue
+            if isinstance(node, ast.Delete):
+                for target in node.targets:
+                    self._bind_target(target, _UNKNOWN_BINDING, scope)
+                continue
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, ast.expr):
+                    self._expression(
+                        child,
+                        scope,
+                        in_function=in_function,
+                        in_type_checking=in_type_checking,
+                    )
+        for node in deferred_functions:
+            self._function_body(
+                node,
+                scope,
+                in_type_checking=in_type_checking,
+            )
+
+
+def _receipt_import_records(source: str, *, filename: str) -> set[tuple[str, str, str]]:
+    tree = ast.parse(source, filename=filename)
+    parents: dict[ast.AST, ast.AST] = {}
+    for parent in ast.walk(tree):
+        parents.update((child, parent) for child in ast.iter_child_nodes(parent))
+
+    records: set[tuple[str, str, str]] = set()
+    for node in ast.walk(tree):
+        modules: list[tuple[str, str]] = []
+        if isinstance(node, ast.Import):
+            modules.extend(
+                (
+                    alias.name,
+                    (
+                        "<module>"
+                        if alias.asname is None
+                        else f"<module> as {alias.asname}"
+                    ),
+                )
+                for alias in node.names
+            )
+        elif isinstance(node, ast.ImportFrom):
+            imported_from = _relative_import_module(node, filename=filename)
+            if imported_from is None:
+                continue
+            for alias in node.names:
+                imported_name = (
+                    alias.name
+                    if alias.asname is None
+                    else f"{alias.name} as {alias.asname}"
+                )
+                if node.level:
+                    imported_name = f"{imported_name} [relative]"
+                if _is_receipt_module(imported_from):
+                    modules.append((imported_from, imported_name))
+                    continue
+                imported_module = f"{imported_from}.{alias.name}"
+                if _is_receipt_module(imported_module):
+                    module_name = "<module>"
+                    if node.level:
+                        module_name += " [relative]"
+                    modules.append((imported_module, module_name))
+        else:
+            continue
+        for module, name in modules:
+            if not _is_receipt_module(module):
+                continue
+            ancestors: list[ast.AST] = []
+            current: ast.AST = node
+            while current in parents:
+                current = parents[current]
+                ancestors.append(current)
+            in_function = any(
+                isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef))
+                for parent in ancestors
+            )
+            in_type_checking = any(
+                isinstance(parent, ast.If)
+                and isinstance(parent.test, ast.Name)
+                and parent.test.id == "TYPE_CHECKING"
+                for parent in ancestors
+            )
+            context = _receipt_import_context(
+                in_function=in_function,
+                in_type_checking=in_type_checking,
+            )
+            records.add((context, module, name))
+    records.update(_DynamicReceiptImportScanner().scan(tree))
+    return records
+
+
+def _receipt_import_policy_violations(
+    relative_path: str,
+    source: str,
+) -> tuple[str, ...]:
+    records = _receipt_import_records(source, filename=relative_path)
+    reviewed = _REVIEWED_RECEIPT_IMPORTS.get(relative_path)
+    if reviewed is None:
+        return tuple(
+            f"{relative_path}: forbidden {context} import {module}.{name}"
+            for context, module, name in sorted(records)
+        )
+
+    expected_type_imports, expected_runtime_imports = reviewed
+    type_imports = {
+        (module, name)
+        for context, module, name in records
+        if context == "type_checking"
+    }
+    runtime_imports = {
+        (module, name) for context, module, name in records if context == "function"
+    }
+    invalid_imports = {
+        (module, name) for context, module, name in records if context == "invalid"
+    }
+    violations: list[str] = []
+    if invalid_imports:
+        violations.append(
+            f"{relative_path}: receipt imports must be function-local or TYPE_CHECKING: "
+            f"{sorted(invalid_imports)!r}"
+        )
+    if type_imports != expected_type_imports:
+        violations.append(
+            f"{relative_path}: reviewed type imports changed: {sorted(type_imports)!r}"
+        )
+    if runtime_imports != expected_runtime_imports:
+        violations.append(
+            f"{relative_path}: reviewed runtime imports changed: "
+            f"{sorted(runtime_imports)!r}"
+        )
+    return tuple(violations)
+
+
+def _production_python_sources(repository_root: Path) -> dict[str, str]:
+    paths = set(repository_root.glob("*.py"))
+    for root_name in ("core", "packages", "plugins"):
+        root = repository_root / root_name
+        if root.is_dir():
+            paths.update(root.rglob("*.py"))
+    for root_name in ("bin", "libexec"):
+        root = repository_root / root_name
+        if not root.is_dir():
+            continue
+        for path in root.iterdir():
+            if not path.is_file():
+                continue
+            try:
+                with path.open(
+                    "r",
+                    encoding="utf-8",
+                    errors="surrogateescape",
+                ) as handle:
+                    first_line = handle.readline()
+            except OSError:
+                continue
+            if "python" in first_line and first_line.startswith("#!"):
+                paths.add(path)
+    sources: dict[str, str] = {}
+    for path in sorted(paths):
+        relative = path.relative_to(repository_root)
+        if (
+            "tests" in relative.parts
+            or relative.parts[:3] == ("core", "startup", "runtime_receipt")
+            or any(part in {"__pycache__", "out", ".out"} for part in relative.parts)
+        ):
+            continue
+        sources[relative.as_posix()] = path.read_text(
+            encoding="utf-8",
+            errors="surrogateescape",
+        )
+    return sources
+
+
+def _synthetic_reviewed_sessions_imports() -> str:
+    lines = ["from typing import TYPE_CHECKING", "", "if TYPE_CHECKING:"]
+    lines.extend(
+        f"    from {module} import {name}"
+        for module, name in sorted(_REVIEWED_STAGE_3A1_TYPE_IMPORTS)
+    )
+    lines.extend(("", "def reviewed_runtime_imports():"))
+    lines.extend(
+        f"    from {module} import {name}"
+        for module, name in sorted(_REVIEWED_STAGE_3A1_RUNTIME_IMPORTS)
+    )
+    return "\n".join(lines) + "\n"
+
+
+_DYNAMIC_RECEIPT_IMPORT_CASES = (
+    (
+        "direct-importlib",
+        f"""
+import importlib
+
+def load():
+    return importlib.import_module(name="{_RECEIPT_PERSISTENCE_MODULE}")
+""",
+        _RECEIPT_PERSISTENCE_MODULE,
+    ),
+    (
+        "imported-alias-chain",
+        f"""
+from importlib import import_module as imported
+
+load_module = imported
+load_again = load_module
+
+def load():
+    return load_again("{_RECEIPT_PERSISTENCE_MODULE}")
+""",
+        _RECEIPT_PERSISTENCE_MODULE,
+    ),
+    (
+        "global-import-after-function",
+        f"""
+def load():
+    return import_module(TARGET)
+
+TARGET = "{_RECEIPT_PERSISTENCE_MODULE}"
+from importlib import import_module
+""",
+        _RECEIPT_PERSISTENCE_MODULE,
+    ),
+    (
+        "module-alias-chain",
+        f"""
+import importlib as imported
+
+module_api = imported
+load_module = module_api.import_module
+
+def load():
+    return load_module("{_RECEIPT_PERSISTENCE_MODULE}")
+""",
+        _RECEIPT_PERSISTENCE_MODULE,
+    ),
+    (
+        "builtin-import",
+        f"""
+def load():
+    return __import__("{_RECEIPT_PERSISTENCE_MODULE}")
+""",
+        _RECEIPT_PERSISTENCE_MODULE,
+    ),
+    (
+        "builtin-alias-chain",
+        f"""
+load_module = __import__
+load_again = load_module
+
+def load():
+    return load_again("{_RECEIPT_PERSISTENCE_MODULE}")
+""",
+        _RECEIPT_PERSISTENCE_MODULE,
+    ),
+    (
+        "builtins-import-alias",
+        f"""
+from builtins import __import__ as load_module
+
+def load():
+    return load_module("{_RECEIPT_PERSISTENCE_MODULE}")
+""",
+        _RECEIPT_PERSISTENCE_MODULE,
+    ),
+    (
+        "builtins-module-alias",
+        f"""
+import builtins as builtin_api
+
+load_module = builtin_api.__import__
+
+def load():
+    return load_module("{_RECEIPT_PERSISTENCE_MODULE}")
+""",
+        _RECEIPT_PERSISTENCE_MODULE,
+    ),
+    (
+        "split-concatenation",
+        """
+from importlib import import_module
+
+BASE = "core." + "startup."
+RECEIPT = "runtime_" + "receipt"
+TARGET = BASE + RECEIPT + ".persistence"
+
+def load():
+    return import_module(TARGET)
+""",
+        _RECEIPT_PERSISTENCE_MODULE,
+    ),
+    (
+        "adjacent-literals",
+        f"""
+from importlib import import_module
+
+TARGET = (
+    "core.startup."
+    "{"runtime_" + "receipt.persistence"}"
+)
+
+def load():
+    return import_module(TARGET)
+""",
+        _RECEIPT_PERSISTENCE_MODULE,
+    ),
+    (
+        "constant-f-string",
+        """
+from importlib import import_module
+
+SUFFIX = "receipt"
+TARGET = f"core.startup.runtime_{SUFFIX}.persistence"
+
+def load():
+    return import_module(TARGET)
+""",
+        _RECEIPT_PERSISTENCE_MODULE,
+    ),
+    (
+        "constant-join",
+        """
+from importlib import import_module
+
+PARTS = ("core", "startup", "runtime_receipt", "persistence")
+TARGET = ".".join(PARTS)
+
+def load():
+    return import_module(TARGET)
+""",
+        _RECEIPT_PERSISTENCE_MODULE,
+    ),
+    (
+        "constant-format",
+        """
+from importlib import import_module
+
+TARGET = "{}.{}.{}.{}".format(
+    "core",
+    "startup",
+    "runtime_receipt",
+    "persistence",
+)
+
+def load():
+    return import_module(TARGET)
+""",
+        _RECEIPT_PERSISTENCE_MODULE,
+    ),
+    (
+        "constant-percent-format",
+        """
+from importlib import import_module
+
+TARGET = "%s.%s.%s" % ("core.startup", "runtime_receipt", "persistence")
+
+def load():
+    return import_module(TARGET)
+""",
+        _RECEIPT_PERSISTENCE_MODULE,
+    ),
+    (
+        "unresolved-receipt-suffix",
+        """
+from importlib import import_module
+
+BASE = "core.startup.runtime_receipt."
+
+def load(name):
+    return import_module(BASE + name)
+""",
+        _UNRESOLVED_RECEIPT_MODULE,
+    ),
+    (
+        "relative-import-module",
+        f"""
+import importlib as module_api
+
+def load():
+    return module_api.import_module(
+        ".{"runtime_" + "receipt.persistence"}",
+        package="core.startup",
+    )
+""",
+        _RECEIPT_PERSISTENCE_MODULE,
+    ),
+    (
+        "relative-unresolved-package",
+        f"""
+import importlib as module_api
+
+def load(package):
+    return module_api.import_module(
+        ".{"runtime_" + "receipt.persistence"}",
+        package=package,
+    )
+""",
+        _UNRESOLVED_RECEIPT_MODULE,
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    ("case_name", "source", "expected_module"),
+    _DYNAMIC_RECEIPT_IMPORT_CASES,
+    ids=[case[0] for case in _DYNAMIC_RECEIPT_IMPORT_CASES],
+)
+def test_dynamic_receipt_import_bypass_forms_are_forbidden(
+    case_name: str,
+    source: str,
+    expected_module: str,
+) -> None:
+    del case_name
+    relative = "core/run/other.py"
+    records = _receipt_import_records(source, filename=relative)
+
+    assert ("function", expected_module, _DYNAMIC_IMPORT_NAME) in records
+    assert _receipt_import_policy_violations(relative, source) == (
+        f"{relative}: forbidden function import "
+        f"{expected_module}.{_DYNAMIC_IMPORT_NAME}",
+    )
+
+
+@pytest.mark.parametrize(
+    ("case_name", "source", "expected_module"),
+    _DYNAMIC_RECEIPT_IMPORT_CASES,
+    ids=[case[0] for case in _DYNAMIC_RECEIPT_IMPORT_CASES],
+)
+def test_sessions_dynamic_receipt_imports_break_the_exact_allowlist(
+    case_name: str,
+    source: str,
+    expected_module: str,
+) -> None:
+    del case_name
+    combined = _synthetic_reviewed_sessions_imports() + source
+    records = _receipt_import_records(combined, filename=_SESSIONS_PATH)
+
+    assert ("function", expected_module, _DYNAMIC_IMPORT_NAME) in records
+    assert _receipt_import_policy_violations(_SESSIONS_PATH, combined)
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        f"""
+def import_module(name):
+    return name
+
+def load():
+    return import_module("{_RECEIPT_PERSISTENCE_MODULE}")
+""",
+        f"""
+from importlib import import_module
+
+def load():
+    def import_module(name):
+        return name
+    return import_module("{_RECEIPT_PERSISTENCE_MODULE}")
+""",
+        f"""
+from importlib import import_module
+
+def load(import_module):
+    return import_module("{_RECEIPT_PERSISTENCE_MODULE}")
+""",
+        f"""
+from importlib import import_module
+
+def local_helper(name):
+    return name
+
+def load():
+    import_module("{_RECEIPT_PERSISTENCE_MODULE}")
+    import_module = local_helper
+""",
+        f"""
+from importlib import import_module
+
+def local_helper(name):
+    return name
+
+import_module = local_helper
+
+def load():
+    return import_module("{_RECEIPT_PERSISTENCE_MODULE}")
+""",
+        f"""
+import importlib
+
+class LocalLoader:
+    def import_module(self, name):
+        return name
+
+importlib = LocalLoader()
+
+def load():
+    return importlib.import_module("{_RECEIPT_PERSISTENCE_MODULE}")
+""",
+        """
+import importlib
+
+def load():
+    return importlib.import_module("core.audit.context")
+""",
+        """
+from importlib import import_module
+
+def load(name):
+    return import_module("packages.plugins." + name)
+""",
+        """
+from importlib import import_module
+
+def load(name):
+    return import_module(name)
+""",
+        f"""
+def __import__(name):
+    return name
+
+def load():
+    return __import__("{_RECEIPT_PERSISTENCE_MODULE}")
+""",
+        """
+def load():
+    return __import__("shutil")
+""",
+    ),
+)
+def test_dynamic_import_guard_ignores_unrelated_or_shadowed_calls(
+    source: str,
+) -> None:
+    relative = "core/run/other.py"
+
+    assert _receipt_import_records(source, filename=relative) == set()
+    assert _receipt_import_policy_violations(relative, source) == ()
+
+
+def test_synthetic_sessions_exact_import_allowlist_is_accepted() -> None:
+    source = _synthetic_reviewed_sessions_imports()
+
+    assert _receipt_import_policy_violations(_SESSIONS_PATH, source) == ()
+
+
+@pytest.mark.parametrize(
+    "extra_import",
+    (
+        "    from core.startup import runtime_receipt\n",
+        "    from core.startup.runtime_receipt import parse_receipt\n",
+        (
+            f"    from {_RECEIPT_PERSISTENCE_MODULE} "
+            "import read_receipt_sidecar as hidden\n"
+        ),
+        f"    from {_RECEIPT_PERSISTENCE_MODULE} import *\n",
+        (
+            "    from ..startup.runtime_"
+            "receipt.persistence "
+            "import read_receipt_sidecar\n"
+        ),
+    ),
+)
+def test_synthetic_sessions_broader_aliased_wildcard_or_relative_imports_fail(
+    extra_import: str,
+) -> None:
+    source = (
+        _synthetic_reviewed_sessions_imports()
+        + "\ndef forbidden_receipt_import():\n"
+        + extra_import
+    )
+
+    assert _receipt_import_policy_violations(_SESSIONS_PATH, source)
+
+
+def test_relative_receipt_import_in_another_production_file_is_forbidden() -> None:
+    relative = "core/startup/hidden_receipt_import.py"
+    relative_module = ".runtime_" + "receipt.persistence"
+    source = f"from {relative_module} import read_receipt_sidecar\n"
+
+    assert _receipt_import_policy_violations(relative, source) == (
+        f"{relative}: forbidden invalid import "
+        f"{_RECEIPT_PERSISTENCE_MODULE}.read_receipt_sidecar [relative]",
+    )
+
+
+def test_stage3a1_receipt_importers_are_exact() -> None:
+    repository_root = Path(__file__).parents[3]
+    production_sources = _production_python_sources(repository_root)
+    violations = tuple(
+        violation
+        for relative_path, source_text in production_sources.items()
+        for violation in _receipt_import_policy_violations(
+            relative_path,
+            source_text,
+        )
+    )
+    assert violations == ()
+    assert {
+        relative
+        for relative, source_text in production_sources.items()
+        if _RECEIPT_IMPORT_PREFIX in source_text
+    } == {_SESSIONS_PATH}
+
+
+def test_reviewed_sessions_receipt_imports_are_explicit_and_exact() -> None:
+    repository_root = Path(__file__).parents[3]
+    source_text = (repository_root / _SESSIONS_PATH).read_text(encoding="utf-8")
+
+    assert _receipt_import_policy_violations(_SESSIONS_PATH, source_text) == ()
+    assert "_receipt_module" not in source_text
+    assert "importlib.import_module" not in source_text
+    assert "globals()" not in source_text
+    assert '"runtime_" +' not in source_text
+    tree = ast.parse(source_text, filename=_SESSIONS_PATH)
+    assert any(
+        isinstance(node, ast.FunctionDef)
+        and node.name == "read_current_session_runtime_receipt"
+        for node in tree.body
+    )
+    for broadened_source in (
+        source_text + "\nfrom core.startup import runtime_receipt\n",
+        source_text + f"\nfrom {_RECEIPT_PLUMBING_TYPES_MODULE} "
+        "import ReceiptReference as HiddenReference\n",
+    ):
+        assert _receipt_import_policy_violations(
+            _SESSIONS_PATH,
+            broadened_source,
+        )
+
+
+def test_reviewed_sessions_bans_reflective_import_tokens() -> None:
+    repository_root = Path(__file__).parents[3]
+    source_text = (repository_root / _SESSIONS_PATH).read_text(encoding="utf-8")
+    for token in _REFLECTIVE_IMPORT_TOKENS:
+        assert token not in source_text, token
+
+
+def test_extra_production_receipt_importer_is_forbidden() -> None:
+    relative = "core/project/copied_receipt_import.py"
+    violations = _receipt_import_policy_violations(
+        relative,
+        "def copied_import():\n"
+        f"    from {_RECEIPT_PERSISTENCE_MODULE} import read_receipt_sidecar\n",
+    )
+    assert violations == (
+        f"{relative}: forbidden function import "
+        f"{_RECEIPT_PERSISTENCE_MODULE}.read_receipt_sidecar",
+    )
+
+
+def test_importing_sessions_keeps_receipt_modules_lazy_and_cycle_free(
+    tmp_path: Path,
+) -> None:
+    repository_root = Path(__file__).parents[3]
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys, tempfile; "
+            "from pathlib import Path; "
+            "import core.project.sessions as sessions; "
+            "sessions.SESSIONS_DIR = Path(tempfile.mkdtemp()); "
+            "sessions.read_sessions(); "
+            "print(sessions.read_current_session_runtime_receipt.__name__); "
+            "print(','.join(sorted(name for name in sys.modules "
+            "if name.startswith('core.startup.runtime_receipt'))))",
+        ],
+        cwd=repository_root,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "TMPDIR": str(tmp_path),
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        "read_current_session_runtime_receipt",
+        "",
+    ]
