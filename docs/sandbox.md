@@ -110,6 +110,29 @@ of Landlock/seccomp-only containment (see
 [environment.md](environment.md)); every waived run warns that same-UID
 `/proc` credential reads are not blocked in that mode.
 
+### Per-call no-degrade, capture, and cancellation
+
+`sandbox(..., no_degrade=True)` is an opt-in ratchet for callers that require
+the Linux fork-based user/mount/PID/network-namespace backend. It ignores
+`RAPTOR_ALLOW_DEGRADED_UNTRUSTED` for that call, forces fresh `/proc` and
+proxy-netns requirements, and refuses unsupported or demoted backends before
+running the target. Existing callers retain the default
+`no_degrade=False` behavior. Results record the actual `backend`,
+`no_degrade`, and `degrade_waiver_honored` treatment in `sandbox_info`.
+
+Fork-backend captures expose `stdout_truncated`, `stderr_truncated`,
+`stdout_bytes_kept`, and `stderr_bytes_kept` on successful results,
+`TimeoutExpired`, and `SandboxCancelled`. The same values are mirrored under
+`sandbox_info["capture"]`. The compatibility text marker remains in returned
+stdout/stderr, but structured fields are authoritative; missing metadata never
+proves that a legacy backend captured a complete stream.
+
+`cancel_fd=` is parent-owned and Linux-fork-only. It must be close-on-exec,
+is never added to the target's inherited descriptors, and remains open in the
+caller. Readability or EOF requests cancellation. Cancellation, timeout, and
+other collection-phase `BaseException`s all use the existing death-pipe/PID
+namespace teardown owner before propagating.
+
 ---
 
 ## Containment floor
