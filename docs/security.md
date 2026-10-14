@@ -225,7 +225,7 @@ hooks, credential isolation, and SAGE trust boundaries.
 
 ## Security Invariants
 
-Three invariants govern any code path where RAPTOR reads target source
+Four invariants govern any code path where RAPTOR reads target source
 via an LLM, dispatches a sub-agent, or feeds LLM-derived artefacts to
 downstream consumers (engineering detail: `core/security/THREAT_MODEL.md`):
 
@@ -244,6 +244,32 @@ downstream consumers (engineering detail: `core/security/THREAT_MODEL.md`):
 - **I3 — Config trust is narrow.** The config-file poisoning gate
   (scenario 3 above) is a different threat from source-level prompt
   injection; `--trust-repo` relaxes only the config checks, never I2.
+- **I4 — Runtime receipts remain non-authorizing.** Receipt-backed
+  session records and runs are projectless, ownerless, and ledgerless.
+  Generic lifecycle paths refuse them. A narrow test-only exception
+  exists for RAPTOR's fixed owned runtime fake: a non-exported,
+  process-local, exact-object, single-use capability binds one verified
+  launch, direct child, receipt snapshot, private terminal socket, and
+  fresh projectless run. An authenticated terminal event creates a
+  thread-bound permit only around an existing lifecycle wrapper.
+
+  The outer receipt veto and the under-lock status update independently
+  verify the exact run path, raw metadata generation, parsed receipt
+  snapshot, terminal event, target status, and null project pin.
+  Wrapper signatures and effect order do not change. The permit is
+  spent even when verification fails; fork descendants wipe all
+  process-local authority. Exact cleanup, replay resistance, and
+  launch/run/socket binding prevent tampering, concurrent reuse,
+  cross-thread use, or cross-launch reuse.
+
+  This exception has no environment, CLI, hook-event, receipt-field,
+  provider, model, public export, launcher, or live frontend surface.
+  It calls no ledger start, resume, or finish API. Project journal and
+  coverage projections remain no-ops because the run stays
+  authoritatively projectless. Same-launch resume requires a fresh
+  capability bound to the new metadata generation; cross-launch
+  receipt continuity remains audit evidence and grants no terminal
+  authority.
 
 ---
 

@@ -830,6 +830,36 @@ the machine inventory but deliberately not documented; run
 `python3 .github/scripts/check_env_docs.py --list test-only` for the
 current list.
 
+### Owned runtime fake lifecycle exception
+
+Runtime-receipt metadata is deny-only: it does not grant a project,
+session owner, ledger witness, provider, model, or general lifecycle
+authority. The sole exception is an internal test helper for RAPTOR's
+fixed owned runtime fake. It may create one fresh mode-0700,
+projectless run beneath that fake's private bundle and mint a
+non-exported capability bound to the exact launch, direct child,
+receipt snapshot, terminal socket, run path, and metadata generation.
+
+The capability is process-local, exact-object, single-use, and cannot
+be serialized. An authenticated terminal event installs a
+thread-bound permit only while an existing completion, failure,
+cancellation, or interruption wrapper executes. The receipt veto
+checks the binding before the wrapper runs, and the status update
+checks it again while holding the metadata lock. Any import, parse,
+binding, lock, or postcondition error denies the transition and spends
+the permit.
+
+The exception has no environment variable, command-line flag, hook
+payload, public package export, provider path, or live frontend path.
+Fork descendants wipe its keys, permits, registry records, and file
+descriptors. Exact cleanup rejects replacement or tampering; replay,
+concurrent reuse, another thread, another run, and another launch gain
+no authority. Receipt-backed runs remain ownerless, ledgerless, and
+authoritatively projectless, so project journal and coverage
+projections remain no-ops. Resuming the same launch requires a fresh
+capability bound to the new metadata generation; cross-launch receipt
+continuity remains audit evidence only.
+
 
 ## Internal plumbing — do not set
 
