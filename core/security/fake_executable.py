@@ -40,6 +40,7 @@ _DIR_FLAGS = (
     | getattr(os, "O_NOFOLLOW", 0)
     | getattr(os, "O_CLOEXEC", 0)
 )
+_CANARY_CONTEXT = b"raptor-copilot-level-a-canary-v1\0"
 
 
 @dataclass(frozen=True, init=False, repr=False)
@@ -427,9 +428,46 @@ def verify_owned_fake_executable(
     return capability
 
 
+def _derive_synthetic_canary(
+    observation_key: bytes,
+    session_id: str,
+) -> str:
+    digest = hmac.new(
+        observation_key,
+        _CANARY_CONTEXT + session_id.encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+    return base64.urlsafe_b64encode(digest).decode("ascii")
+
+
+def owned_fake_synthetic_canary(
+    capability: object,
+    session_id: str,
+) -> str:
+    verified = verify_owned_fake_executable(capability)
+    return _derive_synthetic_canary(
+        verified._observation_key,
+        session_id,
+    )
+
+
+def owned_fake_secret_observation_hmac(
+    capability: object,
+    value: str,
+) -> str:
+    verified = verify_owned_fake_executable(capability)
+    return hmac.new(
+        verified._observation_key,
+        value.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
 __all__ = [
     "FAKE_EXECUTABLE_FACTORY_ID",
     "MAX_OWNED_FAKE_SCRIPT_BYTES",
     "OwnedFakeExecutable",
+    "owned_fake_secret_observation_hmac",
+    "owned_fake_synthetic_canary",
     "verify_owned_fake_executable",
 ]

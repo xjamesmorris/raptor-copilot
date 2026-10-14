@@ -46,6 +46,7 @@ from core.config import RaptorConfig
 from core.security.fake_executable import (
     FAKE_EXECUTABLE_FACTORY_ID,
     OwnedFakeExecutable,
+    _derive_synthetic_canary,
     _issue_owned_fake_executable,
 )
 from core.testing.git_hermeticity import (
@@ -74,6 +75,7 @@ _PROTECTED_ENV_KEYS = frozenset({
     "RAPTOR_DIR",
     "RAPTOR_TEST_LIVE_LLM",
     "RAPTOR_CC_TRANSPORT_DISABLED",
+    "RAPTOR_COPILOT_TRANSPORT_DISABLED",
     "TMPDIR",
     "VIRTUAL_ENV",
     "XDG_CACHE_HOME",
@@ -1274,6 +1276,14 @@ class HermeticCLIWorkspace:
             hashlib.sha256,
         ).hexdigest()
 
+    def synthetic_secret_canary(self, session_id: str) -> str:
+        """Derive the internally generated Level-A canary for a session."""
+        _validate_text(session_id, field="session_id")
+        return _derive_synthetic_canary(
+            self._secret_observation_key,
+            session_id,
+        )
+
     def configure_cli(
         self,
         name: str,
@@ -1411,6 +1421,7 @@ class HermeticCLIWorkspace:
             "RAPTOR_CONFIG": str(self.raptor_config),
             "RAPTOR_OUT_DIR": str(self.raptor_out_dir),
             "RAPTOR_CC_TRANSPORT_DISABLED": "1",
+            "RAPTOR_COPILOT_TRANSPORT_DISABLED": "1",
             **RaptorConfig.GIT_ENV_VARS,
             "LANG": "C",
             "LC_ALL": "C",

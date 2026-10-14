@@ -804,6 +804,10 @@ class RaptorConfig:
         # is strictly re-validated at consumption (positive integer
         # or warn-and-default, never unlimited).
         "RAPTOR_REDB_MAX_BYTES",
+        # Pure-refusal guard for the synthetic Copilot probe boundary.
+        # Like the Claude Code switch, propagation can only forbid a
+        # spawn; no value selects a provider or grants live authority.
+        "RAPTOR_COPILOT_TRANSPORT_DISABLED",
     })
 
     # Environment variables that can be exploited for command injection or
@@ -1499,6 +1503,7 @@ class RaptorConfig:
         # on PATH and CLAUDECODE — the switch is the layer that makes
         # such a bug loud and spend-free instead of live.
         env["RAPTOR_CC_TRANSPORT_DISABLED"] = "1"
+        env["RAPTOR_COPILOT_TRANSPORT_DISABLED"] = "1"
         return env
 
     @staticmethod

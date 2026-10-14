@@ -104,18 +104,20 @@ os.environ.setdefault(
 # live CLI and spends real model budget as a side effect of running a
 # tier. Live-LLM invocation from tests is explicit opt-in: export
 # RAPTOR_TEST_LIVE_LLM=1 to run deliberately-live tests; everything
-# else gets the spawn-time kill switch (billed claude spawns raise a
-# named error; detection, selection and mock-driven transport-shape
-# tests are unaffected). Subprocesses inherit the switch, so
+# else gets both spawn-time kill switches (billed claude spawns and
+# the synthetic Copilot probe raise named errors; detection, selection,
+# planning, and mock-driven transport-shape tests are unaffected).
+# Subprocesses inherit the switches, so
 # CLI-invoking e2e tests are covered without per-file plumbing.
 # Force-assigned, not setdefault: an ambient RAPTOR_CC_TRANSPORT_
-# DISABLED=0 (the documented spelling for keeping the transport live
+# DISABLED=0 (the documented spelling for keeping that transport live
 # in production) would otherwise defeat the hermetic default silently.
 # RAPTOR_TEST_LIVE_LLM=1 is the ONE spelling that makes test sessions
 # live; per-module spawn-machinery opt-outs go through the
 # cc_spawn_machinery_enabled fixture below.
 if os.environ.get("RAPTOR_TEST_LIVE_LLM") != "1":
     os.environ["RAPTOR_CC_TRANSPORT_DISABLED"] = "1"
+    os.environ["RAPTOR_COPILOT_TRANSPORT_DISABLED"] = "1"
 
 # Semgrep phones home on any invocation (semgrep.dev version check,
 # anonymous metrics) unless suppressed; tests that shell out to a real
@@ -474,6 +476,28 @@ def cc_spawn_machinery_enabled(monkeypatch):
     fixture must never dispatch the real CLI (declare fakes in the
     module docstring)."""
     monkeypatch.delenv("RAPTOR_CC_TRANSPORT_DISABLED", raising=False)
+
+
+@pytest.fixture
+def copilot_synthetic_transport_enabled(monkeypatch):
+    """Enable only the verified repository fake for one Level-A test.
+
+    The shared ``RAPTOR_TEST_LIVE_LLM`` convention remains the sole
+    session-level live opt-in. This fixture does not enable a real path:
+    it verifies the opaque fake capability before clearing the pure-denial
+    switch, and the execution chokepoint independently requires the same
+    capability.
+    """
+
+    def enable(capability) -> None:
+        from core.security.fake_executable import (
+            verify_owned_fake_executable,
+        )
+
+        verify_owned_fake_executable(capability)
+        monkeypatch.setenv("RAPTOR_COPILOT_TRANSPORT_DISABLED", "0")
+
+    return enable
 
 
 _SESSIONS_DIR_SEQ = _itertools.count()

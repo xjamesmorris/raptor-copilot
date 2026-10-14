@@ -1223,9 +1223,9 @@
     "note": "LLM transport-routing env vars carried into LLM child envs (backend-selection flags and AWS profile/region names - infrastructure constants, not a learnable name vocabulary); same class as cc_proxy_hosts._PROVIDER_ENV_KEYS"
   },
   "core/config/__init__.py::SAFE_ENV_ALLOWLIST": {
-    "count": 13,
+    "count": 14,
     "kind": "literal",
-    "note": "subprocess env allowlist (infrastructure env-var names, not a learned name vocabulary); grew by the RAPTOR_SANITIZER_CUT* transport family"
+    "note": "subprocess env allowlist (infrastructure env-var names, not a learned name vocabulary); includes the pure-denial RAPTOR_COPILOT_TRANSPORT_DISABLED switch"
   },
   "core/config/__init__.py::TARGET_ENV_STRIP_SET": {
     "count": 16,
@@ -1548,6 +1548,31 @@
     "count": 11,
     "kind": "literal",
     "note": "allowlist of RAPTOR's own run-lifecycle command names that hold LLM quota mid-run (the sibling-observation classifier; includes forward-compat members that cannot occur on the ledger yet \u2014 rationale inline), not a learned name vocabulary; same class as core/run/provenance.py::_DETERMINISTIC_COMMANDS"
+  },
+  "core/llm/copilot_probe.py::_child_env": {
+    "count": 17,
+    "kind": "literal",
+    "note": "fixed child-environment allowlist for the sandboxed probe (private HOME/XDG/COPILOT_HOME/cache roots, auto-update disabled, non-interactive marker, locale); security allowlist \u2014 same class as SAFE_ENV_ALLOWLIST"
+  },
+  "core/llm/copilot_probe.py::_paths": {
+    "count": 14,
+    "kind": "literal",
+    "note": "private probe-state layout schema materialised as absolute private paths; same keys as _relative_dirs, not a name vocabulary"
+  },
+  "core/llm/copilot_probe.py::_relative_dirs": {
+    "count": 16,
+    "kind": "literal",
+    "note": "private probe-state layout schema (root-relative directory components created/verified descriptor-relative); layout keys, not a name vocabulary"
+  },
+  "core/llm/copilot_probe.py::manifest": {
+    "count": 12,
+    "kind": "literal",
+    "note": "record-only evidence manifest field names (capture/process/runtime/parser/quarantine/retention); persistence schema, not a name vocabulary"
+  },
+  "core/llm/copilot_probe.py::state_directories": {
+    "count": 14,
+    "kind": "literal",
+    "note": "ordered subset of the private probe-state layout validated post-capture; an identity mismatch marks the state unscannable \u2014 layout keys, not a name vocabulary"
   },
   "core/llm/copilot_protocol.py::_EVENT_SHAPES": {
     "count": 28,
