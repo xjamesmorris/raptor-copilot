@@ -11,6 +11,8 @@ import pytest
 
 from core.startup.host import (
     Frontend,
+    FrontendLaunchState,
+    FrontendPreparation,
     HostClaimError,
     SessionHostClaim,
     _parse_executable,
@@ -19,9 +21,78 @@ from core.startup.host import (
     _supports_direct_process_claim,
     build_session_host_claim,
     host_process_matches,
+    launcher_lines,
+    parse_frontend,
     parse_metadata_host_claim,
     parse_session_host_claim,
+    prepare_frontend,
 )
+
+
+def _write_executable(path: Path, content: bytes = b"#!/bin/sh\nexit 0\n") -> None:
+    path.write_bytes(content)
+    path.chmod(0o700)
+
+
+def test_frontend_preparation_keeps_presence_launch_and_provider_separate(
+    tmp_path,
+):
+    _write_executable(tmp_path / "claude")
+    _write_executable(tmp_path / "copilot")
+
+    copilot = prepare_frontend("copilot", search_path=str(tmp_path))
+    assert copilot.frontend is Frontend.COPILOT
+    assert copilot.installed is True
+    assert copilot.launch_state is FrontendLaunchState.GATED
+    assert copilot.launchable is False
+    assert copilot.provider_usable is None
+    assert copilot.session_claim is None
+    assert "live host contract" in (copilot.reason or "")
+
+    claude = prepare_frontend("claude", search_path=str(tmp_path))
+    assert claude.frontend is Frontend.CLAUDE
+    assert claude.installed is True
+    assert claude.launch_state is FrontendLaunchState.READY
+    assert claude.launchable is True
+    assert claude.provider_usable is None
+    assert claude.session_claim is None
+    assert launcher_lines(claude) == f"launch_executable={tmp_path / 'claude'}"
+
+
+def test_missing_and_unknown_frontends_are_distinct(tmp_path):
+    missing = prepare_frontend("copilot", search_path=str(tmp_path))
+    assert missing.launch_state is FrontendLaunchState.MISSING
+    assert missing.installed is False
+    with pytest.raises(ValueError, match="unknown frontend"):
+        parse_frontend("browser")
+
+
+def test_launcher_lines_include_native_claim_and_refuse_gated_state(tmp_path):
+    native = tmp_path / "claude"
+    _write_executable(native, b"\x7fELFsynthetic")
+
+    preparation = prepare_frontend("claude", search_path=str(tmp_path))
+    assert preparation.session_claim is not None
+    assert launcher_lines(preparation).splitlines() == [
+        f"launch_executable={native}",
+        "host_v=1",
+        "host=claude",
+        f"host_uid={os.geteuid()}",
+        f"host_exe={native}",
+        f"host_exe_dev={native.stat().st_dev}",
+        f"host_exe_ino={native.stat().st_ino}",
+    ]
+
+    with pytest.raises(ValueError, match="not launchable"):
+        launcher_lines(
+            FrontendPreparation(
+                frontend=Frontend.COPILOT,
+                executable=tmp_path / "copilot",
+                launch_state=FrontendLaunchState.GATED,
+                provider_usable=None,
+                session_claim=None,
+            )
+        )
 
 
 def test_host_claim_parser_rejects_partial_unknown_and_noncanonical_fields():

@@ -1,14 +1,25 @@
-"""Verified host-process identity without frontend launch authority.
+"""Interactive frontend preparation and verified host-process identity.
 
-An installed frontend executable, a verified session owner, and a usable
-headless LLM provider are separate facts.  This module defines only the
-identity claim used by the private session registry.  It does not select,
-prepare, or launch a frontend and does not infer provider usability.
+The interactive frontend, an installed executable, a verified session owner,
+and a usable headless LLM provider are deliberately separate facts:
+
+* :class:`FrontendPreparation` records the operator-selected frontend and
+  whether an executable is installed.
+* ``launch_state`` records whether this launcher is allowed to exec it.
+* ``provider_usable`` is intentionally ``None`` here. Provider detection and
+  admission live in ``core.llm`` and are not inferred from frontend presence.
+* :class:`SessionHostClaim` binds a launcher-selected frontend to the owning
+  process's uid and executable inode. It supplements (never replaces) the
+  session token, starttime, boot-id, and pid-namespace checks.
+
+Copilot launch remains gated until its live host contract is verified. There
+is intentionally no environment-variable or payload escape hatch.
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 import stat
 import sys
 from dataclasses import dataclass
@@ -47,6 +58,14 @@ class Frontend(str, Enum):
     COPILOT = "copilot"
 
 
+class FrontendLaunchState(str, Enum):
+    """Whether the interactive launcher may exec the selected frontend."""
+
+    READY = "ready"
+    MISSING = "missing"
+    GATED = "gated"
+
+
 class HostClaimError(ValueError):
     """A persisted host claim is partial, malformed, or unknown."""
 
@@ -83,6 +102,31 @@ class SessionHostClaim:
 
 
 @dataclass(frozen=True)
+class FrontendPreparation:
+    """Result of resolving one explicitly configured interactive frontend.
+
+    ``provider_usable`` is intentionally tri-state. ``None`` means this
+    preparation did not evaluate a headless provider, preventing an installed
+    CLI from being misreported as an admitted RAPTOR provider.
+    """
+
+    frontend: Frontend
+    executable: Path | None
+    launch_state: FrontendLaunchState
+    provider_usable: bool | None
+    session_claim: SessionHostClaim | None
+    reason: str | None = None
+
+    @property
+    def installed(self) -> bool:
+        return self.executable is not None
+
+    @property
+    def launchable(self) -> bool:
+        return self.launch_state is FrontendLaunchState.READY
+
+
+@dataclass(frozen=True)
 class SessionOwner:
     """Resolved legacy or strongly verified frontend-session owner."""
 
@@ -90,6 +134,17 @@ class SessionOwner:
     frontend: Frontend
     host_verified: bool
     host_claim: SessionHostClaim | None = None
+
+
+def parse_frontend(value: str) -> Frontend:
+    """Parse the explicit frontend selector without aliases or guessing."""
+    try:
+        return Frontend(value)
+    except ValueError as exc:
+        choices = ", ".join(item.value for item in Frontend)
+        raise ValueError(
+            f"unknown frontend {value!r} (expected one of: {choices})"
+        ) from exc
 
 
 def _safe_executable_path(value: str) -> Path:
@@ -148,6 +203,64 @@ def build_session_host_claim(
         executable=path,
         executable_device=st.st_dev,
         executable_inode=st.st_ino,
+    )
+
+
+def prepare_frontend(
+    value: str,
+    *,
+    search_path: str | None = None,
+) -> FrontendPreparation:
+    """Resolve one frontend without inferring provider usability.
+
+    Copilot is intentionally reported as installed-but-gated when present.
+    No environment variable can change that decision.
+    """
+    frontend = parse_frontend(value)
+    found = shutil.which(frontend.value, path=search_path)
+    if found is None:
+        return FrontendPreparation(
+            frontend=frontend,
+            executable=None,
+            launch_state=FrontendLaunchState.MISSING,
+            provider_usable=None,
+            session_claim=None,
+            reason=f"{frontend.value} executable not found on hardened PATH",
+        )
+    try:
+        executable = _safe_executable_path(found)
+    except ValueError as exc:
+        return FrontendPreparation(
+            frontend=frontend,
+            executable=None,
+            launch_state=FrontendLaunchState.MISSING,
+            provider_usable=None,
+            session_claim=None,
+            reason=str(exc),
+        )
+    if frontend is Frontend.COPILOT:
+        return FrontendPreparation(
+            frontend=frontend,
+            executable=executable,
+            launch_state=FrontendLaunchState.GATED,
+            provider_usable=None,
+            session_claim=None,
+            reason=(
+                "Copilot frontend is installed, but its live host contract "
+                "has not been verified"
+            ),
+        )
+    claim = (
+        build_session_host_claim(frontend, executable)
+        if _supports_direct_process_claim(executable)
+        else None
+    )
+    return FrontendPreparation(
+        frontend=frontend,
+        executable=executable,
+        launch_state=FrontendLaunchState.READY,
+        provider_usable=None,
+        session_claim=claim,
     )
 
 
@@ -327,8 +440,67 @@ def host_process_matches(
     )
 
 
+def launcher_lines(preparation: FrontendPreparation) -> str:
+    """Machine output consumed by ``bin/raptor`` for a launchable host."""
+    if not preparation.launchable or preparation.executable is None:
+        raise ValueError("frontend preparation is not launchable")
+    lines = [f"launch_executable={preparation.executable}"]
+    if preparation.session_claim is not None:
+        lines.extend(
+            f"{key}={value}"
+            for key, value in preparation.session_claim.session_fields().items()
+        )
+    return "\n".join(lines)
+
+
+def _main(argv: list[str]) -> int:
+    if len(argv) != 1:
+        print(
+            "usage: python3 -m core.startup.host <claude|copilot>",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        preparation = prepare_frontend(argv[0])
+    except ValueError as exc:
+        print(f"raptor: {exc}", file=sys.stderr)
+        return 2
+    if preparation.launch_state is FrontendLaunchState.MISSING:
+        if preparation.frontend is Frontend.CLAUDE:
+            print("raptor: claude not found. Install Claude Code:", file=sys.stderr)
+            print(
+                "  https://docs.anthropic.com/en/docs/claude-code/overview",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            "raptor: copilot not found. Install GitHub Copilot CLI "
+            "before selecting --frontend copilot.",
+            file=sys.stderr,
+        )
+        return 127
+    if preparation.launch_state is FrontendLaunchState.GATED:
+        print(
+            "raptor: Copilot frontend is installed at "
+            f"{preparation.executable}, but launch is disabled because its "
+            "live host contract is not verified; refusing before target "
+            "trust checks, project activation, session state, plugin loading, "
+            "or frontend execution.",
+            file=sys.stderr,
+        )
+        return 78
+    print(launcher_lines(preparation))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main(sys.argv[1:]))
+
+
 __all__ = [
     "Frontend",
+    "FrontendLaunchState",
+    "FrontendPreparation",
     "HOST_CLAIM_VERSION",
     "HostClaimError",
     "RUN_HOST_KEYS",
@@ -338,8 +510,11 @@ __all__ = [
     "build_session_host_claim",
     "frontend_matches_comm",
     "host_process_matches",
+    "launcher_lines",
+    "parse_frontend",
     "parse_metadata_host_claim",
     "parse_session_host_claim",
+    "prepare_frontend",
     "process_executable_identity",
     "process_uid",
 ]
