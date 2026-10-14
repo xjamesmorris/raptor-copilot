@@ -4,16 +4,35 @@ Every run directory gets a .raptor-run.json file tracking what command
 produced it, when, and whether it succeeded. Tools use start_run/complete_run/fail_run.
 """
 
+from __future__ import annotations
+
+import copy
 import contextlib
+import errno
+import hashlib
 import json
 import logging
 import os
 import re
+import secrets
+import stat
+import threading
+import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Literal, Mapping
 
-from core.json import append_jsonl, load_json, save_json
+from core.json import (
+    JsonBudgetExceededError,
+    append_jsonl,
+    dumps_artifact,
+    load_json,
+    loads_bounded,
+    save_json,
+)
 
 try:
     import fcntl
@@ -70,6 +89,295 @@ class RunOwnershipError(ValueError):
     invocation even for the legitimate flow — the discriminator that
     actually separates owner from trespasser is the command name.
     """
+
+
+RUN_RUNTIME_RECEIPT_KEY = "session_runtime_receipt"
+RUN_RUNTIME_RECEIPT_LINEAGE_KEY = "session_runtime_receipt_lineage"
+MAX_RUN_METADATA_BYTES = RUN_METADATA_MAX_BYTES
+RUN_RECEIPT_LINEAGE_SCHEMA = "raptor.run_runtime_receipt_lineage/v1"
+RUN_RECEIPT_LINEAGE_SCHEMA_VERSION = 1
+MAX_RUN_RECEIPT_LINEAGE_ENTRIES = 32
+MAX_RUN_RECEIPT_LINEAGE_ROW_BYTES = 9_216
+MAX_RUN_RECEIPT_LINEAGE_BYTES = (
+    MAX_RUN_RECEIPT_LINEAGE_ENTRIES * MAX_RUN_RECEIPT_LINEAGE_ROW_BYTES + 256
+)
+
+_RUN_RECEIPT_RESERVED_EXTRA_KEYS = frozenset(
+    {
+        RUN_RUNTIME_RECEIPT_KEY,
+        RUN_RUNTIME_RECEIPT_LINEAGE_KEY,
+        "runtime_receipt_resumes",
+    }
+)
+_RUN_RECEIPT_RESERVED_TOP_LEVEL_KEYS = frozenset(
+    {
+        RUN_RUNTIME_RECEIPT_KEY,
+        RUN_RUNTIME_RECEIPT_LINEAGE_KEY,
+    }
+)
+_RUN_RECEIPT_PROJECT_SOURCES = frozenset(
+    {"session", "argv", "threaded"}
+)
+_RUN_RECEIPT_LINEAGE_RELATIONS = frozenset({"exact", "new_launch_same_stable"})
+_RUN_RECEIPT_LINEAGE_TIMESTAMP_RE = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T"
+    r"[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}\+00:00$",
+    re.ASCII,
+)
+_RUN_RECEIPT_SHA256_RE = re.compile(r"^[0-9a-f]{64}$", re.ASCII)
+_STRICT_METADATA_LOCK_ATTEMPTS = 20
+_STRICT_METADATA_LOCK_INTERVAL_S = 0.01
+
+
+class RunReceiptComparisonResult(str, Enum):
+    """Closed, non-authorizing run-level receipt relations."""
+
+    ABSENT_BOTH = "absent_both"
+    NEW_SNAPSHOT_NON_AUTHORIZING = "new_snapshot_non_authorizing"
+    MATCH_NON_AUTHORIZING = "match_non_authorizing"
+    METADATA_ONLY = "metadata_only"
+    REGISTRY_ONLY = "registry_only"
+    METADATA_INVALID = "metadata_invalid"
+    REGISTRY_INVALID = "registry_invalid"
+    REGISTRY_PENDING = "registry_pending"
+    REGISTRY_REJECTED = "registry_rejected"
+    RECEIPT_MISSING = "receipt_missing"
+    AUTHORITY_INVALID = "authority_invalid"
+    PROFILE_MISMATCH = "profile_mismatch"
+    STABLE_IDENTITY_MISMATCH = "stable_identity_mismatch"
+    LAUNCH_INSTANCE_MISMATCH = "launch_instance_mismatch"
+    RESUME_MATCH_NON_AUTHORIZING = "resume_match_non_authorizing"
+    LINEAGE_INVALID = "lineage_invalid"
+    LINEAGE_OVERFLOW = "lineage_overflow"
+    LAUNCH_REPLAY = "launch_replay"
+    LAUNCH_INSTANCE_INVALID = "launch_instance_invalid"
+    REGISTRY_CHANGED = "registry_changed"
+    METADATA_CHANGED = "metadata_changed"
+
+
+@dataclass(frozen=True, slots=True)
+class RunReceiptComparison:
+    """A receipt relation that deliberately cannot be used as a boolean."""
+
+    result: RunReceiptComparisonResult
+    exact_snapshot_result: object | None
+    authoritative: Literal[False] = field(default=False, init=False)
+
+    def __post_init__(self) -> None:
+        from core.startup.runtime_receipt.plumbing_types import (
+            ReceiptComparisonResult,
+        )
+
+        if type(self.result) is not RunReceiptComparisonResult:
+            raise TypeError("result must be RunReceiptComparisonResult")
+        if (
+            self.exact_snapshot_result is not None
+            and type(self.exact_snapshot_result) is not ReceiptComparisonResult
+        ):
+            raise TypeError("exact snapshot result must be ReceiptComparisonResult")
+
+    def __bool__(self) -> bool:
+        raise TypeError("run receipt comparison is not an authority boolean")
+
+    def __init_subclass__(cls) -> None:
+        raise TypeError("RunReceiptComparison cannot be subclassed")
+
+
+class RunReceiptReason(str, Enum):
+    """Closed refusal reasons for run receipt operations."""
+
+    RESERVED_KEY_OVERRIDE = "reserved_key_override"
+    LEGACY_UPGRADE_FORBIDDEN = "legacy_upgrade_forbidden"
+    RECEIPT_DOWNGRADE_FORBIDDEN = "receipt_downgrade_forbidden"
+    METADATA_MISSING = "metadata_missing"
+    METADATA_INVALID = "metadata_invalid"
+    METADATA_OVERSIZED = "metadata_oversized"
+    METADATA_CHANGED = "metadata_changed"
+    REGISTRY_ABSENT = "registry_absent"
+    REGISTRY_PENDING = "registry_pending"
+    REGISTRY_REJECTED = "registry_rejected"
+    REGISTRY_INVALID = "registry_invalid"
+    REGISTRY_CHANGED = "registry_changed"
+    RECEIPT_MISSING = "receipt_missing"
+    AUTHORITY_INVALID = "authority_invalid"
+    PROFILE_MISMATCH = "profile_mismatch"
+    STABLE_IDENTITY_MISMATCH = "stable_identity_mismatch"
+    LAUNCH_INSTANCE_MISMATCH = "launch_instance_mismatch"
+    CROSS_LAUNCH_RESUME_UNSUPPORTED = "cross_launch_resume_unsupported"
+    LINEAGE_INVALID = "lineage_invalid"
+    LINEAGE_OVERFLOW = "lineage_overflow"
+    LAUNCH_REPLAY = "launch_replay"
+    LAUNCH_INSTANCE_INVALID = "launch_instance_invalid"
+    REENTRANT_STATUS_MISMATCH = "reentrant_status_mismatch"
+    REENTRANT_COMMAND_MISMATCH = "reentrant_command_mismatch"
+    PROJECT_FORBIDDEN = "project_forbidden"
+    PROJECT_PIN_MISMATCH = "project_pin_mismatch"
+    TERMINAL_TRANSITION_FORBIDDEN = "terminal_transition_forbidden"
+    PIN_REWRITE_FORBIDDEN = "pin_rewrite_forbidden"
+    STRICT_LOCK_UNAVAILABLE = "strict_lock_unavailable"
+    LOCK_BUSY = "lock_busy"
+
+
+_RUN_RECEIPT_ERROR_DETAIL_KEYS = frozenset(
+    {
+        "operation",
+        "reason",
+        "comparison",
+        "subordinate",
+        "status",
+        "segment",
+        "profile_id",
+    }
+)
+
+
+class RunRuntimeReceiptError(ValueError):
+    """Bounded, redacted refusal for a run receipt operation."""
+
+    def __init__(
+        self,
+        reason: RunReceiptReason,
+        *,
+        operation: str,
+        comparison: RunReceiptComparison | None = None,
+        subordinate: str | None = None,
+        status: str | None = None,
+        segment: int | None = None,
+        profile_id: str | None = None,
+    ) -> None:
+        if type(reason) is not RunReceiptReason:
+            raise TypeError("reason must be RunReceiptReason")
+        fields: dict[str, str] = {
+            "operation": operation,
+            "reason": reason.value,
+        }
+        if comparison is not None:
+            if type(comparison) is not RunReceiptComparison:
+                raise TypeError("comparison must be RunReceiptComparison")
+            fields["comparison"] = comparison.result.value
+        if subordinate is not None:
+            fields["subordinate"] = subordinate
+        if status is not None:
+            fields["status"] = status
+        if segment is not None:
+            fields["segment"] = str(segment)
+        if profile_id is not None:
+            fields["profile_id"] = profile_id
+        bounded: dict[str, str] = {}
+        for key, value in fields.items():
+            if key not in _RUN_RECEIPT_ERROR_DETAIL_KEYS:
+                raise ValueError("run receipt diagnostic key is not allowed")
+            if (
+                not value
+                or not value.isascii()
+                or not value.isprintable()
+                or len(value.encode("ascii")) > 128
+            ):
+                value = "<redacted>"
+            bounded[key] = value
+        if len(bounded) > 16:
+            raise ValueError("run receipt diagnostic has too many fields")
+        self.reason = reason
+        self.operation = operation
+        self.comparison = comparison
+        self.details = MappingProxyType(bounded)
+        detail = ", ".join(f"{key}={value}" for key, value in bounded.items())
+        super().__init__(f"run receipt operation refused ({detail})")
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class RunReceiptAuditSnapshot:
+    """Canonical historical snapshot used only for audit and vetoes."""
+
+    reference: Any
+    receipt: Any
+    canonical: bytes = field(repr=False)
+    authoritative: Literal[False] = field(default=False, init=False)
+
+    def __post_init__(self) -> None:
+        from core.startup.runtime_receipt.plumbing_types import (
+            PlumbingFailure,
+            ReceiptReference,
+            reference_from_receipt,
+        )
+        from core.startup.runtime_receipt.schema import RuntimeReceipt
+
+        if type(self.canonical) is not bytes or not self.canonical:
+            raise ValueError("audit snapshot canonical bytes are invalid")
+        if type(self.reference) is not ReceiptReference:
+            raise TypeError("reference must be ReceiptReference")
+        if type(self.receipt) is not RuntimeReceipt:
+            raise TypeError("receipt must be RuntimeReceipt")
+        actual = reference_from_receipt(self.receipt)
+        if isinstance(actual, PlumbingFailure) or actual != self.reference:
+            raise ValueError("audit snapshot reference and receipt disagree")
+
+    def __repr__(self) -> str:
+        return "RunReceiptAuditSnapshot(<redacted>)"
+
+    def __bool__(self) -> bool:
+        raise TypeError("run receipt audit snapshot is not an authority boolean")
+
+    def __init_subclass__(cls) -> None:
+        raise TypeError("RunReceiptAuditSnapshot cannot be subclassed")
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _RunReceiptLineageEntry:
+    segment: int
+    resumed_at_utc: str
+    resumed_at: datetime = field(repr=False)
+    relation: str
+    prior_snapshot_sha256: str
+    current_snapshot_sha256: str
+    prior_reference: Any = field(repr=False)
+    current_reference: Any = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _RunReceiptLineage:
+    entries: tuple[_RunReceiptLineageEntry, ...] = field(repr=False)
+    canonical: bytes = field(repr=False)
+    authoritative: Literal[False] = field(default=False, init=False)
+
+    def __bool__(self) -> bool:
+        raise TypeError("run receipt lineage is not an authority boolean")
+
+    def __repr__(self) -> str:
+        return "_RunReceiptLineage(<redacted>)"
+
+    def __init_subclass__(cls) -> None:
+        raise TypeError("_RunReceiptLineage cannot be subclassed")
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _ParsedReceiptMetadata:
+    snapshot: RunReceiptAuditSnapshot | None = field(repr=False)
+    lineage: _RunReceiptLineage | None = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _StrictRunMetadata:
+    raw: bytes = field(repr=False)
+    value: dict[str, Any] = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _ReceiptCommitPlan:
+    operation: str
+    output_dir: Path
+    capture: Any = field(repr=False)
+    expected_raw: bytes | None = field(repr=False)
+    desired_raw: bytes = field(repr=False)
+    desired_metadata: dict[str, Any] = field(repr=False)
+    temporary_path: Path = field(repr=False)
+    segment: int | None = None
+
+
+def _metadata_allows_legacy_attribution(meta: Mapping[str, object]) -> bool:
+    """Deny-only guard for legacy owner/liveness/consumer paths."""
+
+    return not any(key in meta for key in _RUN_RECEIPT_RESERVED_TOP_LEVEL_KEYS)
 
 
 # Status enum
@@ -249,7 +557,7 @@ def _read_ppid_ps(pid: int) -> int:
 
 
 def _get_session_pid() -> int | None:
-    """Get the PID of the Claude Code session process.
+    """Get the PID of the owning RAPTOR frontend session.
 
     Delegates to the ONE shared session resolver
     (``core.project.sessions.resolve_session_pid``: validated
@@ -261,9 +569,9 @@ def _get_session_pid() -> int | None:
     subagent pid that the sweeps then judged dead the moment the
     subagent exited.
 
-    The CLAUDECODE env + getppid() fallback survives ONLY here — for
-    run-metadata recording in claude-less contexts (bare-shell libexec
-    flows). It is never used for project-binding resolution.
+    The legacy ``CLAUDECODE`` + getppid() fallback survives ONLY here
+    for run-metadata recording in bare-shell libexec flows. It is never
+    used for project-binding resolution or Copilot host authority.
     """
     from core.project.sessions import resolve_session_pid
     pid = resolve_session_pid()
@@ -283,14 +591,14 @@ def _get_session_pid() -> int | None:
     return ppid
 
 
-def _session_stamp(pid: int) -> dict[str, str]:
+def _session_stamp(pid: int) -> dict[str, Any]:
     """Identity stamp for *pid*, recorded beside ``session_pid`` in run
     metadata so the liveness verifiers can tell "this exact process"
     from "some process that recycled the PID" — including another real
-    claude session, which every comm check accepts by construction.
+    frontend session, which a process-name check accepts by construction.
     Keys absent when unreadable (legacy semantics apply on read)."""
     from core.project import sessions as _sessions
-    stamp: dict[str, str] = {}
+    stamp: dict[str, Any] = {}
     start = _sessions.proc_starttime(pid)
     if start is not None:
         stamp["session_start"] = start
@@ -307,6 +615,9 @@ def _session_stamp(pid: int) -> dict[str, str]:
         # of THIS machine" (provably dead) from "another machine
         # sharing the filesystem" (unverifiable — fail open).
         stamp["session_machine_id"] = machine
+    claim = _sessions.session_host_claim(pid)
+    if claim is not None:
+        stamp.update(claim.metadata_fields())
     return stamp
 
 
@@ -385,6 +696,1252 @@ def _harness_session_id() -> str | None:
     return None
 
 
+
+def _receipt_error(
+    reason: RunReceiptReason,
+    *,
+    operation: str,
+    comparison: RunReceiptComparison | None = None,
+    subordinate: str | None = None,
+    status: str | None = None,
+    segment: int | None = None,
+    profile_id: str | None = None,
+) -> RunRuntimeReceiptError:
+    return RunRuntimeReceiptError(
+        reason,
+        operation=operation,
+        comparison=comparison,
+        subordinate=subordinate,
+        status=status,
+        segment=segment,
+        profile_id=profile_id,
+    )
+
+
+def _reserved_mapping_key(mapping: object) -> str | None:
+    if not isinstance(mapping, Mapping):
+        return None
+    return next(
+        (key for key in _RUN_RECEIPT_RESERVED_EXTRA_KEYS if key in mapping),
+        None,
+    )
+
+
+def _reject_reserved_mapping(
+    mapping: object,
+    *,
+    operation: str,
+) -> None:
+    if _reserved_mapping_key(mapping) is not None:
+        raise _receipt_error(
+            RunReceiptReason.RESERVED_KEY_OVERRIDE,
+            operation=operation,
+        )
+
+
+def _metadata_contains_reserved_input(meta: Mapping[str, object]) -> bool:
+    return (
+        not _metadata_allows_legacy_attribution(meta)
+        or _reserved_mapping_key(meta.get("extra")) is not None
+    )
+
+
+def _metadata_file_fingerprint(
+    value: os.stat_result,
+) -> tuple[int, int, int, int, int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_uid,
+        value.st_gid,
+        value.st_size,
+        value.st_nlink,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _strict_read_run_metadata_bytes(
+    path: Path,
+    *,
+    operation: str,
+    missing_ok: bool,
+) -> bytes | None:
+    flags = os.O_RDONLY
+    for name in ("O_NONBLOCK", "O_NOFOLLOW", "O_CLOEXEC"):
+        value = getattr(os, name, None)
+        if type(value) is not int:
+            raise _receipt_error(
+                RunReceiptReason.STRICT_LOCK_UNAVAILABLE,
+                operation=operation,
+                subordinate=name.lower(),
+            )
+        flags |= value
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        raise _receipt_error(
+            RunReceiptReason.METADATA_MISSING,
+            operation=operation,
+        ) from None
+    except OSError as exc:
+        raise _receipt_error(
+            RunReceiptReason.METADATA_INVALID,
+            operation=operation,
+            subordinate=(
+                "loop"
+                if exc.errno == errno.ELOOP
+                else "permission_denied"
+                if exc.errno in {errno.EACCES, errno.EPERM}
+                else "open_failed"
+            ),
+        ) from None
+    try:
+        try:
+            first = os.fstat(fd)
+        except OSError:
+            raise _receipt_error(
+                RunReceiptReason.METADATA_INVALID,
+                operation=operation,
+                subordinate="fstat_failed",
+            ) from None
+        if (
+            not stat.S_ISREG(first.st_mode)
+            or first.st_uid != os.geteuid()
+            or first.st_nlink != 1
+            or stat.S_IMODE(first.st_mode) & 0o022
+        ):
+            raise _receipt_error(
+                RunReceiptReason.METADATA_INVALID,
+                operation=operation,
+                subordinate="file_policy",
+            )
+        if first.st_size > MAX_RUN_METADATA_BYTES:
+            raise _receipt_error(
+                RunReceiptReason.METADATA_OVERSIZED,
+                operation=operation,
+            )
+        chunks: list[bytes] = []
+        remaining = MAX_RUN_METADATA_BYTES + 1
+        while remaining:
+            try:
+                chunk = os.read(fd, min(65_536, remaining))
+            except OSError:
+                raise _receipt_error(
+                    RunReceiptReason.METADATA_INVALID,
+                    operation=operation,
+                    subordinate="read_failed",
+                ) from None
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > MAX_RUN_METADATA_BYTES:
+            raise _receipt_error(
+                RunReceiptReason.METADATA_OVERSIZED,
+                operation=operation,
+            )
+        try:
+            second = os.fstat(fd)
+            current = os.stat(path, follow_symlinks=False)
+        except OSError:
+            raise _receipt_error(
+                RunReceiptReason.METADATA_CHANGED,
+                operation=operation,
+            ) from None
+        if (
+            len(raw) != first.st_size
+            or _metadata_file_fingerprint(first)
+            != _metadata_file_fingerprint(second)
+            or _metadata_file_fingerprint(second)
+            != _metadata_file_fingerprint(current)
+        ):
+            raise _receipt_error(
+                RunReceiptReason.METADATA_CHANGED,
+                operation=operation,
+            )
+        return raw
+    finally:
+        os.close(fd)
+
+
+def _strict_load_run_metadata(
+    path: Path,
+    *,
+    operation: str,
+    missing_ok: bool,
+) -> _StrictRunMetadata | None:
+    raw = _strict_read_run_metadata_bytes(
+        path,
+        operation=operation,
+        missing_ok=missing_ok,
+    )
+    if raw is None:
+        return None
+    try:
+        value = loads_bounded(
+            raw,
+            max_bytes=MAX_RUN_METADATA_BYTES,
+            reject_duplicate_keys=True,
+        )
+    except JsonBudgetExceededError:
+        raise _receipt_error(
+            RunReceiptReason.METADATA_OVERSIZED,
+            operation=operation,
+        ) from None
+    except (UnicodeError, ValueError, RecursionError):
+        raise _receipt_error(
+            RunReceiptReason.METADATA_INVALID,
+            operation=operation,
+        ) from None
+    if not isinstance(value, dict):
+        raise _receipt_error(
+            RunReceiptReason.METADATA_INVALID,
+            operation=operation,
+        )
+    return _StrictRunMetadata(raw=raw, value=value)
+
+
+def _parse_run_receipt_snapshot(
+    value: object,
+    *,
+    operation: str,
+) -> RunReceiptAuditSnapshot:
+    from core.startup.runtime_receipt.canonical import canonical_bytes
+    from core.startup.runtime_receipt.plumbing_types import (
+        MAX_SNAPSHOT_BYTES,
+        PlumbingFailure,
+        ReceiptReference,
+        ReceiptState,
+        reference_from_receipt,
+    )
+    from core.startup.runtime_receipt.reasons import ReceiptRejection
+    from core.startup.runtime_receipt.schema import RuntimeReceipt
+    from core.startup.runtime_receipt.verify import parse_receipt
+
+    envelope_keys = frozenset({"schema", "schema_version", "receipt"})
+    identity_keys = frozenset(
+        {
+            "state",
+            "profile_id",
+            "stable_identity_sha256",
+            "launch_instance_sha256",
+            "process_corroboration_sha256",
+        }
+    )
+    binding_keys = frozenset(
+        {
+            "launch_binding_sha256",
+            "receipt_sha256",
+            "launch_nonce",
+            "session_pid",
+            "session_starttime_ticks",
+        }
+    )
+    snapshot_keys = envelope_keys | identity_keys | binding_keys
+    try:
+        if not isinstance(value, dict) or set(value) != snapshot_keys:
+            raise ValueError("snapshot keys are not exact")
+        canonical = canonical_bytes(value)
+        if len(canonical) > MAX_SNAPSHOT_BYTES:
+            raise OverflowError("snapshot exceeds its byte bound")
+        if (
+            value["schema"] != "raptor.run_runtime_receipt_snapshot/v1"
+            or value["schema_version"] != 1
+            or value["state"] != "verified"
+        ):
+            raise ValueError("snapshot schema or state is invalid")
+        receipt_raw = canonical_bytes(value["receipt"])
+        receipt = parse_receipt(receipt_raw)
+        if isinstance(receipt, ReceiptRejection) or type(receipt) is not RuntimeReceipt:
+            raise ValueError("snapshot receipt is invalid")
+        reference = reference_from_receipt(receipt)
+        if (
+            isinstance(reference, PlumbingFailure)
+            or type(reference) is not ReceiptReference
+            or reference.state is not ReceiptState.VERIFIED
+        ):
+            raise ValueError("snapshot reference is invalid")
+        duplicates = {
+            "profile_id": reference.profile_id.value,
+            "stable_identity_sha256": reference.stable_identity_sha256.value,
+            "launch_instance_sha256": reference.launch_instance_sha256.value,
+            "process_corroboration_sha256": (
+                reference.process_corroboration_sha256.value
+            ),
+            "launch_binding_sha256": reference.launch_binding_sha256.value,
+            "receipt_sha256": reference.receipt_sha256.value,
+            "launch_nonce": reference.launch_nonce.value,
+            "session_pid": reference.session_pid.text,
+            "session_starttime_ticks": reference.session_starttime_ticks.text,
+        }
+        if any(value[key] != expected for key, expected in duplicates.items()):
+            raise ValueError("snapshot duplicate field mismatch")
+    except OverflowError:
+        raise _receipt_error(
+            RunReceiptReason.METADATA_OVERSIZED,
+            operation=operation,
+        ) from None
+    except (TypeError, UnicodeError, ValueError, RecursionError):
+        raise _receipt_error(
+            RunReceiptReason.METADATA_INVALID,
+            operation=operation,
+        ) from None
+    return RunReceiptAuditSnapshot(
+        reference=reference,
+        receipt=receipt,
+        canonical=canonical,
+    )
+
+
+def _lineage_error(
+    *,
+    operation: str,
+    subordinate: str | None = None,
+) -> RunRuntimeReceiptError:
+    return _receipt_error(
+        RunReceiptReason.LINEAGE_INVALID,
+        operation=operation,
+        comparison=RunReceiptComparison(
+            RunReceiptComparisonResult.LINEAGE_INVALID,
+            None,
+        ),
+        subordinate=subordinate,
+    )
+
+
+def _lineage_overflow_error(
+    *,
+    operation: str,
+    segment: int,
+) -> RunRuntimeReceiptError:
+    return _receipt_error(
+        RunReceiptReason.LINEAGE_OVERFLOW,
+        operation=operation,
+        comparison=RunReceiptComparison(
+            RunReceiptComparisonResult.LINEAGE_OVERFLOW,
+            None,
+        ),
+        segment=segment,
+    )
+
+
+def _parse_lineage_timestamp(
+    value: object,
+    *,
+    operation: str,
+) -> datetime:
+    if (
+        type(value) is not str
+        or _RUN_RECEIPT_LINEAGE_TIMESTAMP_RE.fullmatch(value) is None
+    ):
+        raise _lineage_error(
+            operation=operation,
+            subordinate="timestamp",
+        )
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise _lineage_error(
+            operation=operation,
+            subordinate="timestamp",
+        ) from None
+    if (
+        parsed.tzinfo is None
+        or parsed.utcoffset() != timezone.utc.utcoffset(parsed)
+        or parsed.astimezone(timezone.utc).isoformat(timespec="microseconds") != value
+    ):
+        raise _lineage_error(
+            operation=operation,
+            subordinate="timestamp",
+        )
+    return parsed
+
+
+def _parse_lineage_reference(
+    value: object,
+    *,
+    operation: str,
+):
+    from core.startup.runtime_receipt.canonical import canonical_bytes
+    from core.startup.runtime_receipt.plumbing_types import (
+        PlumbingFailure,
+        ReceiptReference,
+        ReceiptState,
+        parse_reference,
+        serialize_reference,
+    )
+
+    try:
+        raw = canonical_bytes(value)  # type: ignore[arg-type]
+        reference = parse_reference(raw)
+        if (
+            isinstance(reference, PlumbingFailure)
+            or type(reference) is not ReceiptReference
+            or reference.state is not ReceiptState.VERIFIED
+            or not secrets.compare_digest(serialize_reference(reference), raw)
+        ):
+            raise ValueError("lineage reference is invalid")
+    except (TypeError, UnicodeError, ValueError, RecursionError):
+        raise _lineage_error(
+            operation=operation,
+            subordinate="reference",
+        ) from None
+    return reference
+
+
+def _references_share_lineage_identity(left: Any, right: Any) -> bool:
+    from core.startup.runtime_receipt.plumbing_types import ReceiptState
+
+    return (
+        left.state is ReceiptState.VERIFIED
+        and right.state is ReceiptState.VERIFIED
+        and left.profile_id == right.profile_id
+        and left.stable_identity_sha256 == right.stable_identity_sha256
+        and left.launcher_euid == right.launcher_euid
+    )
+
+
+def _reference_generation_is_distinct(prior: Any, current: Any) -> bool:
+    return (
+        prior.session_id != current.session_id
+        and prior.launch_id != current.launch_id
+        and prior.session_pid != current.session_pid
+        and prior.session_starttime_ticks != current.session_starttime_ticks
+        and (
+            prior.session_token_commitment_sha256
+            != current.session_token_commitment_sha256
+        )
+        and prior.launch_nonce != current.launch_nonce
+        and prior.launch_instance_sha256 != current.launch_instance_sha256
+        and prior.launch_binding_sha256 != current.launch_binding_sha256
+        and (prior.process_corroboration_sha256 != current.process_corroboration_sha256)
+        and prior.receipt_sha256 != current.receipt_sha256
+    )
+
+
+def _reference_replays_any(candidate: Any, historical: tuple[Any, ...]) -> bool:
+    for reference in historical:
+        if (
+            candidate.session_id == reference.session_id
+            or candidate.launch_id == reference.launch_id
+            or (
+                candidate.session_token_commitment_sha256
+                == reference.session_token_commitment_sha256
+            )
+            or candidate.launch_nonce == reference.launch_nonce
+            or candidate.receipt_sha256 == reference.receipt_sha256
+        ):
+            return True
+    return False
+
+
+def _append_unique_reference(references: list[Any], reference: Any) -> None:
+    if all(reference != existing for existing in references):
+        references.append(reference)
+
+
+def _lineage_replay_references(
+    lineage: _RunReceiptLineage | None,
+) -> tuple[Any, ...]:
+    references: list[Any] = []
+    if lineage is not None:
+        for entry in lineage.entries:
+            _append_unique_reference(references, entry.prior_reference)
+            _append_unique_reference(references, entry.current_reference)
+    return tuple(references)
+
+
+def _snapshot_digest(snapshot: RunReceiptAuditSnapshot) -> str:
+    return hashlib.sha256(snapshot.canonical).hexdigest()
+
+
+def _parse_run_receipt_lineage(
+    value: object,
+    *,
+    head: RunReceiptAuditSnapshot,
+    operation: str,
+) -> _RunReceiptLineage:
+    from core.startup.runtime_receipt.canonical import canonical_bytes
+
+    envelope_keys = frozenset({"schema", "schema_version", "entries"})
+    row_keys = frozenset(
+        {
+            "segment",
+            "resumed_at_utc",
+            "relation",
+            "prior_snapshot_sha256",
+            "current_snapshot_sha256",
+            "prior_reference",
+            "current_reference",
+        }
+    )
+    try:
+        if not isinstance(value, dict) or set(value) != envelope_keys:
+            raise ValueError("lineage envelope keys are not exact")
+        canonical = canonical_bytes(value)
+    except (TypeError, UnicodeError, ValueError, RecursionError):
+        raise _lineage_error(operation=operation) from None
+    if len(canonical) > MAX_RUN_RECEIPT_LINEAGE_BYTES:
+        raise _receipt_error(
+            RunReceiptReason.METADATA_OVERSIZED,
+            operation=operation,
+        )
+    if (
+        type(value["schema"]) is not str
+        or value["schema"] != RUN_RECEIPT_LINEAGE_SCHEMA
+        or type(value["schema_version"]) is not int
+        or value["schema_version"] != RUN_RECEIPT_LINEAGE_SCHEMA_VERSION
+    ):
+        raise _lineage_error(operation=operation)
+    raw_entries = value["entries"]
+    if (
+        not isinstance(raw_entries, list)
+        or not raw_entries
+        or len(raw_entries) > MAX_RUN_RECEIPT_LINEAGE_ENTRIES
+    ):
+        raise _lineage_error(operation=operation)
+
+    parsed_entries: list[_RunReceiptLineageEntry] = []
+    seen_references: list[Any] = []
+    previous_reference: Any | None = None
+    previous_snapshot_sha256: str | None = None
+    previous_timestamp: datetime | None = None
+    for index, raw_entry in enumerate(raw_entries):
+        try:
+            if not isinstance(raw_entry, dict) or set(raw_entry) != row_keys:
+                raise ValueError("lineage row keys are not exact")
+            row_canonical = canonical_bytes(raw_entry)
+        except (TypeError, UnicodeError, ValueError, RecursionError):
+            raise _lineage_error(operation=operation) from None
+        if len(row_canonical) > MAX_RUN_RECEIPT_LINEAGE_ROW_BYTES:
+            raise _receipt_error(
+                RunReceiptReason.METADATA_OVERSIZED,
+                operation=operation,
+            )
+
+        segment = raw_entry["segment"]
+        relation = raw_entry["relation"]
+        prior_digest = raw_entry["prior_snapshot_sha256"]
+        current_digest = raw_entry["current_snapshot_sha256"]
+        if type(segment) is not int or segment != index + 2:
+            raise _lineage_error(
+                operation=operation,
+                subordinate="segment",
+            )
+        if type(relation) is not str or relation not in _RUN_RECEIPT_LINEAGE_RELATIONS:
+            raise _lineage_error(
+                operation=operation,
+                subordinate="relation",
+            )
+        if (
+            type(prior_digest) is not str
+            or _RUN_RECEIPT_SHA256_RE.fullmatch(prior_digest) is None
+            or type(current_digest) is not str
+            or _RUN_RECEIPT_SHA256_RE.fullmatch(current_digest) is None
+        ):
+            raise _lineage_error(
+                operation=operation,
+                subordinate="digest",
+            )
+        timestamp = _parse_lineage_timestamp(
+            raw_entry["resumed_at_utc"],
+            operation=operation,
+        )
+        if previous_timestamp is not None and timestamp <= previous_timestamp:
+            raise _lineage_error(
+                operation=operation,
+                subordinate="timestamp",
+            )
+        prior_reference = _parse_lineage_reference(
+            raw_entry["prior_reference"],
+            operation=operation,
+        )
+        current_reference = _parse_lineage_reference(
+            raw_entry["current_reference"],
+            operation=operation,
+        )
+        if not _references_share_lineage_identity(
+            head.reference,
+            prior_reference,
+        ) or not _references_share_lineage_identity(
+            head.reference,
+            current_reference,
+        ):
+            raise _lineage_error(
+                operation=operation,
+                subordinate="identity",
+            )
+        if previous_reference is not None and (
+            prior_reference != previous_reference
+            or not secrets.compare_digest(
+                prior_digest,
+                previous_snapshot_sha256 or "",
+            )
+        ):
+            raise _lineage_error(
+                operation=operation,
+                subordinate="chain",
+            )
+
+        replay_history = list(seen_references)
+        _append_unique_reference(replay_history, prior_reference)
+        if relation == "exact":
+            if prior_reference != current_reference or not secrets.compare_digest(
+                prior_digest, current_digest
+            ):
+                raise _lineage_error(
+                    operation=operation,
+                    subordinate="relation",
+                )
+        elif (
+            _reference_replays_any(
+                current_reference,
+                tuple(replay_history),
+            )
+            or not _references_share_lineage_identity(
+                prior_reference,
+                current_reference,
+            )
+            or not _reference_generation_is_distinct(
+                prior_reference,
+                current_reference,
+            )
+            or secrets.compare_digest(prior_digest, current_digest)
+        ):
+            raise _lineage_error(
+                operation=operation,
+                subordinate="relation",
+            )
+
+        parsed_entries.append(
+            _RunReceiptLineageEntry(
+                segment=segment,
+                resumed_at_utc=raw_entry["resumed_at_utc"],
+                resumed_at=timestamp,
+                relation=relation,
+                prior_snapshot_sha256=prior_digest,
+                current_snapshot_sha256=current_digest,
+                prior_reference=prior_reference,
+                current_reference=current_reference,
+            )
+        )
+        _append_unique_reference(seen_references, prior_reference)
+        _append_unique_reference(seen_references, current_reference)
+        previous_reference = current_reference
+        previous_snapshot_sha256 = current_digest
+        previous_timestamp = timestamp
+
+    final_entry = parsed_entries[-1]
+    if final_entry.current_reference != head.reference or not secrets.compare_digest(
+        final_entry.current_snapshot_sha256,
+        _snapshot_digest(head),
+    ):
+        raise _lineage_error(
+            operation=operation,
+            subordinate="head",
+        )
+    return _RunReceiptLineage(
+        entries=tuple(parsed_entries),
+        canonical=canonical,
+    )
+
+
+def _receipt_resume_rows(
+    metadata: Mapping[str, object],
+    *,
+    operation: str,
+) -> list[object]:
+    extra = metadata.get("extra")
+    if extra is None:
+        return []
+    if not isinstance(extra, dict):
+        raise _receipt_error(
+            RunReceiptReason.METADATA_INVALID,
+            operation=operation,
+        )
+    resumes = extra.get("resumes")
+    if resumes is None:
+        return []
+    if not isinstance(resumes, list):
+        raise _receipt_error(
+            RunReceiptReason.METADATA_INVALID,
+            operation=operation,
+        )
+    return resumes
+
+
+def _parse_receipt_metadata(
+    strict: _StrictRunMetadata,
+    *,
+    operation: str,
+) -> _ParsedReceiptMetadata:
+    meta = strict.value
+    _reject_reserved_mapping(meta.get("extra"), operation=operation)
+    has_snapshot = RUN_RUNTIME_RECEIPT_KEY in meta
+    has_lineage = RUN_RUNTIME_RECEIPT_LINEAGE_KEY in meta
+    if has_lineage and not has_snapshot:
+        raise _lineage_error(operation=operation)
+    if not has_snapshot:
+        return _ParsedReceiptMetadata(snapshot=None, lineage=None)
+    snapshot = _parse_run_receipt_snapshot(
+        meta[RUN_RUNTIME_RECEIPT_KEY],
+        operation=operation,
+    )
+    resumes = _receipt_resume_rows(meta, operation=operation)
+    if not has_lineage:
+        if resumes:
+            raise _lineage_error(
+                operation=operation,
+                subordinate="legacy_resume_history",
+            )
+        return _ParsedReceiptMetadata(snapshot=snapshot, lineage=None)
+    lineage = _parse_run_receipt_lineage(
+        meta[RUN_RUNTIME_RECEIPT_LINEAGE_KEY],
+        head=snapshot,
+        operation=operation,
+    )
+    return _ParsedReceiptMetadata(snapshot=snapshot, lineage=lineage)
+
+
+def compare_run_runtime_receipt(
+    metadata_snapshot: RunReceiptAuditSnapshot | None,
+    current_capture: object | None,
+    *,
+    operation: str,
+    lineage: _RunReceiptLineage | None,
+) -> RunReceiptComparison:
+    """Compare explicit receipt state; every positive is non-authorizing."""
+    from core.project.sessions import SessionRuntimeReceiptCapture
+    from core.startup.runtime_receipt.plumbing_types import (
+        ReceiptComparatorInput,
+        ReceiptComparisonResult,
+        RuntimeReceiptSnapshot,
+        authority_invariant_failure,
+        compare_receipt_snapshot,
+        serialize_snapshot,
+    )
+
+    if operation not in {"start", "resume"}:
+        raise ValueError("operation must be start or resume")
+    if lineage is not None and (
+        type(lineage) is not _RunReceiptLineage or lineage.authoritative is not False
+    ):
+        return RunReceiptComparison(
+            RunReceiptComparisonResult.LINEAGE_INVALID,
+            None,
+        )
+    if metadata_snapshot is None and lineage is not None:
+        return RunReceiptComparison(
+            RunReceiptComparisonResult.LINEAGE_INVALID,
+            None,
+        )
+    if metadata_snapshot is None and current_capture is None:
+        return RunReceiptComparison(
+            RunReceiptComparisonResult.ABSENT_BOTH,
+            None,
+        )
+    if metadata_snapshot is None:
+        result = (
+            RunReceiptComparisonResult.NEW_SNAPSHOT_NON_AUTHORIZING
+            if operation == "start"
+            else RunReceiptComparisonResult.REGISTRY_ONLY
+        )
+        return RunReceiptComparison(result, None)
+    if type(metadata_snapshot) is not RunReceiptAuditSnapshot:
+        return RunReceiptComparison(
+            RunReceiptComparisonResult.METADATA_INVALID,
+            None,
+        )
+    try:
+        metadata_snapshot.__post_init__()
+        if type(current_capture) is SessionRuntimeReceiptCapture:
+            current_capture.__post_init__()
+    except (TypeError, ValueError):
+        return RunReceiptComparison(
+            RunReceiptComparisonResult.AUTHORITY_INVALID,
+            None,
+        )
+    if (
+        metadata_snapshot.authoritative is not False
+        or type(current_capture) is not SessionRuntimeReceiptCapture
+        or current_capture.authoritative is not False
+        or authority_invariant_failure(
+            current_capture.snapshot,
+            RuntimeReceiptSnapshot,
+        )
+        is not None
+    ):
+        return RunReceiptComparison(
+            RunReceiptComparisonResult.AUTHORITY_INVALID,
+            None,
+        )
+    exact = compare_receipt_snapshot(
+        ReceiptComparatorInput(
+            current_capture.snapshot,
+            current_capture.reference,
+            current_capture.snapshot.receipt,
+        )
+    )
+    if exact is not ReceiptComparisonResult.MATCH_NON_AUTHORIZING:
+        if exact is ReceiptComparisonResult.AUTHORITY_INVALID:
+            result = RunReceiptComparisonResult.AUTHORITY_INVALID
+        elif exact is ReceiptComparisonResult.PROFILE_MISMATCH:
+            result = RunReceiptComparisonResult.PROFILE_MISMATCH
+        elif exact is ReceiptComparisonResult.STABLE_IDENTITY_MISMATCH:
+            result = RunReceiptComparisonResult.STABLE_IDENTITY_MISMATCH
+        elif operation == "resume":
+            result = RunReceiptComparisonResult.LAUNCH_INSTANCE_INVALID
+        else:
+            result = RunReceiptComparisonResult.LAUNCH_INSTANCE_MISMATCH
+        return RunReceiptComparison(result, exact)
+    if metadata_snapshot.reference.profile_id != current_capture.reference.profile_id:
+        return RunReceiptComparison(
+            RunReceiptComparisonResult.PROFILE_MISMATCH,
+            None,
+        )
+    if (
+        metadata_snapshot.reference.stable_identity_sha256
+        != current_capture.reference.stable_identity_sha256
+    ):
+        return RunReceiptComparison(
+            RunReceiptComparisonResult.STABLE_IDENTITY_MISMATCH,
+            None,
+        )
+    if (
+        metadata_snapshot.receipt.stable_identity
+        != current_capture.snapshot.receipt.stable_identity
+    ):
+        return RunReceiptComparison(
+            RunReceiptComparisonResult.STABLE_IDENTITY_MISMATCH,
+            None,
+        )
+    current_raw = serialize_snapshot(current_capture.snapshot)
+    if secrets.compare_digest(metadata_snapshot.canonical, current_raw):
+        return RunReceiptComparison(
+            RunReceiptComparisonResult.MATCH_NON_AUTHORIZING,
+            exact,
+        )
+    if operation == "start":
+        return RunReceiptComparison(
+            RunReceiptComparisonResult.LAUNCH_INSTANCE_MISMATCH,
+            exact,
+        )
+    if _reference_replays_any(
+        current_capture.reference,
+        _lineage_replay_references(lineage),
+    ):
+        return RunReceiptComparison(
+            RunReceiptComparisonResult.LAUNCH_REPLAY,
+            exact,
+        )
+    if not _references_share_lineage_identity(
+        metadata_snapshot.reference,
+        current_capture.reference,
+    ) or not _reference_generation_is_distinct(
+        metadata_snapshot.reference,
+        current_capture.reference,
+    ):
+        return RunReceiptComparison(
+            RunReceiptComparisonResult.LAUNCH_INSTANCE_INVALID,
+            exact,
+        )
+    return RunReceiptComparison(
+        RunReceiptComparisonResult.RESUME_MATCH_NON_AUTHORIZING,
+        exact,
+    )
+
+
+def _metadata_file_has_receipt_state(path: Path) -> bool:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return False
+    try:
+        value_stat = os.fstat(fd)
+        if not stat.S_ISREG(value_stat.st_mode):
+            return True
+        if value_stat.st_size > MAX_RUN_METADATA_BYTES:
+            return True
+        chunks: list[bytes] = []
+        remaining = MAX_RUN_METADATA_BYTES + 1
+        while remaining:
+            chunk = os.read(fd, min(65_536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    if len(raw) > MAX_RUN_METADATA_BYTES:
+        return True
+    try:
+        value = loads_bounded(
+            raw,
+            max_bytes=MAX_RUN_METADATA_BYTES,
+            reject_duplicate_keys=False,
+        )
+    except (UnicodeError, ValueError, RecursionError):
+        return any(
+            json.dumps(key).encode("ascii") in raw
+            for key in _RUN_RECEIPT_RESERVED_EXTRA_KEYS
+        )
+    if isinstance(value, dict) and _metadata_contains_reserved_input(value):
+        return True
+    return False
+
+
+def _receipt_branch_selected(path: Path) -> bool:
+    from core.project.sessions import (
+        SessionHostV2CredentialState,
+        session_host_v2_credential_state,
+    )
+
+    state = session_host_v2_credential_state()
+    return (
+        state is SessionHostV2CredentialState.MATCHING_HOST_V2
+        or _metadata_file_has_receipt_state(path)
+    )
+
+
+def _capture_current_run_receipt(*, operation: str, now: datetime):
+    from core.project.sessions import capture_current_session_runtime_receipt
+    from core.startup.runtime_receipt.plumbing_types import (
+        PlumbingDisposition,
+        PlumbingFailure,
+        PlumbingReason,
+    )
+    from core.startup.runtime_receipt.profile import (
+        DEFAULT_PROFILE_DIRECTORY,
+        load_profile_store,
+    )
+    from core.startup.runtime_receipt.reasons import ReceiptRejection
+
+    profiles = load_profile_store(DEFAULT_PROFILE_DIRECTORY)
+    if isinstance(profiles, ReceiptRejection):
+        comparison = RunReceiptComparison(
+            RunReceiptComparisonResult.REGISTRY_INVALID,
+            None,
+        )
+        raise _receipt_error(
+            RunReceiptReason.REGISTRY_INVALID,
+            operation=operation,
+            comparison=comparison,
+            subordinate=profiles.reason_codes[0].value,
+        )
+    captured = capture_current_session_runtime_receipt(
+        profiles=profiles,
+        now=now,
+    )
+    if captured is None:
+        comparison = RunReceiptComparison(
+            RunReceiptComparisonResult.REGISTRY_CHANGED,
+            None,
+        )
+        raise _receipt_error(
+            RunReceiptReason.REGISTRY_CHANGED,
+            operation=operation,
+            comparison=comparison,
+        )
+    if isinstance(captured, PlumbingFailure):
+        first = captured.reason_codes[0]
+        if first is PlumbingReason.STATE_NOT_FINAL:
+            result = RunReceiptComparisonResult.REGISTRY_PENDING
+            reason = RunReceiptReason.REGISTRY_PENDING
+        elif first is PlumbingReason.RECEIPT_STATE_REJECTED:
+            result = RunReceiptComparisonResult.REGISTRY_REJECTED
+            reason = RunReceiptReason.REGISTRY_REJECTED
+        elif first in {
+            PlumbingReason.SIDECAR_MISSING,
+            PlumbingReason.SESSION_ENTRY_MISSING,
+        }:
+            result = RunReceiptComparisonResult.RECEIPT_MISSING
+            reason = RunReceiptReason.RECEIPT_MISSING
+        else:
+            result = RunReceiptComparisonResult.REGISTRY_INVALID
+            reason = RunReceiptReason.REGISTRY_INVALID
+        comparison = RunReceiptComparison(result, None)
+        subordinate = first.value
+        if captured.disposition is PlumbingDisposition.STATE_CONFLICT:
+            comparison = RunReceiptComparison(
+                RunReceiptComparisonResult.REGISTRY_CHANGED,
+                None,
+            )
+            reason = RunReceiptReason.REGISTRY_CHANGED
+        raise _receipt_error(
+            reason,
+            operation=operation,
+            comparison=comparison,
+            subordinate=subordinate,
+        )
+    return captured
+
+
+def _comparison_refusal(
+    comparison: RunReceiptComparison,
+    *,
+    operation: str,
+) -> RunRuntimeReceiptError:
+    result = comparison.result
+    if result is RunReceiptComparisonResult.METADATA_ONLY:
+        reason = RunReceiptReason.RECEIPT_DOWNGRADE_FORBIDDEN
+    elif result is RunReceiptComparisonResult.REGISTRY_ONLY:
+        reason = RunReceiptReason.LEGACY_UPGRADE_FORBIDDEN
+    elif result is RunReceiptComparisonResult.AUTHORITY_INVALID:
+        reason = RunReceiptReason.AUTHORITY_INVALID
+    elif result is RunReceiptComparisonResult.PROFILE_MISMATCH:
+        reason = RunReceiptReason.PROFILE_MISMATCH
+    elif result is RunReceiptComparisonResult.STABLE_IDENTITY_MISMATCH:
+        reason = RunReceiptReason.STABLE_IDENTITY_MISMATCH
+    elif result is RunReceiptComparisonResult.LAUNCH_INSTANCE_MISMATCH:
+        reason = RunReceiptReason.LAUNCH_INSTANCE_MISMATCH
+    elif result is RunReceiptComparisonResult.LINEAGE_INVALID:
+        reason = RunReceiptReason.LINEAGE_INVALID
+    elif result is RunReceiptComparisonResult.LINEAGE_OVERFLOW:
+        reason = RunReceiptReason.LINEAGE_OVERFLOW
+    elif result is RunReceiptComparisonResult.LAUNCH_REPLAY:
+        reason = RunReceiptReason.LAUNCH_REPLAY
+    elif result is RunReceiptComparisonResult.LAUNCH_INSTANCE_INVALID:
+        reason = RunReceiptReason.LAUNCH_INSTANCE_INVALID
+    else:
+        reason = RunReceiptReason.METADATA_INVALID
+    return _receipt_error(
+        reason,
+        operation=operation,
+        comparison=comparison,
+    )
+
+
+def _validate_receipt_project_pin(
+    metadata: Mapping[str, object],
+    *,
+    operation: str,
+) -> str:
+    if (
+        "project" not in metadata
+        or metadata.get("project") is not None
+        or metadata.get("project_source") not in _RUN_RECEIPT_PROJECT_SOURCES
+    ):
+        raise _receipt_error(
+            RunReceiptReason.PROJECT_PIN_MISMATCH,
+            operation=operation,
+        )
+    return str(metadata["project_source"])
+
+
+def _receipt_project_source(*, operation: str) -> str:
+    from core.run.pin import (
+        _process_override_source,
+        get_process_project,
+    )
+
+    override = get_process_project()
+    if override is None:
+        return "session"
+    if override == "-":
+        return _process_override_source()
+    raise _receipt_error(
+        RunReceiptReason.PROJECT_FORBIDDEN,
+        operation=operation,
+    )
+
+
+def _snapshot_json_value(capture: Any) -> dict[str, Any]:
+    from core.startup.runtime_receipt.plumbing_types import serialize_snapshot
+
+    value = json.loads(serialize_snapshot(capture.snapshot))
+    if not isinstance(value, dict):
+        raise AssertionError("serialized receipt snapshot must be an object")
+    return value
+
+
+def _audit_snapshot_json_value(
+    snapshot: RunReceiptAuditSnapshot,
+) -> dict[str, Any]:
+    value = json.loads(snapshot.canonical)
+    if not isinstance(value, dict):
+        raise AssertionError("audit receipt snapshot must be an object")
+    return value
+
+
+def _capture_audit_snapshot(capture: Any) -> RunReceiptAuditSnapshot:
+    from core.startup.runtime_receipt.plumbing_types import serialize_snapshot
+
+    return RunReceiptAuditSnapshot(
+        reference=capture.reference,
+        receipt=capture.snapshot.receipt,
+        canonical=serialize_snapshot(capture.snapshot),
+    )
+
+
+def _lineage_json_value(
+    lineage: _RunReceiptLineage,
+) -> dict[str, Any]:
+    value = json.loads(lineage.canonical)
+    if not isinstance(value, dict):
+        raise AssertionError("run receipt lineage must be an object")
+    return value
+
+
+def _reference_json_value(reference: Any) -> dict[str, Any]:
+    from core.startup.runtime_receipt.plumbing_types import serialize_reference
+
+    value = json.loads(serialize_reference(reference))
+    if not isinstance(value, dict):
+        raise AssertionError("receipt reference must be an object")
+    return value
+
+
+def _lineage_resume_timestamp(
+    now: datetime,
+    *,
+    lineage: _RunReceiptLineage | None,
+    operation: str,
+) -> str:
+    if getattr(now, "tzinfo", None) is None:
+        raise _lineage_error(
+            operation=operation,
+            subordinate="timestamp",
+        )
+    try:
+        value = now.astimezone(timezone.utc).isoformat(timespec="microseconds")
+    except (AttributeError, TypeError, ValueError):
+        raise _lineage_error(
+            operation=operation,
+            subordinate="timestamp",
+        ) from None
+    parsed = _parse_lineage_timestamp(value, operation=operation)
+    if lineage is not None and parsed <= lineage.entries[-1].resumed_at:
+        raise _lineage_error(
+            operation=operation,
+            subordinate="timestamp",
+        )
+    return value
+
+
+def _append_receipt_lineage(
+    lineage: _RunReceiptLineage | None,
+    *,
+    prior: RunReceiptAuditSnapshot,
+    current: RunReceiptAuditSnapshot,
+    relation: str,
+    now: datetime,
+    operation: str,
+) -> tuple[_RunReceiptLineage, int, str]:
+    if lineage is None:
+        entries: list[dict[str, Any]] = []
+    else:
+        lineage_value = _lineage_json_value(lineage)
+        entries = copy.deepcopy(lineage_value["entries"])
+    if len(entries) >= MAX_RUN_RECEIPT_LINEAGE_ENTRIES:
+        raise _lineage_overflow_error(
+            operation=operation,
+            segment=len(entries) + 2,
+        )
+    segment = len(entries) + 2
+    resumed_at_utc = _lineage_resume_timestamp(
+        now,
+        lineage=lineage,
+        operation=operation,
+    )
+    entries.append(
+        {
+            "segment": segment,
+            "resumed_at_utc": resumed_at_utc,
+            "relation": relation,
+            "prior_snapshot_sha256": _snapshot_digest(prior),
+            "current_snapshot_sha256": _snapshot_digest(current),
+            "prior_reference": _reference_json_value(prior.reference),
+            "current_reference": _reference_json_value(current.reference),
+        }
+    )
+    value = {
+        "schema": RUN_RECEIPT_LINEAGE_SCHEMA,
+        "schema_version": RUN_RECEIPT_LINEAGE_SCHEMA_VERSION,
+        "entries": entries,
+    }
+    parsed = _parse_run_receipt_lineage(
+        value,
+        head=current,
+        operation=operation,
+    )
+    return parsed, segment, resumed_at_utc
+
+
+def _serialize_receipt_run_metadata(
+    metadata: dict[str, Any],
+    *,
+    operation: str,
+) -> bytes:
+    try:
+        raw = (dumps_artifact(metadata, indent=2, ensure_ascii=False) + "\n").encode(
+            "utf-8"
+        )
+    except (TypeError, ValueError, RecursionError):
+        raise _receipt_error(
+            RunReceiptReason.METADATA_INVALID,
+            operation=operation,
+        ) from None
+    if len(raw) > MAX_RUN_METADATA_BYTES:
+        raise _receipt_error(
+            RunReceiptReason.METADATA_OVERSIZED,
+            operation=operation,
+        )
+    try:
+        parsed = loads_bounded(
+            raw,
+            max_bytes=MAX_RUN_METADATA_BYTES,
+            reject_duplicate_keys=True,
+        )
+    except (JsonBudgetExceededError, UnicodeError, ValueError, RecursionError):
+        raise _receipt_error(
+            RunReceiptReason.METADATA_INVALID,
+            operation=operation,
+        ) from None
+    if not isinstance(parsed, dict):
+        raise _receipt_error(
+            RunReceiptReason.METADATA_INVALID,
+            operation=operation,
+        )
+    return raw
+
+
+def _receipt_temporary_path(path: Path) -> Path:
+    suffix = secrets.token_hex(8)
+    return path.with_name(
+        f".{path.name}.receipt.{os.getpid()}.{threading.get_ident()}.{suffix}.tmp"
+    )
+
+
+def _remove_receipt_owner_fields(metadata: dict[str, Any]) -> None:
+    from core.startup.host import RUN_HOST_KEYS
+
+    for key in (
+        "session_pid",
+        "tool_pid",
+        "tool_pid_start",
+        "session_start",
+        "session_boot_id",
+        "session_pidns",
+        "session_machine_id",
+        "session_id",
+        *RUN_HOST_KEYS,
+    ):
+        metadata.pop(key, None)
+
+
 def _session_alive_for_meta(meta: dict) -> bool:
     """Is the session that owns this run metadata still alive?
 
@@ -402,8 +1959,14 @@ def _session_liveness_for_meta(meta: dict) -> str:
     ``"alive"`` / ``"dead"`` / ``"foreign"`` (unverifiable).
 
     Stamped metadata (``session_start`` + ``session_boot_id``) gets the
-    full identity check: a live claude process at the recorded pid with
-    a MISMATCHING stamp is a recycled pid — the owner is dead. Foreign
+    full identity check: a live frontend process at the recorded pid
+    with a MISMATCHING stamp is a recycled pid — the owner is dead.
+    Strong host metadata is corroborated against the launcher-owned
+    registry entry by token presence/shape plus exact claim/stamp
+    equality; this liveness reader does NOT possess or match the secret
+    token and therefore does not authenticate a caller. The caller-owner
+    path separately resolves the PID through the env credential, where
+    the token is matched, before lifecycle ownership is checked. Foreign
     stamps (other boot / machine / pid namespace) are unverifiable here
     and return ``"foreign"`` — consumers choose the fail direction
     (sweeps treat it as alive; the contention gate applies an age
@@ -413,13 +1976,33 @@ def _session_liveness_for_meta(meta: dict) -> str:
     Unstamped (pre-series) metadata keeps the legacy comm-checked
     ``_pid_alive`` — alive/dead only, never foreign.
     """
+    if not _metadata_allows_legacy_attribution(meta):
+        return "dead"
     pid = meta.get("session_pid")
     if isinstance(pid, str) and pid.isascii() and pid.isdigit():
         pid = int(pid)  # stringified pid: read like the hooks do
     if not isinstance(pid, int) or isinstance(pid, bool):
         return "dead"
+    from core.startup.host import (
+        HostClaimError,
+        parse_metadata_host_claim,
+    )
+    try:
+        host_claim = parse_metadata_host_claim(meta)
+    except HostClaimError as exc:
+        logger.warning(
+            "run metadata has a malformed session host claim — "
+            "refusing liveness authority: %s", exc
+        )
+        return "dead"
     start = meta.get("session_start")
     boot = meta.get("session_boot_id")
+    if host_claim is not None and not (start and boot):
+        logger.warning(
+            "run metadata has host evidence without a complete process "
+            "stamp — refusing liveness authority"
+        )
+        return "dead"
     if start and boot:
         from core.project import sessions as _sessions
         fields = {"starttime": str(start), "boot_id": str(boot)}
@@ -429,6 +2012,43 @@ def _session_liveness_for_meta(meta: dict) -> str:
         machine = meta.get("session_machine_id")
         if machine:
             fields["machine_id"] = str(machine)
+        if host_claim is not None:
+            # Strong metadata is not self-authenticating: pid/start/uid/inode
+            # are observable and a sibling run file is attacker-influenced.
+            # Corroborate the exact launcher-owned registry entry (including
+            # the token's presence) before accepting liveness.
+            entry = _sessions._parse_entry(
+                _sessions._sessions_dir() / str(pid)
+            )
+            if entry.get("v") != _sessions.ENTRY_VERSION:
+                return "dead"
+            token = entry.get("token", "")
+            if (len(token) != 32
+                    or any(ch not in "0123456789abcdef" for ch in token)):
+                return "dead"
+            try:
+                from core.startup.host import parse_session_host_claim
+                entry_claim = parse_session_host_claim(entry)
+            except HostClaimError as exc:
+                logger.warning(
+                    "session registry has a malformed host claim for "
+                    "pid %d — refusing liveness: %s", pid, exc
+                )
+                return "dead"
+            if entry_claim != host_claim:
+                return "dead"
+            for meta_key, entry_key in (
+                ("session_start", "starttime"),
+                ("session_boot_id", "boot_id"),
+                ("session_pidns", "pidns"),
+            ):
+                entry_value = entry.get(entry_key)
+                if entry_value and meta_key not in meta:
+                    return "dead"
+                if (meta_key in meta
+                        and str(meta[meta_key]) != entry_value):
+                    return "dead"
+            fields = entry
         if _sessions._foreign_entry(fields):
             # One foreign shape IS decidable: a stamp carrying THIS
             # machine's identity but another boot_id was written
@@ -443,6 +2063,88 @@ def _session_liveness_for_meta(meta: dict) -> str:
         return ("alive" if _sessions._identity_matches(pid, fields)
                 else "dead")
     return "alive" if _pid_alive(pid) else "dead"
+
+
+def _metadata_owned_by_session(meta: dict, session_pid: int) -> bool:
+    """Whether *meta* belongs to the exact current session owner.
+
+    Legacy metadata keeps its historical pid-based behavior, augmented by an
+    exact stamp comparison when both sides carry one. Strong host metadata
+    must match a currently verified registry entry field-for-field; a stale,
+    malformed, duplicate, or foreign record cannot drive lifecycle hooks.
+    """
+    if not _metadata_allows_legacy_attribution(meta):
+        return False
+    try:
+        from core.project.sessions import (
+            SessionHostV2CredentialState,
+            session_host_v2_credential_state,
+        )
+
+        if (
+            session_host_v2_credential_state()
+            is SessionHostV2CredentialState.MATCHING_HOST_V2
+        ):
+            return False
+    except Exception:  # noqa: BLE001 — ownership checks fail closed
+        logger.debug("host-v2 credential ownership veto failed", exc_info=True)
+        return False
+    owner = meta.get("session_pid")
+    if isinstance(owner, str) and owner.isascii() and owner.isdigit():
+        owner = int(owner)
+    if (not isinstance(owner, int) or isinstance(owner, bool)
+            or owner != session_pid):
+        return False
+
+    from core.project import sessions as _sessions
+    from core.startup.host import (
+        HostClaimError,
+        parse_metadata_host_claim,
+        parse_session_host_claim,
+    )
+
+    try:
+        meta_claim = parse_metadata_host_claim(meta)
+    except HostClaimError as exc:
+        logger.warning(
+            "run metadata has a malformed session host claim — "
+            "refusing ownership: %s", exc
+        )
+        return False
+
+    fields = _sessions._parse_entry(
+        _sessions._sessions_dir() / str(session_pid)
+    )
+    if not fields:
+        return meta_claim is None
+    if fields.get("v") == _sessions.ENTRY_VERSION:
+        if not _sessions._identity_matches(session_pid, fields):
+            return False
+        try:
+            entry_claim = parse_session_host_claim(fields)
+        except HostClaimError as exc:
+            logger.warning(
+                "session registry has a malformed host claim for pid %d — "
+                "refusing run ownership: %s", session_pid, exc
+            )
+            return False
+        if meta_claim is not None:
+            if entry_claim is None or meta_claim != entry_claim:
+                return False
+        elif (entry_claim is not None
+              and entry_claim.frontend.value != "claude"):
+            # Host-less run metadata retains only the historical Claude
+            # strength. It must never become Copilot authority merely because
+            # a current strong Copilot record happens to reuse the pid.
+            return False
+        for meta_key, entry_key in (
+            ("session_start", "starttime"),
+            ("session_boot_id", "boot_id"),
+            ("session_pidns", "pidns"),
+        ):
+            if meta_key in meta and str(meta[meta_key]) != fields.get(entry_key):
+                return False
+    return True
 
 
 def _pid_alive(pid: int) -> bool:
@@ -790,6 +2492,332 @@ def _metadata_lock(meta_path: Path):
         os.close(fd)
 
 
+_METADATA_LOCK_STAMP_RE = re.compile(rb"[1-9][0-9]*\n")
+_METADATA_LOCK_STAMP_MAX_BYTES = 32
+
+
+def _metadata_lock_stat_valid(value: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(value.st_mode)
+        and value.st_uid == os.geteuid()
+        and value.st_nlink == 1
+        and value.st_size <= _METADATA_LOCK_STAMP_MAX_BYTES
+        and stat.S_IMODE(value.st_mode) & 0o022 == 0
+    )
+
+
+def _metadata_lock_fd_valid(fd: int, value: os.stat_result) -> bool:
+    """Accept an empty strict lock or the legacy lock's PID diagnostic."""
+
+    if not _metadata_lock_stat_valid(value):
+        return False
+    try:
+        raw = os.pread(fd, _METADATA_LOCK_STAMP_MAX_BYTES + 1, 0)
+    except OSError:
+        return False
+    if len(raw) != value.st_size:
+        return False
+    return raw == b"" or _METADATA_LOCK_STAMP_RE.fullmatch(raw) is not None
+
+
+def _after_strict_metadata_lock_open(_path: Path, _fd: int) -> None:
+    """Test seam after flock acquisition and before pathname revalidation."""
+
+
+@contextlib.contextmanager
+def _strict_metadata_lock(
+    meta_path: Path,
+    *,
+    operation: str,
+    nonblocking: bool,
+):
+    """Strictly lock the same inode used by the legacy metadata lock."""
+
+    if not _HAS_FCNTL:
+        raise _receipt_error(
+            RunReceiptReason.STRICT_LOCK_UNAVAILABLE,
+            operation=operation,
+            subordinate="fcntl_unavailable",
+        )
+    path = Path(meta_path)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    flags = os.O_RDWR | os.O_CREAT
+    for name in ("O_NONBLOCK", "O_NOFOLLOW", "O_CLOEXEC"):
+        value = getattr(os, name, None)
+        if type(value) is not int:
+            raise _receipt_error(
+                RunReceiptReason.STRICT_LOCK_UNAVAILABLE,
+                operation=operation,
+                subordinate=name.lower(),
+            )
+        flags |= value
+    try:
+        fd = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise _receipt_error(
+            RunReceiptReason.STRICT_LOCK_UNAVAILABLE,
+            operation=operation,
+            subordinate=(
+                "loop"
+                if exc.errno == errno.ELOOP
+                else "permission_denied"
+                if exc.errno in {errno.EACCES, errno.EPERM}
+                else "open_failed"
+            ),
+        ) from None
+    locked = False
+    try:
+        first = os.fstat(fd)
+        if not _metadata_lock_fd_valid(fd, first):
+            raise _receipt_error(
+                RunReceiptReason.STRICT_LOCK_UNAVAILABLE,
+                operation=operation,
+                subordinate="lock_policy",
+            )
+        lock_mode = fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0)
+        try:
+            fcntl.flock(fd, lock_mode)
+            locked = True
+        except OSError as exc:
+            if nonblocking and exc.errno in {errno.EAGAIN, errno.EWOULDBLOCK}:
+                raise _receipt_error(
+                    RunReceiptReason.LOCK_BUSY,
+                    operation=operation,
+                ) from None
+            raise _receipt_error(
+                RunReceiptReason.STRICT_LOCK_UNAVAILABLE,
+                operation=operation,
+                subordinate="lock_acquire",
+            ) from None
+        _after_strict_metadata_lock_open(lock_path, fd)
+        try:
+            current = os.stat(lock_path, follow_symlinks=False)
+            held = os.fstat(fd)
+        except OSError:
+            raise _receipt_error(
+                RunReceiptReason.STRICT_LOCK_UNAVAILABLE,
+                operation=operation,
+                subordinate="lock_recheck",
+            ) from None
+        if (
+            current.st_dev != held.st_dev
+            or current.st_ino != held.st_ino
+            or not _metadata_lock_stat_valid(current)
+            or not _metadata_lock_fd_valid(fd, held)
+        ):
+            raise _receipt_error(
+                RunReceiptReason.STRICT_LOCK_UNAVAILABLE,
+                operation=operation,
+                subordinate="lock_replaced",
+            )
+        try:
+            yield
+        finally:
+            try:
+                final = os.stat(lock_path, follow_symlinks=False)
+                held = os.fstat(fd)
+            except OSError:
+                raise _receipt_error(
+                    RunReceiptReason.STRICT_LOCK_UNAVAILABLE,
+                    operation=operation,
+                    subordinate="lock_release",
+                ) from None
+            if (
+                final.st_dev != held.st_dev
+                or final.st_ino != held.st_ino
+                or not _metadata_lock_stat_valid(final)
+                or not _metadata_lock_fd_valid(fd, held)
+            ):
+                raise _receipt_error(
+                    RunReceiptReason.STRICT_LOCK_UNAVAILABLE,
+                    operation=operation,
+                    subordinate="lock_replaced",
+                )
+    finally:
+        if locked:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _write_prebuilt_metadata_bytes(
+    path: Path,
+    raw: bytes,
+    temporary_path: Path,
+    *,
+    operation: str,
+) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    for name in ("O_NONBLOCK", "O_NOFOLLOW", "O_CLOEXEC"):
+        value = getattr(os, name, None)
+        if type(value) is not int:
+            raise _receipt_error(
+                RunReceiptReason.STRICT_LOCK_UNAVAILABLE,
+                operation=operation,
+                subordinate=name.lower(),
+            )
+        flags |= value
+    fd = -1
+    try:
+        fd = os.open(temporary_path, flags, 0o600)
+        os.fchmod(fd, 0o600)
+        offset = 0
+        while offset < len(raw):
+            written = os.write(fd, raw[offset:])
+            if written <= 0:
+                raise OSError("metadata short write")
+            offset += written
+        os.fsync(fd)
+        value = os.fstat(fd)
+        if (
+            not stat.S_ISREG(value.st_mode)
+            or value.st_uid != os.geteuid()
+            or value.st_nlink != 1
+            or stat.S_IMODE(value.st_mode) != 0o600
+            or value.st_size != len(raw)
+        ):
+            raise OSError("metadata temporary policy failure")
+        os.close(fd)
+        fd = -1
+        os.replace(temporary_path, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError:
+        raise _receipt_error(
+            RunReceiptReason.METADATA_CHANGED,
+            operation=operation,
+            subordinate="write_failed",
+        ) from None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        with contextlib.suppress(OSError):
+            temporary_path.unlink()
+
+
+def _read_metadata_bytes_for_cas(
+    path: Path,
+    *,
+    operation: str,
+) -> bytes | None:
+    try:
+        return _strict_read_run_metadata_bytes(
+            path,
+            operation=operation,
+            missing_ok=True,
+        )
+    except RunRuntimeReceiptError:
+        raise _receipt_error(
+            RunReceiptReason.METADATA_CHANGED,
+            operation=operation,
+        ) from None
+
+
+def _commit_receipt_plan(plan: _ReceiptCommitPlan) -> None:
+    from core.project import sessions as _sessions
+
+    for attempt in range(_STRICT_METADATA_LOCK_ATTEMPTS):
+        try:
+            with _sessions.session_runtime_receipt_fence(plan.capture):
+                with _strict_metadata_lock(
+                    plan.output_dir / RUN_METADATA_FILE,
+                    operation=plan.operation,
+                    nonblocking=True,
+                ):
+                    path = plan.output_dir / RUN_METADATA_FILE
+                    observed = _read_metadata_bytes_for_cas(
+                        path,
+                        operation=plan.operation,
+                    )
+                    if plan.expected_raw is None:
+                        unchanged = observed is None
+                    else:
+                        unchanged = observed is not None and secrets.compare_digest(
+                            observed,
+                            plan.expected_raw,
+                        )
+                    if not unchanged:
+                        comparison = RunReceiptComparison(
+                            RunReceiptComparisonResult.METADATA_CHANGED,
+                            None,
+                        )
+                        raise _receipt_error(
+                            RunReceiptReason.METADATA_CHANGED,
+                            operation=plan.operation,
+                            comparison=comparison,
+                        )
+                    _write_prebuilt_metadata_bytes(
+                        path,
+                        plan.desired_raw,
+                        plan.temporary_path,
+                        operation=plan.operation,
+                    )
+                    try:
+                        written = _read_metadata_bytes_for_cas(
+                            path,
+                            operation=plan.operation,
+                        )
+                    except RunRuntimeReceiptError:
+                        comparison = RunReceiptComparison(
+                            RunReceiptComparisonResult.METADATA_CHANGED,
+                            None,
+                        )
+                        raise _receipt_error(
+                            RunReceiptReason.METADATA_CHANGED,
+                            operation=plan.operation,
+                            comparison=comparison,
+                            subordinate="post_replace_verification",
+                        ) from None
+                    if written is None or not secrets.compare_digest(
+                        written,
+                        plan.desired_raw,
+                    ):
+                        comparison = RunReceiptComparison(
+                            RunReceiptComparisonResult.METADATA_CHANGED,
+                            None,
+                        )
+                        raise _receipt_error(
+                            RunReceiptReason.METADATA_CHANGED,
+                            operation=plan.operation,
+                            comparison=comparison,
+                            subordinate="post_replace_verification",
+                        )
+            return
+        except RunRuntimeReceiptError as exc:
+            if (
+                exc.reason is RunReceiptReason.LOCK_BUSY
+                and attempt + 1 < _STRICT_METADATA_LOCK_ATTEMPTS
+            ):
+                time.sleep(_STRICT_METADATA_LOCK_INTERVAL_S)
+                continue
+            raise
+        except _sessions._SessionReceiptAbort as exc:
+            first = exc.failure.reason_codes[0].value
+            if first == "concurrent_finalizer":
+                reason = RunReceiptReason.LOCK_BUSY
+            elif first == "strict_lock_unavailable":
+                reason = RunReceiptReason.STRICT_LOCK_UNAVAILABLE
+            else:
+                reason = RunReceiptReason.REGISTRY_CHANGED
+            comparison = RunReceiptComparison(
+                RunReceiptComparisonResult.REGISTRY_CHANGED,
+                None,
+            )
+            raise _receipt_error(
+                reason,
+                operation=plan.operation,
+                comparison=comparison,
+                subordinate=first,
+            ) from None
+    raise _receipt_error(
+        RunReceiptReason.LOCK_BUSY,
+        operation=plan.operation,
+    )
+
+
 def _contention_project_dir(output_dir: Path) -> Path | None:
     """The directory run-start contention keys on, or ``None``.
 
@@ -879,8 +2907,9 @@ def _live_conflicting_run(project_dir: Path, self_dir: Path,
     """Find a sibling run that makes a new start contention.
 
     A sibling contends when its metadata says ``status=running`` AND
-    its recorded ``session_pid`` is a live claude session belonging to
-    a DIFFERENT session than ours. Everything else is explicitly not
+    its recorded ``session_pid`` is a live verified frontend (or
+    legacy Claude session) belonging to a DIFFERENT session than ours.
+    Everything else is explicitly not
     contention:
 
     * dead recorded pid — a crashed run; detectable, must never block
@@ -945,7 +2974,11 @@ def _live_conflicting_run(project_dir: Path, self_dir: Path,
         # Stamped metadata gets the identity check (a recycled claude
         # pid must not hold contention forever); unstamped falls back
         # to the gate's EPERM-aware comm probe.
-        if meta.get("session_start") and meta.get("session_boot_id"):
+        if (meta.get("session_start") and meta.get("session_boot_id")) \
+                or any(
+                    str(key).startswith("session_host")
+                    for key in meta
+                ):
             liveness = _session_liveness_for_meta(meta)
             if liveness == "dead":
                 continue
@@ -1062,6 +3095,378 @@ def _project_run_gate(project_dir: Path, output_dir: Path, command: str,
         _time.sleep(2.0)
 
 
+def _matching_host_v2_credential() -> bool:
+    from core.project.sessions import (
+        SessionHostV2CredentialState,
+        session_host_v2_credential_state,
+    )
+
+    return (
+        session_host_v2_credential_state()
+        is SessionHostV2CredentialState.MATCHING_HOST_V2
+    )
+
+
+def _prepare_receipt_start_plan(
+    output_dir: Path,
+    command: str,
+    extra: dict[str, Any] | None,
+    target: str | None,
+    target_identity: dict[str, Any] | None,
+) -> _ReceiptCommitPlan:
+    operation = "start"
+    if _contention_project_dir(output_dir) is not None:
+        raise _receipt_error(
+            RunReceiptReason.PROJECT_FORBIDDEN,
+            operation=operation,
+        )
+    project_source = _receipt_project_source(operation=operation)
+    now = datetime.now(timezone.utc)
+    matching_credential = _matching_host_v2_credential()
+    capture = (
+        _capture_current_run_receipt(operation=operation, now=now)
+        if matching_credential
+        else None
+    )
+    path = output_dir / RUN_METADATA_FILE
+    strict = _strict_load_run_metadata(
+        path,
+        operation=operation,
+        missing_ok=True,
+    )
+    parsed = (
+        _parse_receipt_metadata(strict, operation=operation)
+        if strict is not None
+        else _ParsedReceiptMetadata(snapshot=None, lineage=None)
+    )
+    audit = parsed.snapshot
+    lineage = parsed.lineage
+    if not matching_credential:
+        if audit is not None:
+            comparison = RunReceiptComparison(
+                RunReceiptComparisonResult.METADATA_ONLY,
+                None,
+            )
+            raise _comparison_refusal(comparison, operation=operation)
+        raise _receipt_error(
+            RunReceiptReason.REGISTRY_ABSENT,
+            operation=operation,
+        )
+    if strict is not None and audit is None:
+        comparison = RunReceiptComparison(
+            RunReceiptComparisonResult.REGISTRY_ONLY,
+            None,
+        )
+        raise _receipt_error(
+            RunReceiptReason.LEGACY_UPGRADE_FORBIDDEN,
+            operation=operation,
+            comparison=comparison,
+        )
+    comparison = compare_run_runtime_receipt(
+        audit,
+        capture,
+        operation=operation,
+        lineage=lineage,
+    )
+    if audit is None:
+        if (
+            comparison.result
+            is not RunReceiptComparisonResult.NEW_SNAPSHOT_NON_AUTHORIZING
+        ):
+            raise _comparison_refusal(comparison, operation=operation)
+        snapshot_value = _snapshot_json_value(capture)
+        effective_source = project_source
+    else:
+        if comparison.result is not RunReceiptComparisonResult.MATCH_NON_AUTHORIZING:
+            raise _comparison_refusal(comparison, operation=operation)
+        assert strict is not None
+        prior = strict.value
+        if prior.get("status") != STATUS_RUNNING:
+            raise _receipt_error(
+                RunReceiptReason.REENTRANT_STATUS_MISMATCH,
+                operation=operation,
+                status=str(prior.get("status")),
+            )
+        if prior.get("command") != command:
+            raise _receipt_error(
+                RunReceiptReason.REENTRANT_COMMAND_MISMATCH,
+                operation=operation,
+            )
+        effective_source = _validate_receipt_project_pin(
+            prior,
+            operation=operation,
+        )
+        snapshot_value = _audit_snapshot_json_value(audit)
+
+    from core.run.provenance import build_start_manifest
+
+    desired_extra = copy.deepcopy(extra or {})
+    if strict is not None:
+        prior_extra = strict.value.get("extra")
+        if (
+            isinstance(prior_extra, dict)
+            and "resumes" in prior_extra
+            and "resumes" not in desired_extra
+        ):
+            desired_extra["resumes"] = copy.deepcopy(prior_extra["resumes"])
+    metadata: dict[str, Any] = {
+        "version": 2,
+        "command": command,
+        "timestamp": now.isoformat(),
+        "status": STATUS_RUNNING,
+        "manifest": build_start_manifest(
+            target=target,
+            target_identity=target_identity,
+        ),
+        "extra": desired_extra,
+        "project": None,
+        "project_source": effective_source,
+        RUN_RUNTIME_RECEIPT_KEY: snapshot_value,
+    }
+    if lineage is not None:
+        metadata[RUN_RUNTIME_RECEIPT_LINEAGE_KEY] = _lineage_json_value(lineage)
+    if target:
+        metadata["target_path"] = str(target)
+    _remove_receipt_owner_fields(metadata)
+    desired_raw = _serialize_receipt_run_metadata(
+        metadata,
+        operation=operation,
+    )
+    return _ReceiptCommitPlan(
+        operation=operation,
+        output_dir=output_dir,
+        capture=capture,
+        expected_raw=strict.raw if strict is not None else None,
+        desired_raw=desired_raw,
+        desired_metadata=metadata,
+        temporary_path=_receipt_temporary_path(path),
+    )
+
+
+def _run_receipt_reapers(output_dir: Path) -> None:
+    from core.run.tmp_reaper import (
+        reap_stale_logs,
+        reap_stale_runs,
+        reap_stale_tmp,
+    )
+
+    reap_stale_tmp()
+    reap_stale_logs()
+    reap_stale_runs(output_dir.parent)
+
+
+def _start_receipt_run(
+    output_dir: Path,
+    command: str,
+    extra: dict[str, Any] | None,
+    target: str | None,
+    target_identity: dict[str, Any] | None,
+) -> Path:
+    from core.run.safe_io import safe_run_mkdir
+
+    plan = _prepare_receipt_start_plan(
+        output_dir,
+        command,
+        extra,
+        target,
+        target_identity,
+    )
+    _run_receipt_reapers(output_dir)
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    created = not output_dir.exists()
+    safe_run_mkdir(output_dir)
+    try:
+        _commit_receipt_plan(plan)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            if created:
+                output_dir.rmdir()
+        raise
+    from core.run.pin import freeze_run_pin
+    from core.sandbox.summary import set_active_run_dir
+
+    set_active_run_dir(output_dir)
+    freeze_run_pin(
+        output_dir,
+        None,
+        str(plan.desired_metadata["project_source"]),
+    )
+    return output_dir
+
+
+def _prepare_receipt_resume_plan(
+    output_dir: Path,
+    note: str | None,
+) -> _ReceiptCommitPlan:
+    operation = "resume"
+    if _contention_project_dir(output_dir) is not None:
+        raise _receipt_error(
+            RunReceiptReason.PROJECT_FORBIDDEN,
+            operation=operation,
+        )
+    _receipt_project_source(operation=operation)
+    now = datetime.now(timezone.utc)
+    matching_credential = _matching_host_v2_credential()
+    capture = (
+        _capture_current_run_receipt(operation=operation, now=now)
+        if matching_credential
+        else None
+    )
+    path = output_dir / RUN_METADATA_FILE
+    strict = _strict_load_run_metadata(
+        path,
+        operation=operation,
+        missing_ok=True,
+    )
+    if strict is None:
+        if matching_credential:
+            comparison = RunReceiptComparison(
+                RunReceiptComparisonResult.REGISTRY_ONLY,
+                None,
+            )
+            raise _receipt_error(
+                RunReceiptReason.LEGACY_UPGRADE_FORBIDDEN,
+                operation=operation,
+                comparison=comparison,
+            )
+        raise FileNotFoundError(
+            f"No {RUN_METADATA_FILE} in {output_dir} — not a run directory"
+        )
+    parsed = _parse_receipt_metadata(strict, operation=operation)
+    audit = parsed.snapshot
+    lineage = parsed.lineage
+    if not matching_credential:
+        if audit is not None:
+            comparison = RunReceiptComparison(
+                RunReceiptComparisonResult.METADATA_ONLY,
+                None,
+            )
+            raise _comparison_refusal(comparison, operation=operation)
+        raise _receipt_error(
+            RunReceiptReason.REGISTRY_ABSENT,
+            operation=operation,
+        )
+    if audit is None:
+        comparison = RunReceiptComparison(
+            RunReceiptComparisonResult.REGISTRY_ONLY,
+            None,
+        )
+        raise _receipt_error(
+            RunReceiptReason.LEGACY_UPGRADE_FORBIDDEN,
+            operation=operation,
+            comparison=comparison,
+        )
+    if lineage is not None and len(lineage.entries) >= MAX_RUN_RECEIPT_LINEAGE_ENTRIES:
+        raise _lineage_overflow_error(
+            operation=operation,
+            segment=len(lineage.entries) + 2,
+        )
+    comparison = compare_run_runtime_receipt(
+        audit,
+        capture,
+        operation=operation,
+        lineage=lineage,
+    )
+    if comparison.result not in {
+        RunReceiptComparisonResult.MATCH_NON_AUTHORIZING,
+        RunReceiptComparisonResult.RESUME_MATCH_NON_AUTHORIZING,
+        RunReceiptComparisonResult.LAUNCH_REPLAY,
+        RunReceiptComparisonResult.LAUNCH_INSTANCE_INVALID,
+    }:
+        raise _comparison_refusal(comparison, operation=operation)
+    project_source = _validate_receipt_project_pin(
+        strict.value,
+        operation=operation,
+    )
+    current = strict.value.get("status")
+    if current not in RESUMABLE_STATUSES:
+        raise ValueError(
+            f"run status {current!r} is not resumable "
+            f"(resumable: {', '.join(sorted(RESUMABLE_STATUSES))})"
+        )
+    if comparison.result in {
+        RunReceiptComparisonResult.LAUNCH_REPLAY,
+        RunReceiptComparisonResult.LAUNCH_INSTANCE_INVALID,
+    }:
+        raise _comparison_refusal(comparison, operation=operation)
+    if comparison.result is RunReceiptComparisonResult.MATCH_NON_AUTHORIZING:
+        relation = "exact"
+        current_audit = audit
+    else:
+        relation = "new_launch_same_stable"
+        current_audit = _capture_audit_snapshot(capture)
+    lineage, segment, resumed_at_utc = _append_receipt_lineage(
+        lineage,
+        prior=audit,
+        current=current_audit,
+        relation=relation,
+        now=now,
+        operation=operation,
+    )
+    metadata = copy.deepcopy(strict.value)
+    extra = metadata.get("extra")
+    if extra is None:
+        extra = {}
+    if not isinstance(extra, dict):
+        raise _receipt_error(
+            RunReceiptReason.METADATA_INVALID,
+            operation=operation,
+        )
+    resumes = extra.get("resumes")
+    if resumes is None:
+        resumes = []
+    assert isinstance(resumes, list)
+    resumes = copy.deepcopy(resumes)
+    row: dict[str, Any] = {
+        "ts": resumed_at_utc,
+        "prior_status": current,
+        "segment": segment,
+    }
+    if note:
+        row["note"] = note
+    resumes.append(row)
+    extra["resumes"] = resumes
+    metadata["extra"] = extra
+    metadata["status"] = STATUS_RUNNING
+    metadata.pop("end_timestamp", None)
+    metadata.pop("duration_seconds", None)
+    metadata["project"] = None
+    metadata["project_source"] = project_source
+    metadata[RUN_RUNTIME_RECEIPT_KEY] = _audit_snapshot_json_value(current_audit)
+    metadata[RUN_RUNTIME_RECEIPT_LINEAGE_KEY] = _lineage_json_value(lineage)
+    _remove_receipt_owner_fields(metadata)
+    desired_raw = _serialize_receipt_run_metadata(
+        metadata,
+        operation=operation,
+    )
+    return _ReceiptCommitPlan(
+        operation=operation,
+        output_dir=output_dir,
+        capture=capture,
+        expected_raw=strict.raw,
+        desired_raw=desired_raw,
+        desired_metadata=metadata,
+        temporary_path=_receipt_temporary_path(path),
+        segment=segment,
+    )
+
+
+def _resume_receipt_run(output_dir: Path, note: str | None) -> int:
+    plan = _prepare_receipt_resume_plan(output_dir, note)
+    _commit_receipt_plan(plan)
+    from core.run.pin import freeze_run_pin
+    from core.sandbox.summary import set_active_run_dir
+
+    set_active_run_dir(output_dir)
+    freeze_run_pin(
+        output_dir,
+        None,
+        str(plan.desired_metadata["project_source"]),
+    )
+    assert plan.segment is not None
+    return plan.segment
+
+
 def start_run(output_dir: Path, command: str,
               extra: dict[str, Any] | None = None,
               target: str | None = None,
@@ -1082,9 +3487,20 @@ def start_run(output_dir: Path, command: str,
     immediately (``wait_for_project=True`` queues instead). Crashed
     runs (status=running, dead recorded pid) never block.
     """
+    output_dir = Path(output_dir)
+    _reject_reserved_mapping(extra, operation="start")
+    _reject_reserved_mapping(target_identity, operation="start")
+    if _receipt_branch_selected(output_dir / RUN_METADATA_FILE):
+        return _start_receipt_run(
+            output_dir,
+            command,
+            extra,
+            target,
+            target_identity,
+        )
+
     from core.run.safe_io import safe_run_mkdir
 
-    output_dir = Path(output_dir)
     output_dir.parent.mkdir(parents=True, exist_ok=True)
 
     session_pid = _get_session_pid()
@@ -1128,6 +3544,15 @@ def start_run(output_dir: Path, command: str,
         # wholesale. Lock ordering: project op lock (above) before the
         # metadata lock — no path takes them in the other order.
         _gate.enter_context(_metadata_lock(output_dir / RUN_METADATA_FILE))
+        _legacy_backstop = _load_meta(output_dir / RUN_METADATA_FILE)
+        if (
+            isinstance(_legacy_backstop, dict)
+            and _metadata_contains_reserved_input(_legacy_backstop)
+        ):
+            raise _receipt_error(
+                RunReceiptReason.RECEIPT_DOWNGRADE_FORBIDDEN,
+                operation="start",
+            )
 
         # Seal the provenance manifest NOW, before any analysis runs. The
         # source-control snapshot in particular must be taken here — the tree
@@ -1186,10 +3611,18 @@ def start_run(output_dir: Path, command: str,
             )
         )
         if _prior_owner_live:
-            for _k in ("session_pid", "tool_pid", "tool_pid_start",
-                       "session_start", "session_boot_id",
-                       "session_pidns", "session_machine_id",
-                       "session_id"):
+            from core.startup.host import RUN_HOST_KEYS
+            for _k in (
+                "session_pid",
+                "tool_pid",
+                "tool_pid_start",
+                "session_start",
+                "session_boot_id",
+                "session_pidns",
+                "session_machine_id",
+                "session_id",
+                *RUN_HOST_KEYS,
+            ):
                 if _k in _prior_meta:
                     metadata[_k] = _prior_meta[_k]
                 else:
@@ -1408,7 +3841,8 @@ def _cleanup_abandoned(project_dir: Path, command: str, session_pid: int) -> Non
       worker-liveness gate keeps long-lived parallel runs of the same
       command in the same session from being false-failed.
     - Owning session DEAD — the recorded session_pid no longer maps to
-      a live claude process (session SIGKILL'd, machine rebooted, or
+      a live verified frontend/legacy Claude process (session SIGKILL'd,
+      machine rebooted, or
       PID recycled by something else). No live owner means no lifecycle
       hook will ever finalize the run: without this branch such runs
       sat in status=running forever, regardless of command type. The
@@ -1452,6 +3886,8 @@ def _cleanup_abandoned(project_dir: Path, command: str, session_pid: int) -> Non
         if not isinstance(meta, dict) or not meta:
             # Corrupt or non-object metadata (torn write, hostile or
             # malformed run dir): not sweepable — never crash the sweep.
+            continue
+        if _metadata_contains_reserved_input(meta):
             continue
         if meta.get("status") != STATUS_RUNNING:
             continue
@@ -1993,6 +4429,33 @@ def ensure_run_command(output_dir: Path,
         raise RunOwnershipError(msg)
 
 
+def _ensure_receipt_transition_allowed(
+    output_dir: Path,
+    *,
+    operation: str,
+    extra: object = None,
+    manifest: object = None,
+) -> None:
+    _reject_reserved_mapping(extra, operation=operation)
+    _reject_reserved_mapping(manifest, operation=operation)
+    path = Path(output_dir) / RUN_METADATA_FILE
+    if not _metadata_file_has_receipt_state(path):
+        return
+    strict = _strict_load_run_metadata(
+        path,
+        operation=operation,
+        missing_ok=True,
+    )
+    if strict is None:
+        return
+    _reject_reserved_mapping(strict.value.get("extra"), operation=operation)
+    if not _metadata_allows_legacy_attribution(strict.value):
+        raise _receipt_error(
+            RunReceiptReason.TERMINAL_TRANSITION_FORBIDDEN,
+            operation=operation,
+        )
+
+
 def complete_run(output_dir: Path, extra: dict[str, Any] | None = None,
                  manifest: dict[str, Any] | None = None,
                  expected_command: str | None = None) -> None:
@@ -2013,6 +4476,12 @@ def complete_run(output_dir: Path, extra: dict[str, Any] | None = None,
     triage finalisers so a refused completion leaves no side effects
     in the foreign run directory.
     """
+    _ensure_receipt_transition_allowed(
+        output_dir,
+        operation="complete",
+        extra=extra,
+        manifest=manifest,
+    )
     ensure_run_command(output_dir, expected_command)
     _finalize_sandbox_summary(output_dir)
     _triage_verdict = _finalize_sandbox_triage(output_dir)
@@ -2200,6 +4669,11 @@ def project_run_projections(output_dir: Path,
     except Exception:  # noqa: BLE001 — predicate is an aid, never a crash
         logger.debug("imported-run check failed for %s",
                      output_dir, exc_info=True)
+
+    _ensure_receipt_transition_allowed(
+        output_dir,
+        operation="project_run_projections",
+    )
     _merge_run_journal(output_dir, project_dir=project_dir)
     _convert_reads_manifest(output_dir)
     _snapshot_run_coverage(output_dir, project_dir=project_dir)
@@ -2522,6 +4996,11 @@ def fail_run(output_dir: Path, error: str | None = None,
     fail runs they did not start (dead-session abandons, lifecycle
     hooks) simply make no claim.
     """
+    _ensure_receipt_transition_allowed(
+        output_dir,
+        operation="fail",
+        extra=extra,
+    )
     ensure_run_command(output_dir, expected_command)
     if _already_terminal(output_dir, "fail_run", allow_refail=True,
                          incoming_extra=extra):
@@ -2552,6 +5031,11 @@ def cancel_run(output_dir: Path, extra: dict[str, Any] | None = None,
     ``expected_command`` (optional) asserts ownership — see
     :func:`ensure_run_command`.
     """
+    _ensure_receipt_transition_allowed(
+        output_dir,
+        operation="cancel",
+        extra=extra,
+    )
     ensure_run_command(output_dir, expected_command)
     if _already_terminal(output_dir, "cancel_run", incoming_extra=extra):
         return
@@ -2579,6 +5063,11 @@ def interrupt_run(output_dir: Path, reason: str | None = None,
     ``expected_command`` (optional) asserts ownership — see
     :func:`ensure_run_command`.
     """
+    _ensure_receipt_transition_allowed(
+        output_dir,
+        operation="interrupt",
+        extra=extra,
+    )
     ensure_run_command(output_dir, expected_command)
     if _already_terminal(output_dir, "interrupt_run", incoming_extra=extra):
         return
@@ -2625,6 +5114,10 @@ def resume_run(output_dir: Path, note: str | None = None) -> int:
     ValueError when the status is not resumable (notably
     ``completed``).
     """
+    output_dir = Path(output_dir)
+    if _receipt_branch_selected(output_dir / RUN_METADATA_FILE):
+        return _resume_receipt_run(output_dir, note)
+
     path = Path(output_dir) / RUN_METADATA_FILE
     with _metadata_lock(path):
         metadata = _load_meta(path)
@@ -2639,6 +5132,11 @@ def resume_run(output_dir: Path, note: str | None = None) -> int:
                 "expected JSON object"
             )
             raise ValueError(msg)  # noqa: TRY004
+        if _metadata_contains_reserved_input(metadata):
+            raise _receipt_error(
+                RunReceiptReason.RECEIPT_DOWNGRADE_FORBIDDEN,
+                operation="resume",
+            )
         current = metadata.get("status")
         if current not in RESUMABLE_STATUSES:
             msg = (
@@ -2686,9 +5184,15 @@ def resume_run(output_dir: Path, note: str | None = None) -> int:
             # run owned by a different session must never carry the old
             # session's stamp (the verifiers would judge the live
             # resumed run abandoned: stamp != live process at new pid).
-            for key in ("session_start", "session_boot_id",
-                        "session_pidns", "session_machine_id",
-                        "session_id"):
+            from core.startup.host import RUN_HOST_KEYS
+            for key in (
+                "session_start",
+                "session_boot_id",
+                "session_pidns",
+                "session_machine_id",
+                "session_id",
+                *RUN_HOST_KEYS,
+            ):
                 metadata.pop(key, None)
             metadata.update(_session_stamp(session_pid))
             resumed_sid = _harness_session_id()
@@ -2702,9 +5206,15 @@ def resume_run(output_dir: Path, note: str | None = None) -> int:
             # the honest owner record; the refreshed worker stamp
             # above carries the in-flight signal instead.
             metadata.pop("session_pid", None)
-            for key in ("session_start", "session_boot_id",
-                        "session_pidns", "session_machine_id",
-                        "session_id"):
+            from core.startup.host import RUN_HOST_KEYS
+            for key in (
+                "session_start",
+                "session_boot_id",
+                "session_pidns",
+                "session_machine_id",
+                "session_id",
+                *RUN_HOST_KEYS,
+            ):
                 metadata.pop(key, None)
         save_json(path, metadata)
     # Re-mark as the active run so sandbox summaries and coverage
@@ -2810,6 +5320,10 @@ def reopen_run(output_dir: Path, note: str | None = None) -> None:
     Raises FileNotFoundError when there is no metadata file and
     ValueError when the current status is not ``completed``.
     """
+    _ensure_receipt_transition_allowed(
+        output_dir,
+        operation="reopen",
+    )
     path = Path(output_dir) / RUN_METADATA_FILE
     with _metadata_lock(path):
         metadata = _load_meta(path)
@@ -2822,6 +5336,12 @@ def reopen_run(output_dir: Path, note: str | None = None) -> None:
                 "expected JSON object"
             )
             raise ValueError(msg)  # noqa: TRY004 — malformed on-disk data
+        _reject_reserved_mapping(metadata.get("extra"), operation="reopen")
+        if not _metadata_allows_legacy_attribution(metadata):
+            raise _receipt_error(
+                RunReceiptReason.TERMINAL_TRANSITION_FORBIDDEN,
+                operation="reopen",
+            )
         current = metadata.get("status")
         if current != STATUS_COMPLETED:
             msg = f"reopen_run: expected status 'completed', got {current!r}"
@@ -3052,6 +5572,12 @@ def write_run_pin(run_dir: Path, project: str | None, source: str) -> None:
         meta = _load_meta(path)
         if not isinstance(meta, dict):
             meta = {}
+        _reject_reserved_mapping(meta.get("extra"), operation="write_run_pin")
+        if not _metadata_allows_legacy_attribution(meta):
+            raise _receipt_error(
+                RunReceiptReason.PIN_REWRITE_FORBIDDEN,
+                operation="write_run_pin",
+            )
         if (meta.get("status") == STATUS_RUNNING
                 and _session_alive_for_meta(meta)):
             msg = (f"refusing to re-pin {run_dir}: the run is live "
@@ -3098,6 +5624,8 @@ def _update_status(output_dir: Path, status: str,
     concurrent writers (parallel workers, a sweep racing a completion)
     serialise instead of last-writer-wins dropping each other's updates.
     """
+    _reject_reserved_mapping(extra, operation="status")
+    _reject_reserved_mapping(manifest, operation="status")
     path = Path(output_dir) / RUN_METADATA_FILE
     with _metadata_lock(path):
         metadata = _load_meta(path)
@@ -3119,6 +5647,12 @@ def _update_status(output_dir: Path, status: str,
             # exception type callers already handle.
             msg = f"Malformed {RUN_METADATA_FILE} in {output_dir} — expected JSON object"
             raise ValueError(msg)  # noqa: TRY004
+        _reject_reserved_mapping(metadata.get("extra"), operation="status")
+        if not _metadata_allows_legacy_attribution(metadata):
+            raise _receipt_error(
+                RunReceiptReason.TERMINAL_TRANSITION_FORBIDDEN,
+                operation="status",
+            )
         current = metadata.get("status")
         incoming_marks = _heuristic_marks(extra)
         if current in _TERMINAL_STATUSES and incoming_marks:

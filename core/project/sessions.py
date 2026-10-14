@@ -78,16 +78,18 @@ from __future__ import annotations
 import contextlib
 import errno
 import functools
+import hashlib
 import logging
 import os
 import re
 import secrets
 import stat
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterator
+from typing import TYPE_CHECKING, Iterator, Literal
 
 from core.startup.host import (
     SESSION_HOST_KEYS,
@@ -276,6 +278,82 @@ class _SessionReceiptEntry:
     host: SessionHostClaim
     token_hex: str
     raw: bytes
+
+
+class SessionHostV2CredentialState(str, Enum):
+    """Whether the caller presents this process's host-v2 credential.
+
+    This is only an env-token discriminator. It exposes no PID, receipt,
+    project binding, or owner and performs no receipt validation.
+    """
+
+    ABSENT = "absent"
+    MATCHING_HOST_V2 = "matching_host_v2"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class SessionRuntimeReceiptCapture:
+    """Operation-scoped, non-authorizing snapshot plus fence witnesses."""
+
+    snapshot: RuntimeReceiptSnapshot
+    session_pid: int
+    reference: ReceiptReference
+    _entry_sha256: bytes = field(repr=False)
+    _sidecar_sha256: bytes = field(repr=False)
+    _host_uid: int = field(repr=False)
+    _host_executable_device: int = field(repr=False)
+    _host_executable_inode: int = field(repr=False)
+    authoritative: Literal[False] = field(default=False, init=False)
+
+    def __post_init__(self) -> None:
+        from core.startup.runtime_receipt.plumbing_types import (
+            ReceiptReference,
+            RuntimeReceiptSnapshot,
+            authority_invariant_failure,
+        )
+
+        if type(self.snapshot) is not RuntimeReceiptSnapshot:
+            raise TypeError("snapshot must be RuntimeReceiptSnapshot")
+        if type(self.reference) is not ReceiptReference:
+            raise TypeError("reference must be ReceiptReference")
+        if authority_invariant_failure(
+            self.snapshot,
+            RuntimeReceiptSnapshot,
+        ) is not None:
+            raise ValueError("snapshot authority invariant violated")
+        if self.snapshot.reference != self.reference:
+            raise ValueError("capture snapshot and reference disagree")
+        if (
+            type(self.session_pid) is not int
+            or self.session_pid <= 0
+            or self.reference.session_pid.value != self.session_pid
+        ):
+            raise ValueError("capture session pid is invalid")
+        if (
+            type(self._entry_sha256) is not bytes
+            or len(self._entry_sha256) != 32
+            or type(self._sidecar_sha256) is not bytes
+            or len(self._sidecar_sha256) != 32
+        ):
+            raise ValueError("capture fence digest is invalid")
+        if any(
+            type(value) is not int or value < 0
+            for value in (
+                self._host_uid,
+                self._host_executable_device,
+                self._host_executable_inode,
+            )
+        ):
+            raise ValueError("capture host identity is invalid")
+
+    def __repr__(self) -> str:
+        return "SessionRuntimeReceiptCapture(<redacted>)"
+
+    def __reduce__(self):
+        raise TypeError("SessionRuntimeReceiptCapture cannot be pickled")
+
+    def __init_subclass__(cls) -> None:
+        raise TypeError("SessionRuntimeReceiptCapture cannot be subclassed")
 
 
 class _SessionReceiptAbort(Exception):
@@ -695,6 +773,15 @@ def _env_session_record() -> tuple[int, dict[str, str]] | None:
         return pid, fields
     except (ValueError, TypeError, OSError):
         return None
+
+
+def session_host_v2_credential_state() -> SessionHostV2CredentialState:
+    """Classify only a matching-token host-v2 env credential."""
+
+    candidate = _env_session_record()
+    if candidate is not None and _host_v2_marker(candidate[1]):
+        return SessionHostV2CredentialState.MATCHING_HOST_V2
+    return SessionHostV2CredentialState.ABSENT
 
 
 def _owner_for_pid(pid: int) -> SessionOwner | None:
@@ -1957,12 +2044,42 @@ def compare_and_swap_session_receipt(
     return invariant or result
 
 
-def read_current_session_runtime_receipt(
+def _capture_live_receipt_binding(
+    capture: SessionRuntimeReceiptCapture,
+) -> tuple[int, str, int, int] | None:
+    reference = capture.reference
+    pid = capture.session_pid
+    if not _pid_running(pid):
+        return None
+    live_start = proc_starttime(pid)
+    live_boot = boot_id()
+    live_pidns = pidns_id()
+    live_euid = _current_euid()
+    if (
+        live_start is None
+        or live_boot is None
+        or live_pidns is None
+        or live_start != reference.session_starttime_ticks.text
+        or live_boot != reference.boot_id.value
+        or live_pidns != reference.pid_namespace_inode.text
+        or live_euid != reference.launcher_euid.value
+        or _process_uid(pid) != capture._host_uid
+        or _process_executable_identity(pid)
+        != (
+            capture._host_executable_device,
+            capture._host_executable_inode,
+        )
+    ):
+        return None
+    return int(live_start), live_boot, int(live_pidns), live_euid
+
+
+def capture_current_session_runtime_receipt(
     *,
     profiles: ProfileStore,
     now: datetime,
-) -> RuntimeReceiptSnapshot | PlumbingFailure | None:
-    """Read a verified host-v2 receipt without minting session authority."""
+) -> SessionRuntimeReceiptCapture | PlumbingFailure | None:
+    """Capture a verified host-v2 receipt without minting session authority."""
     from core.startup.runtime_receipt.persistence import (
         read_receipt_sidecar,
         read_receipt_sidecar_bytes_for_registry,
@@ -2102,7 +2219,115 @@ def read_current_session_runtime_receipt(
         RuntimeReceiptSnapshot,
         details={"stage": "receipt_read_result"},
     )
-    return invariant or snapshot
+    if invariant is not None:
+        return invariant
+    return SessionRuntimeReceiptCapture(
+        snapshot=snapshot,
+        session_pid=pid,
+        reference=reference,
+        _entry_sha256=hashlib.sha256(before).digest(),
+        _sidecar_sha256=hashlib.sha256(sidecar_raw).digest(),
+        _host_uid=entry.host.uid,
+        _host_executable_device=entry.host.executable_device,
+        _host_executable_inode=entry.host.executable_inode,
+    )
+
+
+def read_current_session_runtime_receipt(
+    *,
+    profiles: ProfileStore,
+    now: datetime,
+) -> RuntimeReceiptSnapshot | PlumbingFailure | None:
+    """Read the matching env credential as a verified non-authorizing snapshot."""
+
+    captured = capture_current_session_runtime_receipt(
+        profiles=profiles,
+        now=now,
+    )
+    if isinstance(captured, SessionRuntimeReceiptCapture):
+        return captured.snapshot
+    return captured
+
+
+@contextlib.contextmanager
+def session_runtime_receipt_fence(
+    capture: SessionRuntimeReceiptCapture,
+) -> Iterator[None]:
+    """Hold the strict session lock while rechecking one trusted capture."""
+    from core.startup.runtime_receipt.persistence import (
+        read_receipt_sidecar_bytes_for_registry,
+    )
+    from core.startup.runtime_receipt.plumbing_types import (
+        PlumbingDisposition,
+        PlumbingFailure,
+        PlumbingReason,
+        plumbing_failure,
+    )
+
+    if type(capture) is not SessionRuntimeReceiptCapture:
+        raise TypeError("capture must be SessionRuntimeReceiptCapture")
+    try:
+        capture.__post_init__()
+    except (TypeError, ValueError):
+        raise _SessionReceiptAbort(
+            plumbing_failure(
+                PlumbingDisposition.INVALID_REQUEST,
+                PlumbingReason.AUTHORITY_INVARIANT_VIOLATION,
+                details={"stage": "receipt_fence_capture"},
+            )
+        )
+    try:
+        with _strict_session_lock(capture.session_pid):
+            observed_entry = _read_session_entry_raw(capture.session_pid)
+            if isinstance(observed_entry, PlumbingFailure):
+                raise _SessionReceiptAbort(observed_entry)
+            if observed_entry is None or not secrets.compare_digest(
+                hashlib.sha256(observed_entry).digest(),
+                capture._entry_sha256,
+            ):
+                raise _SessionReceiptAbort(
+                    plumbing_failure(
+                        PlumbingDisposition.STATE_CONFLICT,
+                        PlumbingReason.SESSION_REPLACED,
+                        details={"stage": "receipt_fence_entry"},
+                    )
+                )
+            if _capture_live_receipt_binding(capture) is None:
+                raise _SessionReceiptAbort(
+                    plumbing_failure(
+                        PlumbingDisposition.BINDING_FAILED,
+                        PlumbingReason.PROCESS_BINDING_MISMATCH,
+                        details={"stage": "receipt_fence_binding"},
+                    )
+                )
+            observed_sidecar = read_receipt_sidecar_bytes_for_registry(
+                _sessions_dir(),
+                capture.reference,
+            )
+            if isinstance(observed_sidecar, PlumbingFailure):
+                raise _SessionReceiptAbort(observed_sidecar)
+            if not secrets.compare_digest(
+                hashlib.sha256(observed_sidecar).digest(),
+                capture._sidecar_sha256,
+            ):
+                raise _SessionReceiptAbort(
+                    plumbing_failure(
+                        PlumbingDisposition.PERSISTENCE_FAILED,
+                        PlumbingReason.SIDECAR_DIGEST_MISMATCH,
+                        details={"stage": "receipt_fence_sidecar"},
+                    )
+                )
+            if _capture_live_receipt_binding(capture) is None:
+                raise _SessionReceiptAbort(
+                    plumbing_failure(
+                        PlumbingDisposition.BINDING_FAILED,
+                        PlumbingReason.PROCESS_BINDING_MISMATCH,
+                        details={"stage": "receipt_fence_binding"},
+                    )
+                )
+            yield
+    except _SessionReceiptAbort:
+        raise
 
 
 def remove_session_receipt(
