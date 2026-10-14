@@ -935,14 +935,14 @@ class TestNegotiatedProtocolTelemetry:
 
     def test_client_emit_sites_carry_http_version(self):
         """Every per-attempt telemetry emit in the LLM client attaches
-        the negotiated protocol (source-level wiring check: 2 ok sites
-        + 2 attempt_failed sites)."""
+        the negotiated protocol (source-level wiring check: 2 ok sites,
+        2 blocked sites, and 2 ordinary attempt_failed sites)."""
         from pathlib import Path
 
         import core.llm.client as client_mod
 
         src = Path(client_mod.__file__).read_text()
-        assert src.count("http_version=_transport_http_version()") == 4
+        assert src.count("http_version=_transport_http_version()") == 6
 
     def test_transport_http_version_helper(self):
         from core.llm.client import _transport_http_version

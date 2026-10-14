@@ -733,6 +733,83 @@ def test_recommend_picks_cheapest_trusted(tmp_path):
     assert "also trusted: sonnet" in out
 
 
+def test_recommend_does_not_rank_zero_cost_as_cheapest(tmp_path):
+    sc = ModelScorecard(tmp_path / "sc.json", shadow_rate=0.0)
+    for _ in range(80):
+        sc.record_event(
+            "codeql:py/sqli",
+            "unpriced",
+            EventType.CHEAP_SHORT_CIRCUIT,
+            "correct",
+        )
+        sc.record_event(
+            "codeql:py/sqli",
+            "priced",
+            EventType.CHEAP_SHORT_CIRCUIT,
+            "correct",
+        )
+    sc.register_uses([
+        {
+            "model": "unpriced",
+            "decision_class": "_usage",
+            "calls": 10,
+            "cost_usd": 0.0,
+        },
+        {
+            "model": "priced",
+            "decision_class": "_usage",
+            "calls": 10,
+            "cost_usd": 1.0,
+        },
+    ])
+
+    rc, out, _ = _capture(
+        cli_mod.cmd_recommend,
+        _make_args(
+            path=tmp_path / "sc.json",
+            decision_class="codeql:py/sqli",
+        ),
+    )
+
+    assert rc == 0
+    assert "use: priced" in out
+
+
+def test_summary_skips_zero_call_unpriced_before_priced(tmp_path):
+    sc = ModelScorecard(tmp_path / "sc.json", shadow_rate=0.0)
+    for model in ("a-unpriced", "z-priced"):
+        for _ in range(80):
+            sc.record_event(
+                "codeql:py/sqli",
+                model,
+                EventType.CHEAP_SHORT_CIRCUIT,
+                "correct",
+            )
+    sc.register_uses([
+        {
+            "model": "a-unpriced",
+            "decision_class": "_usage",
+            "calls": 0,
+            "cost_usd": 0.0,
+        },
+        {
+            "model": "z-priced",
+            "decision_class": "_usage",
+            "calls": 10,
+            "cost_usd": 1.0,
+        },
+    ])
+
+    rc, out, _ = _capture(
+        cli_mod.cmd_summary,
+        _make_args(path=tmp_path / "sc.json"),
+    )
+
+    assert rc == 0
+    assert "lowest legacy estimate among trusted: z-priced" in out
+    assert "a-unpriced @" not in out
+
+
 def test_recommend_no_data_reports_clearly(tmp_path):
     """Unknown decision_class -> clear message, exit 0 (informational, not
     an error to operator scripts)."""
@@ -779,8 +856,7 @@ def test_recommend_freshness_shows_banner(tmp_path):
 
 
 def test_list_shows_cost_column_and_by_cost_sorts(tmp_path):
-    """`list` surfaces per-cell spend in the $$ column, and `--by-cost` ranks
-    by it. The cost data is the universal 'did I get value for money' axis."""
+    """`list` labels v2 cost as a legacy estimate and can sort by it."""
     sc = ModelScorecard(tmp_path / "sc.json")
     sc.register_uses([
         {"model": "haiku", "decision_class": "_usage",
@@ -790,7 +866,7 @@ def test_list_shows_cost_column_and_by_cost_sorts(tmp_path):
     ])
     rc, out, _ = _capture(cli_mod.cmd_list, _make_args(path=tmp_path / "sc.json"))
     assert rc == 0
-    assert "$$" in out                              # the cost column header
+    assert "Estimated USD (legacy; authority unknown)" in out
     assert "$0.40" in out and "$0.05" in out        # both cells render their spend
     # --by-cost ranks sonnet ($0.40) above haiku ($0.05)
     rc2, out2, _ = _capture(
@@ -845,7 +921,8 @@ def test_list_json_emits_parseable_array(tmp_path):
     sample = parsed["cells"][0]
     for required in (
         "decision_class", "model", "policy", "n",
-        "calls", "cost_usd", "max_miss_pct", "last_seen_at",
+        "calls", "cost_usd", "cost_basis", "usd_authority",
+        "max_miss_pct", "last_seen_at",
     ):
         assert required in sample, f"missing {required} in {sample}"
 
@@ -861,6 +938,8 @@ def test_recommend_json_emits_recommendation(tmp_path):
     assert rc == 0
     parsed = _json.loads(out)
     assert parsed["decision_class"] == "codeql:py/sqli"
+    assert parsed["cost_basis"] == "scorecard_legacy"
+    assert parsed["usd_authority"] == "unknown"
     assert parsed["recommendation"]["model"] == "haiku"
     assert any(t["model"] == "haiku" for t in parsed["short_circuit"])
 
@@ -873,8 +952,8 @@ def test_summary_text_dashboard(tmp_path):
         cli_mod.cmd_summary, _make_args(path=tmp_path / "sc.json"))
     assert rc == 0
     assert "cells:" in out and "trusted" in out
-    assert "total spend:" in out
-    assert "cheapest trusted: haiku" in out
+    assert "Estimated USD (legacy; authority unknown):" in out
+    assert "lowest legacy estimate among trusted: haiku" in out
 
 
 def test_summary_json_dashboard(tmp_path):
@@ -888,6 +967,8 @@ def test_summary_json_dashboard(tmp_path):
     parsed = _json.loads(out)
     assert parsed["cells_total"] > 0
     assert parsed["policy_breakdown"]["short_circuit"] >= 1
+    assert parsed["cost_basis"] == "scorecard_legacy"
+    assert parsed["usd_authority"] == "unknown"
     assert parsed["cheapest_short_circuit"]["model"] == "haiku"
 
 
@@ -1044,7 +1125,7 @@ def test_chain_closure_json_emits_recommendation(tmp_path):
 
 
 def test_compare_text_includes_cost_and_calls(tmp_path):
-    """Extended `compare` shows $$ + calls per side, not just reliability."""
+    """Extended `compare` labels legacy estimates and calls per side."""
     _seed_minimal(tmp_path / "sc.json")
     # need a shared decision_class for both models — give sonnet a sql cell too
     sc = ModelScorecard(tmp_path / "sc.json", shadow_rate=0.0)
@@ -1056,7 +1137,8 @@ def test_compare_text_includes_cost_and_calls(tmp_path):
         _make_args(path=tmp_path / "sc.json",
                    model_a="haiku", model_b="sonnet"))
     assert rc == 0
-    assert "haiku $$" in out and "sonnet $$" in out
+    assert "haiku legacy estimate" in out
+    assert "sonnet legacy estimate" in out
     assert "haiku calls" in out and "sonnet calls" in out
 
 

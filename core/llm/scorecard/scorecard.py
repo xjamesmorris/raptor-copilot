@@ -62,6 +62,11 @@ from pathlib import Path
 from typing import Literal
 
 from core.json import save_json
+from core.llm.accounting import (
+    CostBasis,
+    CostObservation,
+    ScorecardAggregationRefused,
+)
 from core.llm.scorecard import integrity
 from core.llm.scorecard.freshness import (
     bucket_key,
@@ -651,6 +656,7 @@ class ModelScorecard:
         auto_gc_after_days: int | None = DEFAULT_AUTO_GC_AFTER_DAYS,
         auto_gc_interval_seconds: float = _AUTO_GC_INTERVAL_SECONDS,
         keep_models: set[str] | None = None,
+        refused_models: set[str] | None = None,
         freshness_half_life_days: float | None = None,
         rng=None,
     ) -> None:
@@ -691,6 +697,9 @@ class ModelScorecard:
         # specific model). Frozen ``set`` for cheap lookups.
         self.keep_models: set[str] = (
             set(keep_models) if keep_models else set()
+        )
+        self.refused_models: frozenset[str] = frozenset(
+            refused_models or (),
         )
         self._rng = rng if rng is not None else random.random
         # Trust state of the most recent locked read (set by
@@ -737,6 +746,7 @@ class ModelScorecard:
         diversity). Omitting it keeps the observation counting toward
         the Wilson math but contributes zero target diversity.
         """
+        self._require_model_key(model)
         self._validate_event(event_type, outcome)
         with self._with_lock() as data:
             self._apply_event(
@@ -762,6 +772,7 @@ class ModelScorecard:
         if not events:
             return
         for ev in events:
+            self._require_model_key(ev.get("model"))
             self._validate_event(ev.get("event_type"), ev.get("outcome"))
             if not ev.get("model") or not ev.get("decision_class"):
                 msg = "record_events: each entry needs model and decision_class"
@@ -934,12 +945,31 @@ class ModelScorecard:
         signature)."""
         if not uses:
             return
+        accepted: list[tuple[dict, str, str]] = []
+        for usage in uses:
+            model = usage.get("model")
+            dc = usage.get("decision_class")
+            if (
+                not isinstance(model, str)
+                or not model
+                or not isinstance(dc, str)
+                or not dc
+            ):
+                continue
+            self._require_model_key(model)
+            basis = self._usage_cost_basis(usage)
+            if basis is CostBasis.PROVIDER_BILLED:
+                raise ScorecardAggregationRefused(
+                    "scorecard v2 cannot store provider_billed usage "
+                    "without losing accounting authority",
+                )
+            if basis in (CostBasis.SUBSCRIPTION, CostBasis.UNKNOWN):
+                continue
+            accepted.append((usage, model, dc))
+        if not accepted:
+            return
         with self._with_lock() as data:
-            for u in uses:
-                model = u.get("model")
-                dc = u.get("decision_class")
-                if not model or not dc:
-                    continue
+            for u, model, dc in accepted:
                 cell = self._ensure_cell(data, model, dc)
                 cell["calls"] = _safe_int(cell.get("calls"), 0) + _safe_int(u.get("calls"), 1)
                 cell["cost_usd"] = _safe_float(cell.get("cost_usd"), 0.0) + _safe_float(u.get("cost_usd"), 0.0)
@@ -1010,6 +1040,8 @@ class ModelScorecard:
         computation entirely (including the diversity gate);
         explicit operator intent beats measured drift.
         """
+        if self.is_model_refused(model):
+            return Policy.LEARNING
         with self._with_lock(write=False) as data:
             cell = self._read_cell(data, model, decision_class)
             # Capture the integrity verdict INSIDE the lock scope:
@@ -1117,7 +1149,9 @@ class ModelScorecard:
             "flipped_in": 0,
         }
         with self._with_lock(write=False) as data:
-            for by_dc in (data.get("models") or {}).values():
+            for model, by_dc in (data.get("models") or {}).items():
+                if self.is_model_refused(model):
+                    continue
                 if not isinstance(by_dc, dict):
                     continue
                 for cell in by_dc.values():
@@ -1180,6 +1214,7 @@ class ModelScorecard:
         if not finding_id:
             msg = "finding_id must be non-empty for idempotency"
             raise ValueError(msg)
+        self._require_model_key(model)
         if outcome not in ("correct", "incorrect"):
             msg = f"outcome must be 'correct' or 'incorrect', got {outcome!r}"
             raise ValueError(msg)
@@ -1264,6 +1299,7 @@ class ModelScorecard:
                 f"force_fall_through, got {policy_override!r}"
             )
             raise ValueError(msg)
+        self._require_model_key(model)
         with self._with_lock() as data:
             cell = self._ensure_cell(data, model, decision_class)
             cell["policy_override"] = policy_override
@@ -1292,6 +1328,8 @@ class ModelScorecard:
                     _warn_malformed_once(
                         self.path, f"non-dict value for model {model!r}")
                     continue
+                if self.is_model_refused(model):
+                    continue
                 for dc, cell in by_dc.items():
                     if not isinstance(cell, dict):
                         _warn_malformed_once(
@@ -1307,6 +1345,8 @@ class ModelScorecard:
         self, decision_class: str, model: str,
     ) -> DecisionClassStats | None:
         """Return one cell's stats, or None if absent."""
+        if self.is_model_refused(model):
+            return None
         with self._with_lock(write=False) as data:
             cell = self._read_cell(data, model, decision_class)
             trusted = self._last_read_trusted
@@ -1315,6 +1355,37 @@ class ModelScorecard:
             return self._cell_to_stats(
                 model, decision_class, cell, trusted=trusted,
             )
+
+    def is_model_refused(self, model: str) -> bool:
+        """Whether v2's model-only key is unsafe for this configured route."""
+        return isinstance(model, str) and model in self.refused_models
+
+    def _require_model_key(self, model: object) -> None:
+        if isinstance(model, str) and self.is_model_refused(model):
+            raise ScorecardAggregationRefused(
+                "model-name-only scorecard aggregation is refused for "
+                f"{model!r}; route-qualified scorecard keys are not "
+                "available in schema v2",
+            )
+
+    @staticmethod
+    def _usage_cost_basis(usage: dict) -> CostBasis | None:
+        observation = usage.get("cost_observation")
+        if observation is not None:
+            if not isinstance(observation, CostObservation):
+                raise TypeError(
+                    "cost_observation must be CostObservation",
+                )
+            return observation.basis
+        raw_basis = usage.get("cost_basis")
+        if raw_basis is None:
+            return None
+        try:
+            return CostBasis(raw_basis)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"invalid scorecard cost_basis: {raw_basis!r}",
+            ) from exc
 
     def reset(
         self,

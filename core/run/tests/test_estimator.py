@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 
+from core.llm.accounting import ModelKeyAggregation, UsdBudgetContract
 from core.run.estimator import (
     RunEstimate,
     estimate_from_scorecard,
@@ -71,10 +72,34 @@ class TestEstimateFromScorecard:
             "test-model", 20, max_parallel=1, scorecard_path=sc_path,
         )
         assert est is not None
-        assert est.source == "scorecard"
+        assert est.source == "scorecard-legacy"
         assert est.cost_low > 0
         assert est.cost_high > est.cost_low
         assert est.time_low > 0
+
+    def test_refused_model_key_returns_no_estimate(self, tmp_path):
+        sc_path = tmp_path / "sc.json"
+        self._write_scorecard(sc_path, "test-model", 100, 10.0, 500000)
+
+        assert estimate_from_scorecard(
+            "test-model",
+            20,
+            scorecard_path=sc_path,
+            model_key_aggregation=ModelKeyAggregation.REFUSE,
+        ) is None
+
+    def test_strict_budget_contract_never_uses_legacy_history(
+        self, tmp_path,
+    ):
+        sc_path = tmp_path / "sc.json"
+        self._write_scorecard(sc_path, "test-model", 100, 10.0, 500000)
+
+        assert estimate_from_scorecard(
+            "test-model",
+            20,
+            scorecard_path=sc_path,
+            usd_budget_contract=UsdBudgetContract.AUTHORITATIVE_REQUIRED,
+        ) is None
 
     def test_parallelism_reduces_time(self, tmp_path):
         sc_path = tmp_path / "sc.json"
@@ -173,10 +198,11 @@ class TestFormatEstimate:
     def test_scorecard_source_renders_model_name(self):
         est = RunEstimate(
             cost_low=2, cost_high=4, time_low=5, time_high=8,
-            target_type="claude-opus-4-7 (scorecard)", source="scorecard",
+            target_type="claude-opus-4-7 (scorecard)",
+            source="scorecard-legacy",
         )
         s = format_estimate(est)
-        assert "from scorecard" in s
+        assert "legacy scorecard estimate; authority unknown" in s
         assert "claude-opus-4-7" in s
 
     def test_collapsed_range_renders_single_value(self):
@@ -185,7 +211,10 @@ class TestFormatEstimate:
             target_type="test-model (scorecard)",
         )
         s = format_estimate(est)
-        assert s == "Expected: $30, 60 min (test-model, from scorecard)"
+        assert s == (
+            "Expected: $30, 60 min "
+            "(test-model, legacy scorecard estimate; authority unknown)"
+        )
 
     def test_cost_only_renders_without_time(self):
         est = RunEstimate(
@@ -193,7 +222,10 @@ class TestFormatEstimate:
             target_type="test-model (scorecard)",
         )
         s = format_estimate(est)
-        assert s == "Expected: $10-$20 (test-model, from scorecard)"
+        assert s == (
+            "Expected: $10-$20 "
+            "(test-model, legacy scorecard estimate; authority unknown)"
+        )
 
     def test_time_only_renders_without_cost(self):
         est = RunEstimate(
@@ -201,7 +233,10 @@ class TestFormatEstimate:
             target_type="test-model (scorecard)",
         )
         s = format_estimate(est)
-        assert s == "Expected: 15-30 min (test-model, from scorecard)"
+        assert s == (
+            "Expected: 15-30 min "
+            "(test-model, legacy scorecard estimate; authority unknown)"
+        )
 
     def test_both_zero_returns_empty_string(self):
         est = RunEstimate(

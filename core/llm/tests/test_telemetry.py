@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from core.llm import telemetry
+from core.llm.accounting import CostBasis
 from core.llm.client import LLMClient
 from core.llm.config import LLMConfig, ModelConfig
 from core.llm.telemetry import TelemetrySink, emit, set_sink
@@ -160,6 +161,145 @@ class TestSink:
         assert sink.total_records == 1
         assert telemetry.current_sink() is sink
 
+    def test_unknown_and_subscription_calls_do_not_dilute_cost_mean(
+        self, tmp_path,
+    ):
+        sink = TelemetrySink(tmp_path / "t.jsonl")
+        sink.record({
+            "event": "call",
+            "call_class": "review",
+            "cost_usd": 2.0,
+            "cost_basis": CostBasis.CATALOG_PRICED.value,
+        })
+        sink.record({
+            "event": "call",
+            "call_class": "review",
+            "cost_usd": 0.0,
+            "cost_basis": CostBasis.UNKNOWN.value,
+        })
+        sink.record({
+            "event": "call",
+            "call_class": "review",
+            "cost_usd": 0.0,
+            "cost_basis": CostBasis.SUBSCRIPTION.value,
+        })
+
+        assert sink.mean_call_cost("review") == 2.0
+        assert sink.class_costs()["review"] == (1, 2.0)
+        summary = sink.accounting_summary()
+        assert summary.catalog_priced_calls == 1
+        assert summary.unknown_calls == 1
+        assert summary.subscription_calls == 1
+        assert summary.usd_total_complete is False
+        assert (
+            "Estimated USD $2.00 (catalog v"
+        ) in sink.summary_line()
+        assert (
+            "— incomplete "
+            "(1 unknown, 1 subscription calls)"
+        ) in sink.summary_line()
+
+    def test_explicit_provider_billed_zero_is_a_priced_call(
+        self, tmp_path,
+    ):
+        sink = TelemetrySink(tmp_path / "t.jsonl")
+        sink.record({
+            "event": "call",
+            "call_class": "review",
+            "cost_usd": 0.0,
+            "cost_basis": CostBasis.PROVIDER_BILLED.value,
+        })
+
+        assert sink.mean_call_cost("review") == 0.0
+        summary = sink.accounting_summary()
+        assert summary.provider_billed_calls == 1
+        assert summary.provider_billed_usd == 0.0
+
+    def test_unknown_failed_attempt_is_reported_without_finite_bound(
+        self, tmp_path,
+    ):
+        sink = TelemetrySink(tmp_path / "t.jsonl")
+        sink.record({
+            "event": "attempt_failed",
+            "call_class": "review",
+            "cost_basis": CostBasis.UNKNOWN.value,
+            "retained_reservation_estimate_usd": 0.25,
+            "exposure_unresolved": True,
+        })
+
+        summary = sink.accounting_summary()
+        assert summary.unknown_failed_attempts == 1
+        assert summary.exposure_unresolved is True
+        assert summary.authoritative_remaining_usd is None
+        assert summary.retained_reservation_estimate_usd == 0.25
+        assert "actual unknown" in sink.summary_line()
+
+    @pytest.mark.parametrize("bad_cost", [float("nan"), -1.0])
+    def test_malformed_cost_does_not_poison_aggregates(
+        self, tmp_path, bad_cost,
+    ):
+        sink = TelemetrySink(tmp_path / "t.jsonl")
+        sink.record({
+            "event": "call",
+            "call_class": "review",
+            "cost_usd": bad_cost,
+            "cost_basis": CostBasis.CATALOG_PRICED.value,
+        })
+
+        assert sink.mean_call_cost("review") is None
+        summary = sink.accounting_summary()
+        assert summary.unknown_calls == 1
+        assert summary.usd_total_complete is False
+
+    def test_catalog_version_and_cli_records_reconstruct_by_basis(
+        self, tmp_path,
+    ):
+        sink = TelemetrySink(tmp_path / "t.jsonl")
+        sink.record({
+            "event": "call",
+            "call_class": "review",
+            "cost_usd": 1.25,
+            "cost_basis": CostBasis.CATALOG_PRICED.value,
+            "catalog_version": "catalog-test-v1",
+        })
+        sink.record({
+            "event": "call",
+            "call_class": "review",
+            "cost_usd": 0.75,
+            "cost_basis": CostBasis.CLI_REPORTED.value,
+        })
+
+        summary = sink.accounting_summary()
+        assert summary.catalog_priced_calls == 1
+        assert summary.cli_reported_calls == 1
+        assert sink.total_cost_usd() == pytest.approx(2.0)
+        assert sink.class_costs()["review"] == (2, 2.0)
+        catalog = sink._record_observation({
+            "cost_usd": 1.25,
+            "cost_basis": CostBasis.CATALOG_PRICED.value,
+            "catalog_version": "catalog-test-v1",
+        })
+        assert catalog.catalog_version == "catalog-test-v1"
+
+    def test_priced_failed_attempt_updates_accounting_and_legacy_total(
+        self, tmp_path,
+    ):
+        sink = TelemetrySink(tmp_path / "t.jsonl")
+        sink.record({
+            "event": "attempt_failed",
+            "call_class": "review",
+            "disposition": "error",
+            "cost_usd": 0.4,
+            "cost_basis": CostBasis.CATALOG_PRICED.value,
+            "catalog_version": "catalog-test-v1",
+        })
+
+        summary = sink.accounting_summary()
+        assert summary.catalog_priced_calls == 1
+        assert summary.catalog_priced_usd == pytest.approx(0.4)
+        assert summary.unknown_failed_attempts == 0
+        assert sink.total_cost_usd() == pytest.approx(0.4)
+
 
 def _model(provider: str, name: str) -> ModelConfig:
     return ModelConfig(provider=provider, model_name=name, api_key="k")
@@ -204,6 +344,8 @@ class TestClientEmission:
         assert rec["disposition"] == "ok"
         assert rec["call_class"] == "audit"  # defaults to task_type
         assert rec["cost_usd"] == 0.05
+        assert rec["cost_basis"] == CostBasis.CONFIGURED_RATE.value
+        assert rec["estimated_usd"] == 0.05
         assert rec["tokens_in"] == 100
         assert rec["cache_read_tokens"] == 900
 
@@ -245,7 +387,11 @@ class TestClientEmission:
         assert len(recs) == 2
         assert all(r["event"] == "attempt_failed" for r in recs)
         assert all(r["disposition"] == "timeout" for r in recs)
+        assert all(
+            r["cost_basis"] == CostBasis.UNKNOWN.value for r in recs
+        )
         assert [r["attempt"] for r in recs] == [1, 2]
+        assert sink.accounting_summary().unknown_failed_attempts == 2
 
     def test_model_refusal_emits_blocked_disposition_no_retry(
         self, tmp_path, monkeypatch,

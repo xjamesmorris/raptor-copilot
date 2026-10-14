@@ -23,6 +23,7 @@ import pytest
 # checks happen here (module level) so collection doesn't fail.
 pytest.importorskip("anthropic")
 
+from core.llm.accounting import CostBasis
 from core.llm.config import ModelConfig
 from core.llm.providers import AnthropicProvider
 from core.llm.tool_use import (
@@ -331,6 +332,8 @@ def test_response_text_block_normalises_to_textblock() -> None:
     assert out.stop_reason is StopReason.COMPLETE
     assert out.input_tokens == 10
     assert out.output_tokens == 5
+    assert out.cost_observation.basis is CostBasis.CATALOG_PRICED
+    assert out.cost_observation.estimated_usd is not None
 
 
 def test_response_tool_use_block_normalises_to_toolcall() -> None:
@@ -543,6 +546,7 @@ def test_api_error_returns_error_stop_reason() -> None:
     )
     assert out.stop_reason is StopReason.ERROR
     assert out.content == []
+    assert out.cost_observation.basis is CostBasis.UNKNOWN
     assert out.error_message is not None
     assert "Connection error" in out.error_message or "APIConnectionError" in out.error_message or "error after" in out.error_message
 

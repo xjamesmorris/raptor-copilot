@@ -22,12 +22,32 @@ import sys
 import threading
 import time
 from collections import OrderedDict
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
 from core.hash import sha256_string
 from core.logging import get_logger
 
+from .accounting import (
+    AccountingCapability,
+    AccountingMode,
+    AccountingSummary,
+    AttemptLedger,
+    CostBasis,
+    CostObservation,
+    LLMAccountingUnavailableError,
+    LLMHardLimitUnsupportedError,
+    LLMPolicyError,
+    ModelKeyAggregation,
+    PinnedRouteSnapshot,
+    RouteIdentity,
+    UsdBudgetContract,
+    cost_observation_from_exception,
+    is_basis_authorized,
+    is_observation_authorized,
+    model_key_aggregation_for_config,
+)
 from .config import LLMConfig, ModelConfig
 from .providers import LLMProvider, LLMResponse, StructuredResponse, create_provider
 from .response_validation import SchemaUnknownFieldError, unknown_response_fields
@@ -122,6 +142,14 @@ _OLLAMA_PRECISION_WARNING = (
     "Local model — exploit-PoC reliability varies by model "
     "size/quantization; see /scorecard"
 )
+
+# Cache identity v1 was implicit and provider-less: the key covered the
+# requested model, prompt, system prompt, schema (structured calls), and
+# generation kwargs. v2 adds the canonical routing provider and records the
+# requested route in the MAC-covered entry. Old filenames therefore miss, and
+# an old entry copied into a v2 slot is still rejected as legacy rather than
+# being reinterpreted as route-qualified.
+_CACHE_IDENTITY_VERSION = 2
 
 # Floor for the per-call budget reservation. Acquired before each
 # provider call to close the check-then-act window that lets concurrent
@@ -540,6 +568,9 @@ def _atexit_flush_scorecards() -> None:
         "calls": 0, "cost_usd": 0.0, "stub_cost_usd": 0.0,
         "latency_ms_sum": 0, "models": {},
         "paid_test_ctxs": set(),
+        "scorecard_skipped_unpriced_calls": 0,
+        "scorecard_refused_models": set(),
+        "scorecard_refused_provider_billed_models": set(),
     }
     for client in clients:
         try:
@@ -585,6 +616,9 @@ def _flush_all_scorecards() -> None:
         "calls": 0, "cost_usd": 0.0, "stub_cost_usd": 0.0,
         "latency_ms_sum": 0, "models": {},
         "paid_test_ctxs": set(),
+        "scorecard_skipped_unpriced_calls": 0,
+        "scorecard_refused_models": set(),
+        "scorecard_refused_provider_billed_models": set(),
     }
     flushed_any = False
     for client in clients:
@@ -611,6 +645,15 @@ def _flush_all_scorecards() -> None:
                 total["models"].get(alias, 0) + int(calls or 0)
             )
         total["paid_test_ctxs"].update(stats.get("paid_test_ctxs") or ())
+        total["scorecard_skipped_unpriced_calls"] += int(
+            stats.get("scorecard_skipped_unpriced_calls") or 0,
+        )
+        total["scorecard_refused_models"].update(
+            stats.get("scorecard_refused_models") or (),
+        )
+        total["scorecard_refused_provider_billed_models"].update(
+            stats.get("scorecard_refused_provider_billed_models") or (),
+        )
     if flushed_any:
         _print_scorecard_summary(total)
 
@@ -663,7 +706,36 @@ def _print_scorecard_summary(stats: dict[str, Any]) -> None:
         # zeros on larger numbers (``$3.4900``) read as
         # mild noise but the consistent shape wins for
         # log-grepping across runs.
-        cost_s = f"${tot_cost:.4f}"
+        cost_s = (
+            f"Estimated USD ${tot_cost:.4f} "
+            "(legacy; authority unknown)"
+        )
+        skipped_unpriced = int(
+            stats.get("scorecard_skipped_unpriced_calls") or 0,
+        )
+        if skipped_unpriced:
+            suffix = "" if skipped_unpriced == 1 else "s"
+            cost_s += (
+                f" — incomplete ({skipped_unpriced} unpriced "
+                f"call{suffix} excluded)"
+            )
+        refused_models = sorted(
+            stats.get("scorecard_refused_models") or (),
+        )
+        if refused_models:
+            cost_s += (
+                " — model-key aggregation refused for "
+                + ", ".join(refused_models)
+            )
+        refused_billed = sorted(
+            stats.get("scorecard_refused_provider_billed_models") or (),
+        )
+        if refused_billed:
+            cost_s += (
+                " — provider-billed observations excluded from scorecard "
+                "v2 for "
+                + ", ".join(refused_billed)
+            )
         models_s = ", ".join(
             f"{a} {models[a]}c"
             for a in sorted(models, key=lambda k: -models[k])
@@ -1404,13 +1476,11 @@ def _pinned_llm_config(model_name: str) -> 'LLMConfig':
     substitute a different provider for the one the caller pinned.
 
     Provider inference: explicit ``provider/model`` syntax beats inference;
-    otherwise infer from the model-name prefix (``claude*`` -> anthropic,
-    ``gpt*`` -> openai, anything containing ``gemini`` -> gemini; default
-    anthropic).  When the inferred provider has no credentials configured,
-    returns a bare uncredentialed ``ModelConfig`` — callers that
-    authenticate by other means (e.g. Bedrock with AWS env credentials)
-    can still construct a working request; pure-key-auth callers will
-    hit the same auth error they would have at call time anyway.
+    otherwise known model-name prefixes select their provider. Unknown bare
+    names fail with an explicit-syntax remedy instead of silently becoming
+    Anthropic routes. When the inferred provider has no configured
+    credentials, a bare uncredentialed ``ModelConfig`` is returned so
+    ambient-auth transports can still resolve at dispatch time.
     """
     from dataclasses import replace
 
@@ -1432,8 +1502,12 @@ def _pinned_llm_config(model_name: str) -> 'LLMConfig':
                 f"pinned provider '{model_name}' is not available "
                 f"(backend not installed or not running)"
             )
-        return LLMConfig(primary_model=replace(base, role="code"),
-                         fallback_models=[])
+        return LLMConfig(
+            primary_model=replace(base, role="code"),
+            fallback_models=[],
+            enable_fallback=False,
+            exact_pinned=False,
+        )
 
     if "/" in model_name:
         provider, model_name = model_name.split("/", 1)
@@ -1457,7 +1531,10 @@ def _pinned_llm_config(model_name: str) -> 'LLMConfig':
         resolved = _resolve_shorthand(model_name, configured)
         if resolved is not None:
             model_name = resolved
-        provider = _provider_of(model_name) or "anthropic"
+        provider = _provider_of(model_name)
+        if not provider:
+            from core.security.llm_family import unknown_model_message
+            raise ValueError(unknown_model_message(model_name))
 
     # Credential discovery, in this order:
     #   1. env-var-based provider builder (covers the common case)
@@ -1507,7 +1584,7 @@ def _pinned_llm_config(model_name: str) -> 'LLMConfig':
         )
         primary = replace(base, model_name=model_name, role="code",
                           max_tokens=pinned_max)
-    return LLMConfig(primary_model=primary, fallback_models=[])
+    return LLMConfig.for_pinned_model(primary)
 
 
 class _KeyLockHandle:
@@ -1548,7 +1625,7 @@ class LLMClient:
     # by _record_usage / _record_schema_validity).
     _fired_usage: dict[str, dict[str, Any]]
     _paid_test_ctxs: set[str]
-    _fired_schema: dict[str, dict[str, int]]
+    _fired_schema: dict[str, dict[str, Any]]
 
     # Transcript-seam construction marker. A PLAIN client constructed
     # while a RAPTOR_LLM_TRANSCRIPT session is active bypasses the
@@ -1561,8 +1638,13 @@ class LLMClient:
     # or core.llm.factory.get_client.
     _transcript_seam_construction: bool = False
 
-    def __init__(self, config: LLMConfig | None = None,
-                 *, pinned_model: str | None = None) -> None:
+    def __init__(
+        self,
+        config: LLMConfig | None = None,
+        *,
+        pinned_model: str | None = None,
+        pinned_config: ModelConfig | None = None,
+    ) -> None:
         """Construct the LLM client.
 
         When ``pinned_model`` is set the caller commits to overriding the
@@ -1574,8 +1656,12 @@ class LLMClient:
         ignored them and logged a misleading "Primary model:
         gemini-2.5-pro" banner; this skips the resolution at the source.
 
-        ``config`` takes precedence over ``pinned_model`` when both are
-        passed (caller knows what they want).
+        ``pinned_config`` is the strict path: it is mutually exclusive
+        with the legacy arguments and freezes the route fields for
+        re-validation at every dispatch/cache chokepoint.
+
+        ``config`` keeps its historical precedence over ``pinned_model``
+        when both are passed.
         """
         # Transcript honesty fence FIRST — before any construction
         # side effect (egress proxy bring-up, transport banners): a
@@ -1592,13 +1678,37 @@ class LLMClient:
             caller = sys._getframe(1).f_globals.get("__name__", "<unknown>")
             fence_bare_client_construction(caller)
 
-        if config is not None:
+        if pinned_config is not None and (
+            config is not None or pinned_model is not None
+        ):
+            raise ValueError(
+                "pinned_config is mutually exclusive with config and "
+                "pinned_model",
+            )
+        if pinned_config is not None:
+            self.config = LLMConfig.for_pinned_model(pinned_config)
+        elif config is not None:
             self.config = config
         elif pinned_model is not None:
             self.config = _pinned_llm_config(pinned_model)
         else:
             self.config = LLMConfig()
-        self._pinned_model = pinned_model
+        exact_pinned = bool(getattr(self.config, "exact_pinned", False))
+        primary = self.config.primary_model
+        self._pinned_snapshot = (
+            PinnedRouteSnapshot.from_model_config(primary)
+            if exact_pinned and primary is not None
+            else None
+        )
+        self._pinned_model = (
+            pinned_model
+            if pinned_model is not None
+            else (
+                f"{primary.provider}/{primary.model_name}"
+                if pinned_config is not None and primary is not None
+                else None
+            )
+        )
         self.providers: dict[str, LLMProvider] = {}
         self.total_cost = 0.0
         self.request_count = 0
@@ -1612,6 +1722,7 @@ class LLMClient:
         self._run_start: float | None = None
         self._governed_calls = 0
         self._governed_tokens = 0
+        self.cache_bypassed_pinned = 0
         # Entries whose provenance token was PRESENT but invalid — a
         # genuine tamper signal (only editing a stamped entry produces
         # it; legacy/unstamped entries miss silently). Surfaced in
@@ -1641,6 +1752,11 @@ class LLMClient:
         # actually cost instead of a token $0.10. Guarded by
         # _stats_lock.
         self._call_cost_history: dict[str, tuple[int, float]] = {}
+        self._accounting_summary = AccountingSummary()
+        self._accounting_authority_complete = True
+        self._accounting_terminal_error: (
+            LLMAccountingUnavailableError | None
+        ) = None
         # First budget-exceeded refusal logs at INFO (a designed
         # stop, not a failure); the rest at DEBUG. Every post-
         # exhaustion dispatch attempt hits the budget check, so an
@@ -1830,13 +1946,45 @@ class LLMClient:
         Provider construction is cheap (no network) so holding the
         lock across `create_provider` is fine.
         """
+        self._validate_pinned_route(model_config)
         key = f"{model_config.provider}:{model_config.model_name}"
 
         with self._stats_lock:
             if key not in self.providers:
                 logger.debug("Creating provider: %s", key)
                 self.providers[key] = create_provider(model_config)
-            return self.providers[key]
+            provider = self.providers[key]
+            pinned_snapshot = getattr(self, "_pinned_snapshot", None)
+            if pinned_snapshot is not None:
+                provider._raptor_pinned_route_snapshot = (  # type: ignore[attr-defined]
+                    pinned_snapshot
+                )
+            return provider
+
+    def _validate_pinned_route(self, model_config: ModelConfig) -> None:
+        """Reject any mutation or override of an exact pinned route."""
+        snapshot = getattr(self, "_pinned_snapshot", None)
+        if snapshot is None:
+            return
+        from core.llm.accounting import (
+            PinnedRouteSnapshot,
+            PinnedRouteViolation,
+        )
+        current_primary = self.config.primary_model
+        current_snapshot = (
+            PinnedRouteSnapshot.from_model_config(current_primary)
+            if current_primary is not None
+            else None
+        )
+        effective_snapshot = PinnedRouteSnapshot.from_model_config(
+            model_config,
+        )
+        if current_snapshot != snapshot or effective_snapshot != snapshot:
+            raise PinnedRouteViolation(
+                "Pinned route violation: expected "
+                f"{snapshot.provider}/{snapshot.model}; effective route "
+                "or configuration changed",
+            )
 
     @property
     def primary_provider(self) -> LLMProvider:
@@ -1860,15 +2008,33 @@ class LLMClient:
                 "available, instead of constructing LLMClient directly."
             )
             raise RuntimeError(msg)
+        self._validate_pinned_route(self.config.primary_model)
         return self._get_provider(self.config.primary_model)
 
     @property
     def model_name(self) -> str:
         """Primary model name, or ``""`` when unknown."""
-        if self._pinned_model:
-            return self._pinned_model
         pm = self.config.primary_model
         return pm.model_name if pm else ""
+
+    def _scorecard_refused_models(self) -> set[str]:
+        """Model aliases unsafe for the scorecard v2 model-only key."""
+        configured = self.config._configured_models()
+        snapshots_by_model: dict[str, set[PinnedRouteSnapshot]] = {}
+        refused: set[str] = set()
+        for model in configured:
+            snapshots_by_model.setdefault(model.model_name, set()).add(
+                PinnedRouteSnapshot.from_model_config(model),
+            )
+            if (
+                model_key_aggregation_for_config(model)
+                is not ModelKeyAggregation.LEGACY_MODEL_NAME
+            ):
+                refused.add(model.model_name)
+        for model_name, routes in snapshots_by_model.items():
+            if len(routes) > 1:
+                refused.add(model_name)
+        return refused
 
     @property
     def recommended_max_workers(self) -> int:
@@ -1910,6 +2076,7 @@ class LLMClient:
                 retain_samples=self.config.scorecard_retain_samples,
                 shadow_rate=self.config.scorecard_shadow_rate,
                 keep_models=keep_models or None,
+                refused_models=self._scorecard_refused_models(),
                 freshness_half_life_days=self.config.scorecard_freshness_half_life_days,
             )
         return self._scorecard
@@ -2005,6 +2172,25 @@ class LLMClient:
             else:
                 refs.pop(cache_key, None)
 
+    def _cache_access_for_call(
+        self,
+        cache_key: str,
+    ) -> tuple[Any, bool]:
+        """Return a cache context and whether shared I/O is allowed.
+
+        Exact pins include route fields the logical provider/model cache
+        cannot attest. The immutable snapshot therefore disables both shared
+        reads and writes for the client's lifetime. Legacy provider-only pins
+        have no snapshot and retain the ordinary shared-cache behavior.
+        """
+        if getattr(self, "_pinned_snapshot", None) is None:
+            return self._key_lock(cache_key), True
+        with self._stats_lock:
+            self.cache_bypassed_pinned = (
+                getattr(self, "cache_bypassed_pinned", 0) + 1
+            )
+        return nullcontext(), False
+
     @staticmethod
     def _kwargs_for_cache_key(kwargs: dict[str, Any] | None) -> str:
         """Canonicalise generation kwargs (temperature, max_tokens, …)
@@ -2056,6 +2242,7 @@ class LLMClient:
         self, alias: str, *, cost: float = 0.0, tokens: int = 0,
         input_tokens: int = 0, output_tokens: int = 0,
         duration_s: float = 0.0,
+        cost_observation: CostObservation | None = None,
     ) -> None:
         """Accumulate per-alias cost / tokens / latency for the run-end flush
         into the scorecard. Cheap dict update under ``_stats_lock`` — zero new
@@ -2071,6 +2258,14 @@ class LLMClient:
                     "cost_usd": 0.0, "tokens": 0,
                     "input_tokens": 0, "output_tokens": 0,
                     "latency_ms_sum": 0, "latency_ms_max": 0,
+                    "scorecard_calls": 0,
+                    "scorecard_cost_usd": 0.0,
+                    "scorecard_tokens": 0,
+                    "scorecard_input_tokens": 0,
+                    "scorecard_output_tokens": 0,
+                    "scorecard_latency_ms_sum": 0,
+                    "scorecard_latency_ms_max": 0,
+                    "scorecard_cost_bases": set(),
                 })
                 # sanitize_cost: a NaN here survives into the scorecard
                 # flush and poisons every aggregate it joins.
@@ -2081,6 +2276,30 @@ class LLMClient:
                 cur["output_tokens"] += int(output_tokens or 0)
                 cur["latency_ms_sum"] += ms
                 cur["latency_ms_max"] = max(cur["latency_ms_max"], ms)
+                basis = (
+                    cost_observation.basis
+                    if isinstance(cost_observation, CostObservation)
+                    else None
+                )
+                if basis not in (
+                    CostBasis.SUBSCRIPTION,
+                    CostBasis.UNKNOWN,
+                ):
+                    cur["scorecard_calls"] += 1
+                    cur["scorecard_cost_usd"] += float(cost or 0.0)
+                    cur["scorecard_tokens"] += int(tokens or 0)
+                    cur["scorecard_input_tokens"] += int(
+                        input_tokens or 0,
+                    )
+                    cur["scorecard_output_tokens"] += int(
+                        output_tokens or 0,
+                    )
+                    cur["scorecard_latency_ms_sum"] += ms
+                    cur["scorecard_latency_ms_max"] = max(
+                        cur["scorecard_latency_ms_max"], ms,
+                    )
+                    if basis is not None:
+                        cur["scorecard_cost_bases"].add(basis.value)
                 # Live-API-leak attribution: a PAID call under pytest is
                 # flagged by the run-end scorecard line, but the flag
                 # alone cannot say WHICH test fired it (observed as an
@@ -2109,7 +2328,13 @@ class LLMClient:
         except Exception as exc:  # noqa: BLE001
             logger.debug("_record_usage failed: %s", exc)
 
-    def _record_schema_validity(self, alias: str, *, success: bool) -> None:
+    def _record_schema_validity(
+        self,
+        alias: str,
+        *,
+        success: bool,
+        cost_observation: CostObservation | None = None,
+    ) -> None:
         """Accumulate per-alias schema-validation outcomes for the run-end
         flush — one ``correct`` per structured call whose response parsed and
         matched the schema, one ``incorrect`` per call that didn't.
@@ -2119,15 +2344,27 @@ class LLMClient:
         signal across every ``generate_structured`` use. Cheap dict update
         under ``_stats_lock``; never raises."""
         try:
+            basis = (
+                cost_observation.basis
+                if isinstance(cost_observation, CostObservation)
+                else None
+            )
+            if basis in (CostBasis.SUBSCRIPTION, CostBasis.UNKNOWN):
+                return
             with self._stats_lock:
                 schema = getattr(self, "_fired_schema", None)
                 if schema is None:
                     schema = self._fired_schema = {}
-                cur = schema.setdefault(alias, {"pass": 0, "fail": 0})
+                cur: dict[str, Any] = schema.setdefault(
+                    alias,
+                    {"pass": 0, "fail": 0, "cost_bases": set()},
+                )
                 if success:
                     cur["pass"] += 1
                 else:
                     cur["fail"] += 1
+                if basis is not None:
+                    cur["cost_bases"].add(basis.value)
         except Exception as exc:  # noqa: BLE001
             logger.debug("_record_schema_validity failed: %s", exc)
 
@@ -2218,10 +2455,12 @@ class LLMClient:
                 if f.get("resolved"):
                     cur["resolved"] = f["resolved"]
             uses = []
+            provider_billed_aliases: set[str] = set()
             tot_calls = 0
             tot_cost = 0.0
             stub_cost = 0.0
             tot_lat_ms = 0
+            skipped_unpriced_calls = 0
             for a, v in agg.items():
                 m = usage_metrics.get(a, {})
                 calls = int(v["calls"])
@@ -2237,16 +2476,52 @@ class LLMClient:
                 if str(a).endswith("-stub"):
                     stub_cost += cost
                 tot_lat_ms += lat_sum
-                uses.append({
+                scorecard_calls = int(
+                    m.get("scorecard_calls", calls) or 0,
+                )
+                skipped_unpriced_calls += max(
+                    0, calls - scorecard_calls,
+                )
+                if scorecard_calls <= 0:
+                    continue
+                usage_entry = {
                     "model": a, "decision_class": "_usage",
-                    "calls": calls, "model_version": v["resolved"],
-                    "cost_usd": cost,
-                    "tokens": int(m.get("tokens") or 0),
-                    "input_tokens": int(m.get("input_tokens") or 0),
-                    "output_tokens": int(m.get("output_tokens") or 0),
-                    "latency_ms_sum": lat_sum,
-                    "latency_ms_max": int(m.get("latency_ms_max") or 0),
-                })
+                    "calls": scorecard_calls,
+                    "model_version": v["resolved"],
+                    "cost_usd": float(
+                        m.get("scorecard_cost_usd", cost) or 0.0,
+                    ),
+                    "tokens": int(
+                        m.get("scorecard_tokens", m.get("tokens")) or 0,
+                    ),
+                    "input_tokens": int(
+                        m.get(
+                            "scorecard_input_tokens",
+                            m.get("input_tokens"),
+                        ) or 0,
+                    ),
+                    "output_tokens": int(
+                        m.get(
+                            "scorecard_output_tokens",
+                            m.get("output_tokens"),
+                        ) or 0,
+                    ),
+                    "latency_ms_sum": int(
+                        m.get("scorecard_latency_ms_sum", lat_sum) or 0,
+                    ),
+                    "latency_ms_max": int(
+                        m.get(
+                            "scorecard_latency_ms_max",
+                            m.get("latency_ms_max"),
+                        ) or 0,
+                    ),
+                }
+                bases = set(m.get("scorecard_cost_bases") or ())
+                if CostBasis.PROVIDER_BILLED.value in bases:
+                    provider_billed_aliases.add(str(a))
+                if len(bases) == 1:
+                    usage_entry["cost_basis"] = next(iter(bases))
+                uses.append(usage_entry)
             # Append _structured entries for schema-validity outcomes. Different
             # decision_class from _usage so the schema reliability signal is
             # cleanly separable in `list` views and consumes the standard
@@ -2258,12 +2533,33 @@ class LLMClient:
                 fail_count = int(counts.get("fail") or 0)
                 if not (p or fail_count):
                     continue
-                uses.append({
+                schema_entry = {
                     "model": alias, "decision_class": "_structured",
                     "calls": p + fail_count,
                     "schema_valid_pass": p, "schema_valid_fail": fail_count,
-                })
-            self.scorecard.register_uses(uses)
+                }
+                bases = set(counts.get("cost_bases") or ())
+                if CostBasis.PROVIDER_BILLED.value in bases:
+                    provider_billed_aliases.add(str(alias))
+                if len(bases) == 1:
+                    schema_entry["cost_basis"] = next(iter(bases))
+                uses.append(schema_entry)
+            scorecard = self.scorecard
+            is_refused = getattr(scorecard, "is_model_refused", None)
+            refused_models = sorted({
+                str(alias)
+                for alias in agg
+                if callable(is_refused)
+                and is_refused(alias) is True
+            })
+            provider_billed_models = sorted(provider_billed_aliases)
+            accepted_uses = [
+                usage for usage in uses
+                if usage["model"] not in refused_models
+                and usage["model"] not in provider_billed_models
+            ]
+            if accepted_uses:
+                scorecard.register_uses(accepted_uses)
             stats: dict[str, Any] = {
                 "calls": tot_calls,
                 "cost_usd": tot_cost,
@@ -2273,6 +2569,16 @@ class LLMClient:
                 "paid_test_ctxs": sorted(
                     getattr(self, "_paid_test_ctxs", None) or ()),
             }
+            if skipped_unpriced_calls:
+                stats["scorecard_skipped_unpriced_calls"] = (
+                    skipped_unpriced_calls
+                )
+            if refused_models:
+                stats["scorecard_refused_models"] = refused_models
+            if provider_billed_models:
+                stats["scorecard_refused_provider_billed_models"] = (
+                    provider_billed_models
+                )
             if emit_summary:
                 _print_scorecard_summary(stats)
             return stats
@@ -2301,6 +2607,7 @@ class LLMClient:
     def _get_cache_key(
         self, prompt: str, system_prompt: str | None, model: str,
         kwargs: dict[str, Any] | None = None,
+        *, provider: str,
     ) -> str:
         """Generate cache key for prompt.
 
@@ -2315,10 +2622,110 @@ class LLMClient:
         """
         from core.json import dumps_canonical
         content = dumps_canonical(
-            [model, system_prompt or "", prompt,
+            ["response-cache", _CACHE_IDENTITY_VERSION,
+             self._normalise_cache_provider(provider), model,
+             system_prompt or "", prompt,
              self._kwargs_for_cache_key(kwargs)],
         )
         return sha256_string(content)
+
+    @staticmethod
+    def _normalise_cache_provider(provider: str) -> str:
+        """Canonical provider spelling used by route-aware cache identity."""
+        return provider.lower()
+
+    def _models_to_try(
+        self,
+        model_config: ModelConfig,
+        exclude_fallback_to: set[str] | None,
+    ) -> list[ModelConfig]:
+        """Return the current logical routes eligible for this call.
+
+        This is the single policy calculation shared by cache admission and
+        cold dispatch. It intentionally does not consult
+        ``_daily_quota_exhausted``: quota state suppresses a new provider
+        round-trip, but does not de-authorize an already-produced cache entry.
+        The requested model remains in the list even when disabled so cold
+        dispatch preserves its existing skip/index/role behavior.
+        """
+        self._validate_pinned_route(model_config)
+        models_to_try = [model_config]
+        if getattr(self, "_pinned_snapshot", None) is not None:
+            return models_to_try
+        if not self.config.enable_fallback:
+            return models_to_try
+
+        is_local_primary = model_config.provider.lower() == "ollama"
+        for fallback in self.config.fallback_models:
+            if not fallback.enabled:
+                continue
+            is_local_fallback = fallback.provider.lower() == "ollama"
+            if is_local_primary != is_local_fallback:
+                continue
+            if fallback.model_name == model_config.model_name:
+                continue
+            if (
+                exclude_fallback_to
+                and fallback.model_name in exclude_fallback_to
+            ):
+                continue
+            models_to_try.append(fallback)
+        return models_to_try
+
+    @classmethod
+    def _cache_serving_route_is_eligible(
+        cls,
+        serving_provider: str,
+        serving_model: str,
+        models_to_try: list[ModelConfig],
+    ) -> bool:
+        """Whether a cached serving route is authorized by current policy."""
+        return any(
+            candidate.enabled
+            and cls._normalise_cache_provider(candidate.provider)
+            == cls._normalise_cache_provider(serving_provider)
+            and candidate.model_name == serving_model
+            for candidate in models_to_try
+        )
+
+    @staticmethod
+    def _validated_resolved_model(value: Any) -> str | None:
+        """Return a usable provider-reported snapshot, else unknown."""
+        return value if isinstance(value, str) and value else None
+
+    @classmethod
+    def _cache_identity(
+        cls, provider: str, model: str,
+    ) -> dict[str, Any]:
+        """MAC-covered requested-route identity stored with each entry."""
+        return {
+            "version": _CACHE_IDENTITY_VERSION,
+            "provider": cls._normalise_cache_provider(provider),
+            "model": model,
+        }
+
+    @classmethod
+    def _cache_identity_matches(
+        cls, data: dict[str, Any], provider: str, model: str,
+    ) -> bool:
+        """Whether *data* carries this version's exact requested route.
+
+        A missing identity is a normal compatibility miss. In particular,
+        provider-less v1 entries are never upgraded by inference from their
+        old ``model``/``provider`` response fields.
+        """
+        identity = data.get("cache_identity")
+        if not isinstance(identity, dict):
+            return False
+        version = identity.get("version")
+        return (
+            isinstance(version, int)
+            and not isinstance(version, bool)
+            and version == _CACHE_IDENTITY_VERSION
+            and identity.get("provider")
+            == cls._normalise_cache_provider(provider)
+            and identity.get("model") == model
+        )
 
     def _is_entry_stale(self, data: dict[str, Any]) -> bool:
         """Return True if a cache entry's ``timestamp`` is older than
@@ -2379,8 +2786,17 @@ class LLMClient:
             "(%s); response will be re-fetched.", cache_key, where,
         )
 
-    def _get_cached_response(self, cache_key: str) -> str | None:
-        """Retrieve cached response if available."""
+    def _get_cached_response(
+        self, cache_key: str, *, requested_provider: str,
+        requested_model: str,
+    ) -> tuple[str, str, str, str | None] | None:
+        """Retrieve content, logical serving route, and resolved snapshot.
+
+        The requested route is checked against the MAC-covered cache
+        identity. The serving route can differ when fallback produced the
+        cached response. ``resolved_model`` is optional provider-reported
+        metadata, never inferred from the logical route.
+        """
         if not self.config.enable_caching:
             return None
 
@@ -2398,13 +2814,44 @@ class LLMClient:
         if not cache_integrity.verify_entry(cache_file.stem, data):
             self._reject_cache_entry(cache_file, data, cache_key)
             return None
+        if not self._cache_identity_matches(
+            data, requested_provider, requested_model,
+        ):
+            logger.debug(
+                "Cache identity legacy or mismatched — miss: %s", cache_key,
+            )
+            return None
+        content = data.get("content")
+        serving_model = data.get("model")
+        serving_provider = data.get("provider")
+        if (
+            not isinstance(content, str)
+            or not isinstance(serving_model, str)
+            or not serving_model
+            or not isinstance(serving_provider, str)
+            or not serving_provider
+        ):
+            logger.debug(
+                "Cache entry missing serving-route metadata — miss: %s",
+                cache_key,
+            )
+            return None
         if self._is_entry_stale(data):
             logger.debug("Cache stale (TTL): %s", cache_key)
             return None
         logger.debug("Cache hit: %s", cache_key)
-        return data.get("content")
+        return (
+            content,
+            serving_model,
+            self._normalise_cache_provider(serving_provider),
+            self._validated_resolved_model(data.get("resolved_model")),
+        )
 
-    def _save_to_cache(self, cache_key: str, response: LLMResponse) -> None:
+    def _save_to_cache(
+        self, cache_key: str, response: LLMResponse, *,
+        requested_provider: str, requested_model: str,
+        serving_provider: str, serving_model: str,
+    ) -> None:
         """Save response to cache.
 
         Mode 0o600 — LLM responses can contain proprietary code, scan
@@ -2421,9 +2868,17 @@ class LLMClient:
         cache_file = self.config.cache_dir / f"{cache_key}.json"
         try:
             save_json(cache_file, cache_integrity.stamp(cache_file.stem, {
+                    "cache_identity": self._cache_identity(
+                        requested_provider, requested_model,
+                    ),
                     "content": response.content,
-                    "model": response.model,
-                    "provider": response.provider,
+                    "model": serving_model,
+                    "provider": self._normalise_cache_provider(
+                        serving_provider,
+                    ),
+                    "resolved_model": self._validated_resolved_model(
+                        getattr(response, "resolved_model", None),
+                    ),
                     "tokens_used": response.tokens_used,
                     "timestamp": time.time(),
                 }), mode=0o600)
@@ -2500,6 +2955,7 @@ class LLMClient:
         self, prompt: str, system_prompt: str | None,
         model: str, schema: dict[str, Any],
         kwargs: dict[str, Any] | None = None,
+        *, provider: str,
     ) -> str:
         """Cache key for generate_structured. Includes schema so two callers
         who share a prompt but ask for different shapes don't collide,
@@ -2522,20 +2978,25 @@ class LLMClient:
             schema_json = repr(schema)
         from core.json import dumps_canonical
         content = dumps_canonical(
-            [f"v{self._STRUCTURED_CACHE_VERSION}", model,
+            ["structured-response-cache", _CACHE_IDENTITY_VERSION,
+             f"schema-v{self._STRUCTURED_CACHE_VERSION}",
+             self._normalise_cache_provider(provider), model,
              system_prompt or "", prompt, schema_json,
              self._kwargs_for_cache_key(kwargs)],
         )
         return sha256_string(content)
 
     def _get_cached_structured_response(
-        self, cache_key: str,
-    ) -> tuple[dict[str, Any], str, str | None] | None:
-        """Retrieve cached (result_dict, raw, serving_model) if
-        available. ``serving_model`` is the model that actually
-        produced the entry (a fallback's name when the primary failed
-        at write time); None for entries written before the field
-        existed."""
+        self, cache_key: str, *, requested_provider: str,
+        requested_model: str,
+    ) -> tuple[dict[str, Any], str, str, str, str | None] | None:
+        """Retrieve result, logical serving route, and resolved snapshot.
+
+        The requested route must match the v2 MAC-covered identity. Serving
+        metadata is mandatory because fallback responses must not replay under
+        the requested provider/model's attribution. ``resolved_model`` remains
+        optional provider-reported metadata and is never fabricated.
+        """
         if not self.config.enable_caching:
             return None
 
@@ -2549,24 +3010,50 @@ class LLMClient:
         if not cache_integrity.verify_entry(cache_file.stem, data):
             self._reject_cache_entry(cache_file, data, cache_key)
             return None
+        if not self._cache_identity_matches(
+            data, requested_provider, requested_model,
+        ):
+            logger.debug(
+                "Structured cache identity legacy or mismatched — miss: %s",
+                cache_key,
+            )
+            return None
         # Both fields are required for a usable replay; treat partial
         # entries (e.g. truncated by an interrupted writer) as a miss.
-        if "result" not in data or "raw" not in data:
+        result = data.get("result")
+        raw = data.get("raw")
+        serving_model = data.get("model")
+        serving_provider = data.get("provider")
+        if (
+            not isinstance(result, dict)
+            or not isinstance(raw, str)
+            or not isinstance(serving_model, str)
+            or not serving_model
+            or not isinstance(serving_provider, str)
+            or not serving_provider
+        ):
+            logger.debug(
+                "Structured cache entry missing response or serving-route "
+                "metadata — miss: %s",
+                cache_key,
+            )
             return None
         if self._is_entry_stale(data):
             logger.debug("Structured cache stale (TTL): %s", cache_key)
             return None
         logger.debug("Structured cache hit: %s", cache_key)
-        # "model" is the SERVING model recorded at write time (MAC-
-        # covered like the rest of the entry). Tolerate its absence —
-        # legacy entries predate the field.
-        model = data.get("model")
-        return data["result"], data["raw"], (
-            model if isinstance(model, str) and model else None
+        return (
+            result,
+            raw,
+            serving_model,
+            self._normalise_cache_provider(serving_provider),
+            self._validated_resolved_model(data.get("resolved_model")),
         )
 
     def _save_structured_to_cache(
-        self, cache_key: str, response: "StructuredResponse",
+        self, cache_key: str, response: "StructuredResponse", *,
+        requested_provider: str, requested_model: str,
+        serving_provider: str, serving_model: str,
     ) -> None:
         """Persist a successful structured response for later replay."""
         if not self.config.enable_caching:
@@ -2580,10 +3067,18 @@ class LLMClient:
             # code, scan findings, and vulnerability details. Symmetric with
             # the unstructured _save_to_cache path at line 539.
             save_json(cache_file, cache_integrity.stamp(cache_file.stem, {
+                "cache_identity": self._cache_identity(
+                    requested_provider, requested_model,
+                ),
                 "result": response.result,
                 "raw": response.raw,
-                "model": response.model,
-                "provider": response.provider,
+                "model": serving_model,
+                "provider": self._normalise_cache_provider(
+                    serving_provider,
+                ),
+                "resolved_model": self._validated_resolved_model(
+                    getattr(response, "resolved_model", None),
+                ),
                 "tokens_used": response.tokens_used,
                 "timestamp": time.time(),
             }), mode=0o600)
@@ -3003,6 +3498,360 @@ class LLMClient:
         with self._stats_lock:
             self._governed_tokens = getattr(self, "_governed_tokens", 0) + tokens
 
+    def _usd_budget_contract(self) -> UsdBudgetContract:
+        value = getattr(
+            self.config,
+            "usd_budget_contract",
+            UsdBudgetContract.ADVISORY,
+        )
+        return UsdBudgetContract(value)
+
+    def _trusted_usd_routes(self):
+        return getattr(self.config, "trusted_usd_routes", ()) or ()
+
+    def _raise_accounting_latch(self) -> None:
+        error = getattr(self, "_accounting_terminal_error", None)
+        if error is not None:
+            raise error
+
+    def _fresh_attempt_capability(
+        self,
+        provider: Any,
+    ) -> AccountingCapability:
+        method = getattr(provider, "accounting_capability", None)
+        if not callable(method):
+            return AccountingCapability()
+        try:
+            capability = method()
+        except Exception:
+            logger.debug(
+                "provider accounting capability failed", exc_info=True,
+            )
+            return AccountingCapability()
+        return (
+            capability
+            if isinstance(capability, AccountingCapability)
+            else AccountingCapability()
+        )
+
+    def _expected_cost_basis(self, provider: Any) -> CostBasis:
+        method = getattr(provider, "expected_cost_basis", None)
+        if not callable(method):
+            return CostBasis.UNKNOWN
+        try:
+            return CostBasis(method())
+        except (TypeError, ValueError):
+            return CostBasis.UNKNOWN
+
+    def _ensure_fresh_attempt_allowed(
+        self,
+        provider: Any,
+        model: ModelConfig,
+    ) -> None:
+        """Enforce the selected USD contract before provider dispatch."""
+        self._raise_accounting_latch()
+        contract = self._usd_budget_contract()
+        if contract is UsdBudgetContract.ADVISORY:
+            return
+        route = RouteIdentity(model.provider, model.model_name)
+        with self._stats_lock:
+            accounting = getattr(
+                self, "_accounting_summary", AccountingSummary(),
+            )
+        if contract is UsdBudgetContract.HARD_LIMIT_REQUIRED:
+            # No current provider exposes a proven preemptive USD limit.
+            # A future implementation must wire and prove the native control
+            # rather than flipping a capability bit.
+            raise LLMHardLimitUnsupportedError(
+                "hard_limit_required is unsupported for current route "
+                f"{route.provider}/{route.model}",
+                accounting=accounting,
+            )
+        if not self.config.enable_cost_tracking:
+            raise LLMAccountingUnavailableError(
+                "USD accounting policy requires enable_cost_tracking=True "
+                f"for route {route.provider}/{route.model}",
+                accounting=accounting,
+            )
+        capability = self._fresh_attempt_capability(provider)
+        basis = self._expected_cost_basis(provider)
+        if (
+            capability.mode is not AccountingMode.AUTHORITATIVE
+            or not is_basis_authorized(
+                basis=basis,
+                route=route,
+                trusted_routes=self._trusted_usd_routes(),
+            )
+        ):
+            raise LLMAccountingUnavailableError(
+                "authoritative_required cannot dispatch route "
+                f"{route.provider}/{route.model}: basis={basis.value} "
+                "is not provider_billed or explicitly trusted for this "
+                "exact route",
+                accounting=accounting,
+            )
+
+    def _response_cost_observation(
+        self,
+        provider: Any,
+        response: Any,
+        route: RouteIdentity,
+        legacy_cost: float,
+    ) -> CostObservation:
+        observation = getattr(response, "cost_observation", None)
+        if (
+            isinstance(observation, CostObservation)
+            and observation.basis is not CostBasis.UNKNOWN
+        ):
+            if observation.route not in (None, route):
+                return CostObservation.unknown(route=route)
+            return observation
+        method = getattr(provider, "cost_observation", None)
+        if callable(method):
+            try:
+                derived = method(legacy_cost)
+            except Exception:
+                logger.debug(
+                    "provider cost observation failed", exc_info=True,
+                )
+            else:
+                if isinstance(derived, CostObservation):
+                    if derived.route not in (None, route):
+                        return CostObservation.unknown(route=route)
+                    return derived
+        if isinstance(observation, CostObservation):
+            if observation.route not in (None, route):
+                return CostObservation.unknown(route=route)
+            if (
+                observation.basis is not CostBasis.UNKNOWN
+                or legacy_cost <= 0.0
+            ):
+                return observation
+        if legacy_cost > 0.0:
+            try:
+                return CostObservation.configured_rate(
+                    legacy_cost, route=route,
+                )
+            except (TypeError, ValueError):
+                pass
+        return CostObservation.unknown(route=route)
+
+    def _accounting_is_authorized(
+        self,
+        observation: CostObservation,
+    ) -> bool:
+        return is_observation_authorized(
+            observation, self._trusted_usd_routes(),
+        )
+
+    def _record_accounting_observation(
+        self,
+        observation: CostObservation,
+    ) -> None:
+        with self._stats_lock:
+            summary = getattr(
+                self, "_accounting_summary", AccountingSummary(),
+            ).add(observation)
+            if not self._accounting_is_authorized(observation):
+                self._accounting_authority_complete = False
+            if (
+                getattr(self, "_accounting_authority_complete", True)
+                and not summary.exposure_unresolved
+            ):
+                remaining = max(
+                    0.0,
+                    self.config.max_cost_per_scan
+                    - self._effective_spent_locked(),
+                )
+                summary = summary.with_authoritative_remaining(remaining)
+            else:
+                summary = summary.with_authoritative_remaining(None)
+            self._accounting_summary = summary
+
+    def _record_unknown_failed_attempt(
+        self,
+        *,
+        retained_reservation_estimate_usd: float,
+    ) -> None:
+        with self._stats_lock:
+            self._accounting_authority_complete = False
+            summary = getattr(
+                self, "_accounting_summary", AccountingSummary(),
+            ).add_unknown_failure(
+                retained_reservation_estimate_usd=(
+                    retained_reservation_estimate_usd
+                ),
+            )
+            self._accounting_summary = summary
+
+    def _reconcile_attempt_budget(
+        self,
+        reservation: float,
+        observation: CostObservation,
+    ) -> None:
+        amount = observation.legacy_cost_usd
+        with self._stats_lock:
+            if self.config.enable_cost_tracking:
+                self.total_cost += amount - reservation
+            else:
+                self.total_cost += amount
+
+    def _latch_accounting_error(
+        self,
+        route: RouteIdentity,
+        *,
+        reason: str,
+    ) -> LLMAccountingUnavailableError:
+        with self._stats_lock:
+            existing = getattr(self, "_accounting_terminal_error", None)
+            if existing is not None:
+                return existing
+            error = LLMAccountingUnavailableError(
+                "authoritative USD accounting became unavailable for "
+                f"{route.provider}/{route.model}: {reason}; no later "
+                "fresh attempt is permitted on this client",
+                accounting=getattr(
+                    self, "_accounting_summary", AccountingSummary(),
+                ),
+            )
+            self._accounting_terminal_error = error
+            return error
+
+    def _settle_observed_attempt(
+        self,
+        attempt: AttemptLedger,
+        observation: CostObservation,
+    ) -> CostObservation:
+        settlement = attempt.settle_observation(observation)
+        settled = settlement.observation
+        if settled is None:
+            raise RuntimeError("observed attempt settled without observation")
+        self._reconcile_attempt_budget(
+            settlement.reservation_usd, settled,
+        )
+        self._record_accounting_observation(settled)
+        if (
+            self._usd_budget_contract()
+            is UsdBudgetContract.AUTHORITATIVE_REQUIRED
+            and not self._accounting_is_authorized(settled)
+        ):
+            raise self._latch_accounting_error(
+                settlement.route,
+                reason=f"observed basis {settled.basis.value} is not trusted",
+            )
+        return settled
+
+    def _settle_failed_attempt(
+        self,
+        attempt: AttemptLedger,
+        error: BaseException,
+    ) -> LLMAccountingUnavailableError | None:
+        observation = cost_observation_from_exception(error)
+        if observation is not None:
+            try:
+                settled = self._settle_observed_attempt(
+                    attempt, observation,
+                )
+            except LLMAccountingUnavailableError as policy_error:
+                return policy_error
+            if (
+                self._usd_budget_contract()
+                is UsdBudgetContract.AUTHORITATIVE_REQUIRED
+                and not self._accounting_is_authorized(settled)
+            ):
+                return self._latch_accounting_error(
+                    attempt.route,
+                    reason=(
+                        f"failed attempt basis {settled.basis.value} "
+                        "is not trusted"
+                    ),
+                )
+            return None
+
+        attempt.settle_unknown_failed()
+        if (
+            self._usd_budget_contract()
+            is UsdBudgetContract.AUTHORITATIVE_REQUIRED
+        ):
+            # Keep the reservation in total_cost. It is an estimate of
+            # unresolved exposure, neither a lower nor an upper bound.
+            self._record_unknown_failed_attempt(
+                retained_reservation_estimate_usd=attempt.reservation_usd,
+            )
+            return self._latch_accounting_error(
+                attempt.route,
+                reason="failed attempt returned no authoritative cost",
+            )
+        self._release_budget(attempt.reservation_usd)
+        self._record_unknown_failed_attempt(
+            retained_reservation_estimate_usd=0.0,
+        )
+        return None
+
+    @staticmethod
+    def _telemetry_observation_fields(
+        observation: CostObservation | None,
+    ) -> dict[str, Any]:
+        if not isinstance(observation, CostObservation):
+            return {}
+        return {
+            "cost_basis": observation.basis.value,
+            "provider_billed_usd": observation.provider_billed_usd,
+            "estimated_usd": observation.estimated_usd,
+            "catalog_version": observation.catalog_version,
+        }
+
+    def _failed_attempt_telemetry_fields(
+        self,
+        attempt: AttemptLedger | None,
+    ) -> dict[str, Any]:
+        if attempt is None or attempt.settlement is None:
+            return {}
+        settlement = attempt.settlement
+        if settlement.outcome == "unknown_failed":
+            retained = (
+                settlement.reservation_usd
+                if self._usd_budget_contract()
+                is UsdBudgetContract.AUTHORITATIVE_REQUIRED
+                else 0.0
+            )
+            if retained <= 0:
+                return {}
+            return {
+                "cost_basis": CostBasis.UNKNOWN.value,
+                "retained_reservation_estimate_usd": retained,
+                "exposure_unresolved": True,
+            }
+        fields = self._telemetry_observation_fields(
+            settlement.observation,
+        )
+        fields["cost_usd"] = (
+            settlement.observation.legacy_cost_usd
+            if settlement.observation is not None
+            else 0.0
+        )
+        return fields
+
+    def _failed_attempt_telemetry_payload(
+        self,
+        attempt: AttemptLedger | None,
+        error: BaseException,
+        *,
+        disposition: str,
+    ) -> dict[str, Any]:
+        """Merge typed accounting with legacy paid-usage attribution."""
+        fields = self._failed_attempt_telemetry_fields(attempt)
+        if not fields and disposition == "timeout":
+            fields["cost_basis"] = CostBasis.UNKNOWN.value
+        paid_cost, paid_in, paid_out = _billed_failure_usage(error)
+        if paid_cost > 0 and not fields.get("cost_usd"):
+            fields["cost_usd"] = paid_cost
+        if paid_in > 0:
+            fields["tokens_in"] = paid_in
+        if paid_out > 0:
+            fields["tokens_out"] = paid_out
+        return fields
+
     def generate(self, prompt: str, system_prompt: str | None = None,
                  task_type: str | None = None, **kwargs) -> LLMResponse:
         """
@@ -3062,7 +3911,9 @@ class LLMClient:
         # dispatch set — which would create a duplicate (the same model
         # showing up under two slots in the model panel). Pop here so the
         # value doesn't propagate to providers via **kwargs.
-        exclude_fallback_to: set | None = kwargs.pop('exclude_fallback_to', None)
+        exclude_fallback_to: set[str] | None = kwargs.pop(
+            'exclude_fallback_to', None,
+        )
         # Per-call timeout retry budget — see _TIMEOUT_RETRY_CAP. Popped
         # before the cache key is computed so retry policy never splits
         # otherwise-identical prompts into separate cache entries.
@@ -3104,6 +3955,7 @@ class LLMClient:
                 "model_config= kwarg."
             )
             raise RuntimeError(msg)
+        self._validate_pinned_route(model_config)
 
         # Warn if prompt likely exceeds context window (~4 chars per token)
         estimated_tokens = (len(prompt) + len(system_prompt or "")) // 4
@@ -3116,17 +3968,52 @@ class LLMClient:
         # the same prompt but different temperatures would collide.
         cache_key = self._get_cache_key(
             prompt, system_prompt, model_config.model_name, kwargs,
+            provider=model_config.provider,
         )
-        # Per-key lock dedupes concurrent identical calls: the first
-        # arrival pays the provider round-trip; serial-ordered followers
-        # observe its freshly-written cache entry on their own check
-        # below. Without this, N concurrent threads on the same key all
-        # miss the cache, all call the provider, and all write — burning
-        # N× the cost for a result they'd have shared.
-        with self._key_lock(cache_key):
-            cached_content = self._get_cached_response(cache_key)
-            if cached_content is not None:
+        # Per-key lock dedupes concurrent identical calls for ordinary
+        # logical-route caching. Exact pins bypass shared cache I/O because
+        # the stored identity cannot attest their full route snapshot.
+        cache_context, shared_cache_allowed = self._cache_access_for_call(
+            cache_key,
+        )
+        with cache_context:
+            models_to_try = self._models_to_try(
+                model_config, exclude_fallback_to,
+            )
+            cached = (
+                self._get_cached_response(
+                    cache_key,
+                    requested_provider=model_config.provider,
+                    requested_model=model_config.model_name,
+                )
+                if shared_cache_allowed
+                else None
+            )
+            if cached is not None:
+                (
+                    cached_content,
+                    cached_model,
+                    cached_provider,
+                    cached_resolved_model,
+                ) = cached
+                if not self._cache_serving_route_is_eligible(
+                    cached_provider, cached_model, models_to_try,
+                ):
+                    logger.debug(
+                        "Cached response serving route %s/%s is not "
+                        "eligible under current call policy — regenerating",
+                        cached_provider,
+                        cached_model,
+                    )
+                    cached = None
+            if cached is not None:
                 logger.debug("Using cached response for %s/%s", model_config.provider, model_config.model_name)
+                cache_attempt = AttemptLedger(
+                    route=RouteIdentity(cached_provider, cached_model),
+                    reservation_usd=0.0,
+                )
+                cache_attempt.settle_no_spend()
+                cache_attempt.require_settled()
                 with self._stats_lock:
                     self.request_count += 1
                     self.cache_hits += 1
@@ -3135,48 +4022,33 @@ class LLMClient:
                     event="call",
                     disposition="cache_hit",
                     call_class=call_class,
-                    provider=model_config.provider.lower(),
-                    model=model_config.model_name,
+                    provider=cached_provider,
+                    model=cached_model,
+                    requested_provider=self._normalise_cache_provider(
+                        model_config.provider,
+                    ),
+                    requested_model=model_config.model_name,
                     cost_usd=0.0,
                     duration_s=0.0,
                 )
                 return LLMResponse(
                     content=cached_content,
-                    model=model_config.model_name,
-                    # Lowercase to match the provider field that fresh
-                    # `provider.generate()` returns. Pre-fix the cached
-                    # path passed `model_config.provider` verbatim, so
-                    # an LLMConfig with `provider="Anthropic"` (capital
-                    # A — accepted by the constructor since the
-                    # downstream lookup is case-insensitive) returned
-                    # `"Anthropic"` from cached calls and `"anthropic"`
-                    # from fresh ones. Downstream consumers grouping by
-                    # provider (telemetry summaries, cost rollups) split
-                    # the two into separate buckets silently.
-                    provider=model_config.provider.lower(),
+                    model=cached_model,
+                    provider=cached_provider,
                     tokens_used=0,
                     cost=0.0,
                     finish_reason="cached",
+                    resolved_model=cached_resolved_model,
                 )
 
-            # Try models in order with fallback (same tier only: local→local, cloud→cloud)
-            models_to_try = [model_config]
-            if self.config.enable_fallback:
-                # Filter fallbacks to same tier as primary
-                is_local_primary = model_config.provider.lower() == "ollama"
-                for fallback in self.config.fallback_models:
-                    if not fallback.enabled:
-                        continue
-                    # Skip if different tier (don't mix local and cloud)
-                    is_local_fallback = fallback.provider.lower() == "ollama"
-                    if is_local_primary == is_local_fallback:  # noqa: SIM102
-                        # Skip if same as primary (already trying it)
-                        if fallback.model_name != model_config.model_name:
-                            # Skip if caller marked this name as already-active
-                            # in a parallel dispatch (multi-model duplicate guard).
-                            if exclude_fallback_to and fallback.model_name in exclude_fallback_to:
-                                continue
-                            models_to_try.append(fallback)
+            self._raise_accounting_latch()
+            if not self._check_budget():
+                msg = (
+                    f"LLM budget exceeded: ${self.total_cost:.4f} spent > "
+                    f"${self.config.max_cost_per_scan:.4f} limit. "
+                    + _budget_remedy(self.config.max_cost_per_scan)
+                )
+                raise LLMBudgetExceededError(msg)
 
             last_error = None
             attempts_count = 0
@@ -3219,6 +4091,7 @@ class LLMClient:
                     # THIS attempt's failure (hookless transports have
                     # no request-hook reset of their own).
                     _clear_attempt_spend_signal()
+                    attempt_ledger: AttemptLedger | None = None
                     try:
                         if attempt > 0:
                             # DEBUG, not INFO: the prior attempt's
@@ -3232,6 +4105,7 @@ class LLMClient:
                             logger.debug("Retrying %s/%s (attempt %d/%d)", model.provider, model.model_name, attempt + 1, self.config.max_retries)
 
                         provider = self._get_provider(model)
+                        self._ensure_fresh_attempt_allowed(provider, model)
                         # Acquire budget reservation immediately before the
                         # provider call. The pre-debit closes the
                         # check-then-act window so concurrent dispatchers
@@ -3256,41 +4130,68 @@ class LLMClient:
                                 + _budget_remedy(self.config.max_cost_per_scan)
                             )
                             raise LLMBudgetExceededError(msg)
+                        attempt_ledger = AttemptLedger(
+                            route=RouteIdentity(
+                                model.provider, model.model_name,
+                            ),
+                            reservation_usd=reservation,
+                        )
                         # monotonic() — wall clock can jump under NTP/DST,
                         # producing negative durations or fake-fast calls.
                         t_start = time.monotonic()
                         try:
-                            response = provider.generate(prompt, system_prompt, **kwargs)
-                        except Exception:
-                            self._release_budget(reservation)
+                            response = provider.generate(
+                                prompt, system_prompt, **kwargs,
+                            )
+                            observation = self._response_cost_observation(
+                                provider,
+                                response,
+                                attempt_ledger.route,
+                                response.cost,
+                            )
+                            observation = self._settle_observed_attempt(
+                                attempt_ledger, observation,
+                            )
+                            response.cost = (
+                                observation.legacy_cost_usd
+                            )
+                            response.cost_observation = observation
+                        except BaseException as call_error:
+                            if not attempt_ledger.settled:
+                                policy_error = self._settle_failed_attempt(
+                                    attempt_ledger, call_error,
+                                )
+                                if policy_error is not None:
+                                    raise policy_error from call_error
                             raise
+                        finally:
+                            attempt_ledger.require_settled()
+                        response.resolved_model = self._validated_resolved_model(
+                            getattr(response, "resolved_model", None),
+                        )
                         duration = time.monotonic() - t_start
                         self._record_governed_tokens(response.tokens_used)
 
-                        # Reconcile: cancel the reservation pre-debit and
-                        # add the actual cost. Net effect on total_cost
-                        # is +response.cost. When cost-tracking is
-                        # disabled, _acquire_budget was a no-op so the
-                        # reservation cancellation must also be skipped —
-                        # otherwise total_cost drifts negative by the
-                        # reservation amount per call.
-                        # sanitize_cost at the write: a non-finite cost
-                        # figure booked here disables every budget
-                        # comparison for the rest of the run.
-                        from core.llm.cost import sanitize_cost
-                        cost_actual = sanitize_cost(response.cost)
                         with self._stats_lock:
-                            if self.config.enable_cost_tracking:
-                                self.total_cost += cost_actual - reservation
-                            else:
-                                self.total_cost += cost_actual
                             self.request_count += 1
                             if task_type:
-                                self.task_type_costs[task_type] = self.task_type_costs.get(task_type, 0.0) + cost_actual
-                        self._note_call_cost(call_class, cost_actual)
+                                self.task_type_costs[task_type] = self.task_type_costs.get(task_type, 0.0) + response.cost
+                        if observation.has_numeric_usd:
+                            self._note_call_cost(
+                                call_class, response.cost,
+                            )
 
-                        # Cache response
-                        self._save_to_cache(cache_key, response)
+                        # Exact pins never publish to the shared logical-route
+                        # cache; unpinned/advisory-pin behavior is unchanged.
+                        if shared_cache_allowed:
+                            self._save_to_cache(
+                                cache_key,
+                                response,
+                                requested_provider=model_config.provider,
+                                requested_model=model_config.model_name,
+                                serving_provider=model.provider,
+                                serving_model=model.model_name,
+                            )
 
                         # Record provenance: this provider call fired. role is
                         # primary for the first model tried, fallback otherwise.
@@ -3306,6 +4207,7 @@ class LLMClient:
                             input_tokens=response.input_tokens,
                             output_tokens=response.output_tokens,
                             duration_s=duration,
+                            cost_observation=observation,
                         )
 
                         from core.llm.telemetry import emit as _t_emit
@@ -3326,6 +4228,9 @@ class LLMClient:
                                 response, "cache_read_tokens", 0),
                             cache_write_tokens=getattr(
                                 response, "cache_write_tokens", 0),
+                            **self._telemetry_observation_fields(
+                                observation,
+                            ),
                         )
                         # Degraded-mode breaker: successes dilute the
                         # window's failure fraction (cache hits are
@@ -3358,6 +4263,29 @@ class LLMClient:
                         # check) and surface a generic "All models
                         # failed" RuntimeError, losing the typed
                         # contract.
+                        raise
+                    except LLMPolicyError as e:
+                        if (
+                            attempt_ledger is not None
+                            and attempt_ledger.settled
+                        ):
+                            from core.llm.telemetry import emit as _t_emit
+                            _t_emit(
+                                event="attempt_failed",
+                                disposition="blocked",
+                                call_class=call_class,
+                                provider=model.provider.lower(),
+                                model=model.model_name,
+                                attempt=attempt + 1,
+                                duration_s=round(
+                                    time.monotonic() - attempt_start, 3,
+                                ),
+                                http_version=_transport_http_version(),
+                                error=_sanitize_log_message(str(e))[:200],
+                                **self._failed_attempt_telemetry_fields(
+                                    attempt_ledger,
+                                ),
+                            )
                         raise
                     except Exception as e:  # noqa: BLE001
                         last_error = e
@@ -3462,15 +4390,8 @@ class LLMClient:
                             else _failure_disposition(e)
                         )
 
-                        # Paid usage the raising guard stamped on the
-                        # exception rides the row: without it a burn
-                        # loop's rows all read $0 while the run bleeds
-                        # full-price generations (the ledger booking
-                        # happens provider-side; this is per-attempt
-                        # attribution only).
-                        _paid_cost, _paid_in, _paid_out = (
-                            _billed_failure_usage(e)
-                        )
+                        # Typed accounting and legacy paid-usage
+                        # attribution ride the same failure row.
                         from core.llm.telemetry import emit as _t_emit
                         _t_emit(
                             event="attempt_failed",
@@ -3483,14 +4404,9 @@ class LLMClient:
                                 time.monotonic() - attempt_start, 3),
                             http_version=_transport_http_version(),
                             error=_safe_e[:200],
-                            **(
-                                {
-                                    "cost_usd": _paid_cost,
-                                    "tokens_in": _paid_in,
-                                    "tokens_out": _paid_out,
-                                }
-                                if _paid_cost > 0 or _paid_out > 0
-                                else {}
+                            **self._failed_attempt_telemetry_payload(
+                                attempt_ledger, e,
+                                disposition=_disposition,
                             ),
                         )
                         # Degraded-mode breaker sees the same label
@@ -3657,7 +4573,9 @@ class LLMClient:
         # Get appropriate model (priority: explicit model_config > task_type > primary)
         model_config = kwargs.pop('model_config', None)
         # See ``generate`` for the rationale on exclude_fallback_to.
-        exclude_fallback_to: set | None = kwargs.pop('exclude_fallback_to', None)
+        exclude_fallback_to: set[str] | None = kwargs.pop(
+            'exclude_fallback_to', None,
+        )
         # Per-call timeout retry budget — see ``generate``.
         timeout_retry_cap = _resolve_timeout_retry_cap(
             kwargs.pop('timeout_retry_cap', None),
@@ -3685,6 +4603,7 @@ class LLMClient:
                 "model_config= kwarg."
             )
             raise RuntimeError(msg)
+        self._validate_pinned_route(model_config)
 
         # Provider impls of generate_structured now accept **kwargs
         # (batch 331 — temperature plumbing). The previous warning
@@ -3706,40 +4625,75 @@ class LLMClient:
 
         # Check cache. Key includes schema so two callers who share a
         # prompt but ask for different output shapes don't collide.
-        # Pinned to model_config.model_name (the configured first-choice
-        # model), not whichever fallback we actually use — replays come
-        # back as if the configured model was queried, matching how
-        # generate() does it.
+        # Identity is pinned to the configured first-choice route, not
+        # whichever fallback ultimately serves the call. The entry records
+        # the serving route separately so a replay stays truthfully
+        # attributed to that fallback.
         cache_key = self._get_structured_cache_key(
             prompt, system_prompt, model_config.model_name, schema, kwargs,
+            provider=model_config.provider,
         )
-        # Per-key lock dedupes concurrent identical calls (see generate()
-        # for full rationale).
-        with self._key_lock(cache_key):
-            cached = self._get_cached_structured_response(cache_key)
-            cached_model: str | None = None
+        # Ordinary callers use the shared logical-route cache; exact pins
+        # bypass it because the entry cannot evidence full-route provenance.
+        cache_context, shared_cache_allowed = self._cache_access_for_call(
+            cache_key,
+        )
+        with cache_context:
+            models_to_try = self._models_to_try(
+                model_config, exclude_fallback_to,
+            )
+            cached = (
+                self._get_cached_structured_response(
+                    cache_key,
+                    requested_provider=model_config.provider,
+                    requested_model=model_config.model_name,
+                )
+                if shared_cache_allowed
+                else None
+            )
             if cached is not None:
-                # Tolerant unpack: the reader returns (result, raw,
-                # serving_model); older stubs and overrides may still
-                # hand back a bare (result, raw) pair.
-                cached_result, cached_raw = cached[0], cached[1]
-                if len(cached) > 2:
-                    cached_model = cached[2]
+                (
+                    cached_result,
+                    cached_raw,
+                    cached_model,
+                    cached_provider,
+                    cached_resolved_model,
+                ) = cached
+                if not self._cache_serving_route_is_eligible(
+                    cached_provider, cached_model, models_to_try,
+                ):
+                    logger.debug(
+                        "Cached structured response serving route %s/%s "
+                        "is not eligible under current call policy — "
+                        "regenerating",
+                        cached_provider,
+                        cached_model,
+                    )
+                    cached = None
                 # Strict schema floor applies to cache replays too —
                 # entries written before the floor existed (or by an
                 # older RAPTOR) may carry smuggled fields. Treat a
                 # violating entry as a cache miss and regenerate.
-                stale_unknown = unknown_response_fields(cached_result, schema)
-                if stale_unknown:
-                    logger.debug(
-                        "Cached structured response rejected (unknown "
-                        "fields %s) — regenerating", stale_unknown,
+                if cached is not None:
+                    stale_unknown = unknown_response_fields(
+                        cached_result, schema,
                     )
-                    cached = None
+                    if stale_unknown:
+                        logger.debug(
+                            "Cached structured response rejected (unknown "
+                            "fields %s) — regenerating", stale_unknown,
+                        )
+                        cached = None
             if cached is not None:
                 logger.debug(
                     "Using cached structured response for %s/%s", model_config.provider, model_config.model_name
                 )
+                cache_attempt = AttemptLedger(
+                    route=RouteIdentity(cached_provider, cached_model),
+                    reservation_usd=0.0,
+                )
+                cache_attempt.settle_no_spend()
+                cache_attempt.require_settled()
                 with self._stats_lock:
                     self.request_count += 1
                     self.cache_hits += 1
@@ -3748,8 +4702,12 @@ class LLMClient:
                     event="call",
                     disposition="cache_hit",
                     call_class=call_class,
-                    provider=model_config.provider.lower(),
-                    model=model_config.model_name,
+                    provider=cached_provider,
+                    model=cached_model,
+                    requested_provider=self._normalise_cache_provider(
+                        model_config.provider,
+                    ),
+                    requested_model=model_config.model_name,
                     structured=True,
                     cost_usd=0.0,
                     duration_s=0.0,
@@ -3759,35 +4717,25 @@ class LLMClient:
                     raw=cached_raw,
                     cost=0.0,
                     tokens_used=0,
-                    # The SERVING model recorded at write time — a
+                    # The SERVING route recorded at write time — a
                     # fallback-served entry must not replay as if the
-                    # primary produced it. Legacy entries without the
-                    # field keep the requested model's name.
-                    model=cached_model or model_config.model_name,
-                    # Lowercase — same normalisation as generate()'s
-                    # cached path (see the comment there): a mixed-case
-                    # LLMConfig provider would otherwise split
-                    # cached/fresh responses into separate buckets for
-                    # consumers grouping by provider.
-                    provider=model_config.provider.lower(),
+                    # primary produced it. Disk entries missing either
+                    # field are rejected by the reader.
+                    model=cached_model,
+                    provider=cached_provider,
                     duration=0.0,
                     cached=True,
+                    resolved_model=cached_resolved_model,
                 )
 
-            # Try models in order (same tier only: local→local, cloud→cloud)
-            models_to_try = [model_config]
-            if self.config.enable_fallback:
-                is_local_primary = model_config.provider.lower() == "ollama"
-                for fallback in self.config.fallback_models:
-                    if not fallback.enabled:
-                        continue
-                    is_local_fallback = fallback.provider.lower() == "ollama"
-                    if is_local_primary == is_local_fallback:  # noqa: SIM102
-                        if fallback.model_name != model_config.model_name:
-                            # Multi-model duplicate guard — see ``generate``.
-                            if exclude_fallback_to and fallback.model_name in exclude_fallback_to:
-                                continue
-                            models_to_try.append(fallback)
+            self._raise_accounting_latch()
+            if not self._check_budget():
+                msg = (
+                    f"LLM budget exceeded: ${self.total_cost:.4f} spent > "
+                    f"${self.config.max_cost_per_scan:.4f} limit. "
+                    + _budget_remedy(self.config.max_cost_per_scan)
+                )
+                raise LLMBudgetExceededError(msg)
 
             last_error = None
             attempts_count = 0
@@ -3825,6 +4773,8 @@ class LLMClient:
                     # THIS attempt's failure (hookless transports have
                     # no request-hook reset of their own).
                     _clear_attempt_spend_signal()
+                    attempt_ledger: AttemptLedger | None = None
+                    observation: CostObservation | None = None
                     try:
                         if attempt > 0:
                             # DEBUG, not INFO — see ``generate`` above
@@ -3832,6 +4782,7 @@ class LLMClient:
                             logger.debug("Retrying %s/%s (attempt %d/%d)", model.provider, model.model_name, attempt + 1, self.config.max_retries)
 
                         provider = self._get_provider(model)
+                        self._ensure_fresh_attempt_allowed(provider, model)
 
                         # See `generate` for the acquire/reconcile rationale —
                         # same race shape applies to structured calls.
@@ -3848,6 +4799,12 @@ class LLMClient:
                                 + _budget_remedy(self.config.max_cost_per_scan)
                             )
                             raise LLMBudgetExceededError(msg)
+                        attempt_ledger = AttemptLedger(
+                            route=RouteIdentity(
+                                model.provider, model.model_name,
+                            ),
+                            reservation_usd=reservation,
+                        )
 
                         # Capture cost before call
                         cost_before = provider.total_cost
@@ -3872,94 +4829,97 @@ class LLMClient:
                             result_tuple = provider.generate_structured(
                                 prompt, schema, system_prompt, **kwargs,
                             )
-                        except Exception:
-                            # Release the reservation and book NOTHING.
-                            # The old path recorded the provider-counter
-                            # delta (total_cost - cost_before) as this
-                            # call's failed spend — but the counters are
-                            # SHARED across parallel workers, so a call
-                            # failing after a 6-minute timeout booked
-                            # every concurrent worker's spend from that
-                            # window into the enforced ledger a second
-                            # time (observed live: 11 timeouts each
-                            # booked most of the run's real total
-                            # spend again, tripping the cap at 25/40
-                            # reviews). Money genuinely spent by a
-                            # failed attempt (e.g. the JSON fallback
-                            # completed an API call before the parse
-                            # failed) is already on the provider's own
-                            # ledger — budget enforcement reads
-                            # ``max(total_cost, provider_spend_usd)``
-                            # (see ``_effective_spent_locked``) so it
-                            # still counts, exactly once.
-                            self._release_budget(reservation)
+                            duration = time.monotonic() - t_start
+
+                            # Aggregate-counter deltas are only a legacy
+                            # fallback: exact response-local usage wins below
+                            # so parallel workers cannot multiply-book one
+                            # another's spend.
+                            cost_delta = provider.total_cost - cost_before
+                            tokens_delta = (
+                                provider.total_tokens - tokens_before
+                            )
+                            in_delta = max(
+                                0, _safe_counter(
+                                    provider, "total_input_tokens",
+                                ) - in_before)
+                            out_delta = max(
+                                0, _safe_counter(
+                                    provider, "total_output_tokens",
+                                ) - out_before)
+                            cread_delta = max(
+                                0, _safe_counter(
+                                    provider, "total_cache_read_tokens",
+                                ) - cread_before)
+                            cwrite_delta = max(
+                                0, _safe_counter(
+                                    provider, "total_cache_write_tokens",
+                                ) - cwrite_before)
+
+                            # Exact per-call usage reported by the provider
+                            # takes precedence over aggregate-counter
+                            # deltas, which are racy across workers.
+                            _pc_cost = float(
+                                getattr(
+                                    result_tuple, "cost", 0.0,
+                                ) or 0.0)
+                            _pc_tokens = int(
+                                getattr(
+                                    result_tuple, "tokens_used", 0,
+                                ) or 0)
+                            if _pc_cost > 0 or _pc_tokens > 0:
+                                cost_delta = _pc_cost
+                                tokens_delta = _pc_tokens
+                                in_delta = int(getattr(
+                                    result_tuple,
+                                    "input_tokens",
+                                    0,
+                                ) or 0)
+                                out_delta = int(getattr(
+                                    result_tuple,
+                                    "output_tokens",
+                                    0,
+                                ) or 0)
+                                cread_delta = int(getattr(
+                                    result_tuple,
+                                    "cache_read_tokens",
+                                    0,
+                                ) or 0)
+                                cwrite_delta = int(getattr(
+                                    result_tuple,
+                                    "cache_write_tokens",
+                                    0,
+                                ) or 0)
+                            from core.llm.cost import sanitize_cost
+                            cost_delta = sanitize_cost(cost_delta)
+                            self._record_governed_tokens(tokens_delta)
+                            observation = self._response_cost_observation(
+                                provider,
+                                result_tuple,
+                                attempt_ledger.route,
+                                cost_delta,
+                            )
+                            observation = self._settle_observed_attempt(
+                                attempt_ledger, observation,
+                            )
+                            cost_delta = observation.legacy_cost_usd
+                        except BaseException as call_error:
+                            if not attempt_ledger.settled:
+                                policy_error = self._settle_failed_attempt(
+                                    attempt_ledger, call_error,
+                                )
+                                if policy_error is not None:
+                                    raise policy_error from call_error
                             raise
-                        duration = time.monotonic() - t_start
+                        finally:
+                            attempt_ledger.require_settled()
 
-                        # Calculate cost delta
-                        cost_delta = provider.total_cost - cost_before
-                        tokens_delta = provider.total_tokens - tokens_before
-                        self._record_governed_tokens(tokens_delta)
-                        in_delta = max(
-                            0, _safe_counter(
-                                provider, "total_input_tokens",
-                            ) - in_before)
-                        out_delta = max(
-                            0, _safe_counter(
-                                provider, "total_output_tokens",
-                            ) - out_before)
-                        cread_delta = max(
-                            0, _safe_counter(
-                                provider, "total_cache_read_tokens",
-                            ) - cread_before)
-                        cwrite_delta = max(
-                            0, _safe_counter(
-                                provider, "total_cache_write_tokens",
-                            ) - cwrite_before)
-
-                        # Exact per-call usage reported by the provider
-                        # takes precedence over the aggregate-counter
-                        # deltas above: the provider counters are SHARED
-                        # across parallel workers, so a before/after
-                        # diff swallows every concurrent call's spend
-                        # and multiply-books the same money into this
-                        # ledger (observed live: a run's real spend
-                        # enforced as budget-exhausted, terminating it
-                        # at 25/40 reviews with 62% of the cap
-                        # unspent). Deltas remain the fallback for
-                        # legacy providers that return no usage.
-                        _pc_cost = float(
-                            getattr(result_tuple, "cost", 0.0) or 0.0)
-                        _pc_tokens = int(
-                            getattr(result_tuple, "tokens_used", 0) or 0)
-                        if _pc_cost > 0 or _pc_tokens > 0:
-                            cost_delta = _pc_cost
-                            tokens_delta = _pc_tokens
-                            in_delta = int(getattr(
-                                result_tuple, "input_tokens", 0) or 0)
-                            out_delta = int(getattr(
-                                result_tuple, "output_tokens", 0) or 0)
-                            cread_delta = int(getattr(
-                                result_tuple, "cache_read_tokens", 0) or 0)
-                            cwrite_delta = int(getattr(
-                                result_tuple, "cache_write_tokens", 0) or 0)
-
-                        # Reconcile reservation → actual. Skip the
-                        # reservation cancel when cost-tracking is
-                        # disabled (see ``generate`` for the rationale).
-                        # sanitize_cost at the write — same non-finite
-                        # ledger defence as ``generate``.
-                        from core.llm.cost import sanitize_cost
-                        cost_delta = sanitize_cost(cost_delta)
                         with self._stats_lock:
-                            if self.config.enable_cost_tracking:
-                                self.total_cost += cost_delta - reservation
-                            else:
-                                self.total_cost += cost_delta
                             self.request_count += 1
                             if task_type:
                                 self.task_type_costs[task_type] = self.task_type_costs.get(task_type, 0.0) + cost_delta
-                        self._note_call_cost(call_class, cost_delta)
+                        if observation.has_numeric_usd:
+                            self._note_call_cost(call_class, cost_delta)
 
                         logger.debug("Structured generation successful: %s/%s (tokens: %s, cost: $%.4f, duration: %.1fs)", model.provider, model.model_name, tokens_delta, cost_delta, duration)
 
@@ -3989,7 +4949,9 @@ class LLMClient:
                         # Lift the resolved snapshot the provider attached
                         # (StructuredResponse carries it; a bare-tuple return
                         # yields None — alias-only, never guessed).
-                        resolved = getattr(result_tuple, "resolved_model", None)
+                        resolved = self._validated_resolved_model(
+                            getattr(result_tuple, "resolved_model", None),
+                        )
                         structured_response = StructuredResponse(
                             result=result_dict,
                             raw=raw,
@@ -4007,6 +4969,7 @@ class LLMClient:
                             output_tokens=out_delta,
                             cache_read_tokens=cread_delta,
                             cache_write_tokens=cwrite_delta,
+                            cost_observation=observation,
                         )
                         self._record_fired_model(
                             model.provider, model.model_name, resolved,
@@ -4019,6 +4982,7 @@ class LLMClient:
                             input_tokens=in_delta,
                             output_tokens=out_delta,
                             duration_s=duration,
+                            cost_observation=observation,
                         )
                         from core.llm.telemetry import emit as _t_emit
                         _t_emit(
@@ -4037,6 +5001,9 @@ class LLMClient:
                             tokens_out=out_delta,
                             cache_read_tokens=cread_delta,
                             cache_write_tokens=cwrite_delta,
+                            **self._telemetry_observation_fields(
+                                observation,
+                            ),
                         )
                         # Degraded-mode breaker — same seam as
                         # ``generate``: successes dilute the window.
@@ -4045,13 +5012,22 @@ class LLMClient:
                         # Schema reliability signal — the response parsed and
                         # matched the schema (otherwise we'd be in the except
                         # branch). Recorded under _structured at flush time.
-                        self._record_schema_validity(model.model_name, success=True)
-                        # Cache before returning so repeated identical calls
-                        # short-circuit the provider entirely. Cache key is
-                        # tied to model_config (the first-choice model), so
-                        # a fallback's output is filed under the original
-                        # request's identity — matches generate()'s behaviour.
-                        self._save_structured_to_cache(cache_key, structured_response)
+                        self._record_schema_validity(
+                            model.model_name,
+                            success=True,
+                            cost_observation=observation,
+                        )
+                        # Exact pins never publish to the shared logical-route
+                        # cache. Ordinary callers retain shared-cache behavior.
+                        if shared_cache_allowed:
+                            self._save_structured_to_cache(
+                                cache_key,
+                                structured_response,
+                                requested_provider=model_config.provider,
+                                requested_model=model_config.model_name,
+                                serving_provider=model.provider,
+                                serving_model=model.model_name,
+                            )
                         if attempt > 0:
                             logger.info(
                                 "%s/%s recovered after %d attempt(s) "
@@ -4066,6 +5042,30 @@ class LLMClient:
                         # blanket handler so typed callers see it.
                         # See ``generate`` above for the rationale.
                         raise
+                    except LLMPolicyError as e:
+                        if (
+                            attempt_ledger is not None
+                            and attempt_ledger.settled
+                        ):
+                            from core.llm.telemetry import emit as _t_emit
+                            _t_emit(
+                                event="attempt_failed",
+                                disposition="blocked",
+                                call_class=call_class,
+                                provider=model.provider.lower(),
+                                model=model.model_name,
+                                structured=True,
+                                attempt=attempt + 1,
+                                duration_s=round(
+                                    time.monotonic() - attempt_start, 3,
+                                ),
+                                http_version=_transport_http_version(),
+                                error=_sanitize_log_message(str(e))[:200],
+                                **self._failed_attempt_telemetry_fields(
+                                    attempt_ledger,
+                                ),
+                            )
+                        raise
                     except Exception as e:  # noqa: BLE001
                         last_error = e
                         # Schema reliability signal — only record the model as
@@ -4078,7 +5078,11 @@ class LLMClient:
                         # those as this model's schema unreliability and
                         # the SCHEMA_VALID cell would drift to nonsense.
                         if _is_response_shape_failure(e):
-                            self._record_schema_validity(model.model_name, success=False)
+                            self._record_schema_validity(
+                                model.model_name,
+                                success=False,
+                                cost_observation=observation,
+                            )
 
                         if getattr(e, "status_code", None) == 429:
                             from core.llm.throttle import broadcast_rate_limit
@@ -4156,13 +5160,8 @@ class LLMClient:
                             else _failure_disposition(e)
                         )
 
-                        # Same paid-usage attribution as the generate
-                        # loop above — the structured path is where
-                        # the observed burn shapes (truncation,
-                        # thinking-only max_tokens) actually live.
-                        _paid_cost, _paid_in, _paid_out = (
-                            _billed_failure_usage(e)
-                        )
+                        # Same typed-accounting plus legacy paid-usage
+                        # attribution as the generate loop above.
                         from core.llm.telemetry import emit as _t_emit
                         _t_emit(
                             event="attempt_failed",
@@ -4176,14 +5175,9 @@ class LLMClient:
                                 time.monotonic() - attempt_start, 3),
                             http_version=_transport_http_version(),
                             error=_safe_e[:200],
-                            **(
-                                {
-                                    "cost_usd": _paid_cost,
-                                    "tokens_in": _paid_in,
-                                    "tokens_out": _paid_out,
-                                }
-                                if _paid_cost > 0 or _paid_out > 0
-                                else {}
+                            **self._failed_attempt_telemetry_payload(
+                                attempt_ledger, e,
+                                disposition=_disposition,
                             ),
                         )
                         # Degraded-mode breaker — same seam and same
@@ -4295,6 +5289,11 @@ class LLMClient:
             if provider.total_cache_read_tokens or provider.total_cache_write_tokens:
                 pstat["cache_read_tokens"] = provider.total_cache_read_tokens
                 pstat["cache_write_tokens"] = provider.total_cache_write_tokens
+            provider_accounting = getattr(
+                provider, "accounting_summary", None,
+            )
+            if isinstance(provider_accounting, AccountingSummary):
+                pstat["accounting"] = provider_accounting.as_dict()
             provider_stats[key] = pstat
 
         with self._stats_lock:
@@ -4312,10 +5311,17 @@ class LLMClient:
                 ),
                 "providers": provider_stats,
                 "task_type_costs": dict(self.task_type_costs),
+                "accounting": getattr(
+                    self, "_accounting_summary", AccountingSummary(),
+                ).as_dict(),
             }
             if self.cache_hits:
                 stats["cache_hits"] = self.cache_hits
+            cache_bypassed_pinned = getattr(
+                self, "cache_bypassed_pinned", 0,
+            )
+            if cache_bypassed_pinned:
+                stats["cache_bypassed_pinned"] = cache_bypassed_pinned
             if self.cache_tamper_events:
                 stats["cache_tamper_events"] = self.cache_tamper_events
             return stats
-

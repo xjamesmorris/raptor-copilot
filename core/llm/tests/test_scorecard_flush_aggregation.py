@@ -17,6 +17,10 @@ from unittest.mock import MagicMock
 import pytest
 
 import core.llm.client as client_mod
+from core.llm.accounting import (
+    CostObservation,
+    RouteIdentity,
+)
 from core.llm.client import (
     LLMClient,
     _flush_all_scorecards,
@@ -44,6 +48,7 @@ def _make_client(alias: str, *, calls: int, cost: float,
     # ``scorecard`` is a lazy property over ``_scorecard`` — pre-seed
     # the backing slot so the flush writes to a mock, never to disk.
     c._scorecard = MagicMock()
+    c._scorecard.is_model_refused.return_value = False
     return c
 
 
@@ -91,6 +96,135 @@ class TestFlushReturnsStats:
         assert c.flush_usage_to_scorecard(emit_summary=False) is None
         assert c._scorecard.register_uses.call_count == 1
 
+    def test_unknown_observation_skips_scorecard_denominator(self):
+        c = _make_client("unknown-route", calls=1, cost=0.0)
+        c._fired_usage = {}
+        c._record_usage(
+            "unknown-route",
+            cost_observation=CostObservation.unknown(
+                route=RouteIdentity("future", "unknown-route"),
+            ),
+        )
+
+        stats = c.flush_usage_to_scorecard(emit_summary=False)
+
+        assert stats is not None
+        assert stats["calls"] == 1
+        assert stats["scorecard_skipped_unpriced_calls"] == 1
+        c._scorecard.register_uses.assert_not_called()
+
+    def test_catalog_observation_preserves_legacy_scorecard_write(self):
+        c = _make_client("catalog-model", calls=1, cost=0.25)
+        c._fired_usage = {}
+        c._record_usage(
+            "catalog-model",
+            cost=0.25,
+            tokens=10,
+            cost_observation=CostObservation.catalog_priced(
+                0.25,
+                route=RouteIdentity("anthropic", "catalog-model"),
+            ),
+        )
+
+        c.flush_usage_to_scorecard(emit_summary=False)
+
+        uses = c._scorecard.register_uses.call_args.args[0]
+        assert uses == [{
+            "model": "catalog-model",
+            "decision_class": "_usage",
+            "calls": 1,
+            "model_version": None,
+            "cost_usd": 0.25,
+            "tokens": 10,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "latency_ms_sum": 0,
+            "latency_ms_max": 0,
+            "cost_basis": "catalog_priced",
+        }]
+
+    def test_mixed_numeric_bases_omit_single_basis_label(self):
+        c = _make_client("mixed-model", calls=2, cost=0.5)
+        c._fired_usage = {}
+        route = RouteIdentity("anthropic", "mixed-model")
+        c._record_usage(
+            "mixed-model",
+            cost=0.25,
+            cost_observation=CostObservation.catalog_priced(
+                0.25, route=route,
+            ),
+        )
+        c._record_usage(
+            "mixed-model",
+            cost=0.25,
+            cost_observation=CostObservation.configured_rate(
+                0.25, route=route,
+            ),
+        )
+
+        c.flush_usage_to_scorecard(emit_summary=False)
+
+        uses = c._scorecard.register_uses.call_args.args[0]
+        assert len(uses) == 1
+        assert "cost_basis" not in uses[0]
+
+    def test_refused_model_is_reported_without_scorecard_write(self):
+        c = _make_client("ambiguous-model", calls=1, cost=0.25)
+        c._scorecard.is_model_refused.return_value = True
+
+        stats = c.flush_usage_to_scorecard(emit_summary=False)
+
+        assert stats is not None
+        assert stats["scorecard_refused_models"] == ["ambiguous-model"]
+        c._scorecard.register_uses.assert_not_called()
+
+    def test_provider_billed_is_reported_without_v2_write(self):
+        c = _make_client("future-billed", calls=1, cost=0.0)
+        c._fired_usage = {}
+        c._record_usage(
+            "future-billed",
+            cost=0.0,
+            cost_observation=CostObservation.provider_billed(
+                0.0,
+                route=RouteIdentity("future", "future-billed"),
+            ),
+        )
+
+        stats = c.flush_usage_to_scorecard(emit_summary=False)
+
+        assert stats is not None
+        assert stats["scorecard_refused_provider_billed_models"] == [
+            "future-billed",
+        ]
+        c._scorecard.register_uses.assert_not_called()
+
+    def test_mixed_provider_billed_bucket_is_refused(self):
+        c = _make_client("mixed-billed", calls=2, cost=0.5)
+        c._fired_usage = {}
+        route = RouteIdentity("future", "mixed-billed")
+        c._record_usage(
+            "mixed-billed",
+            cost=0.25,
+            cost_observation=CostObservation.catalog_priced(
+                0.25, route=route,
+            ),
+        )
+        c._record_usage(
+            "mixed-billed",
+            cost=0.25,
+            cost_observation=CostObservation.provider_billed(
+                0.25, route=route,
+            ),
+        )
+
+        stats = c.flush_usage_to_scorecard(emit_summary=False)
+
+        assert stats is not None
+        assert stats["scorecard_refused_provider_billed_models"] == [
+            "mixed-billed",
+        ]
+        c._scorecard.register_uses.assert_not_called()
+
 
 class TestProcessAggregation:
     def test_sixteen_clients_one_line(self, capsys):
@@ -112,6 +246,7 @@ class TestProcessAggregation:
         assert lines[0].startswith("scorecard: 16 calls across 1 model(s) ")
         assert "[haiku 16c]" in lines[0]
         assert "$6.7200" in lines[0]
+        assert "legacy; authority unknown" in lines[0]
         # Every client's window still reached the scorecard.
         for c in clients:
             assert c._scorecard.register_uses.call_count == 1

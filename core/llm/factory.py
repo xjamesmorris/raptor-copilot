@@ -74,6 +74,9 @@ def get_client(
         if session is not None:
             return build_llm_client(cfg)
         return LLMClient(cfg)
-    except Exception as e:  # noqa: BLE001 — soft-fail factory by contract
+    except Exception as e:  # noqa: BLE001
+        from core.llm.accounting import LLMPolicyError
+        if isinstance(e, LLMPolicyError):
+            raise
         logger.warning("LLM client not available: %s", e)
         return None

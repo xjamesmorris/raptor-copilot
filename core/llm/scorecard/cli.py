@@ -53,6 +53,7 @@ from .scorecard import (
 # parser-build time, NOT frozen at import — an env override set after
 # import (in-process callers, some test orders) must still win, like
 # every other call site of the resolver.
+LEGACY_COST_LABEL = "Estimated USD (legacy; authority unknown)"
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +311,8 @@ def _stats_to_json(s: DecisionClassStats) -> dict[str, Any]:
         "cheap_incorrect": ev.incorrect,
         "calls": s.calls,
         "cost_usd": s.cost_usd,
+        "cost_basis": "scorecard_legacy",
+        "usd_authority": "unknown",
         "tokens": s.tokens,
         "input_tokens": s.input_tokens,
         "output_tokens": s.output_tokens,
@@ -343,6 +346,14 @@ def _dumps_json_lane(data: Any) -> str:
     so the structured lane cannot carry live terminal controls either;
     output stays valid JSON for consumers that parse it."""
     return json.dumps(data, indent=2, ensure_ascii=True, default=str)
+
+
+def _legacy_cost_display(stats: DecisionClassStats) -> str:
+    if stats.calls <= 0:
+        return "—"
+    if stats.cost_usd <= 0:
+        return "unavailable"
+    return f"${stats.cost_usd:.4f} est."
 
 
 def _render_table(
@@ -387,11 +398,11 @@ def _render_table(
             _event_correct_count(s, event_type),
             _humanise_age(s.last_seen_at),
             s.calls,
-            f"${s.cost_usd:.4f}" if s.cost_usd else "$0",
+            _legacy_cost_display(s),
         ))
     headers = (
         "decision_class", "model", "n", "max_miss%",
-        "policy", correct_col, "last_seen", "calls", "$$",
+        "policy", correct_col, "last_seen", "calls", LEGACY_COST_LABEL,
     )
     widths = [
         max(len(headers[i]), max((len(str(r[i])) for r in rows), default=0))
@@ -422,7 +433,7 @@ def _render_compare(
             f"{model_b})_"
         )
     def _cost(s: DecisionClassStats) -> str:
-        return f"${s.cost_usd:.4f}" if s.cost_usd else "$0"
+        return _legacy_cost_display(s)
 
     rows = []
     for dc in shared:
@@ -445,9 +456,9 @@ def _render_compare(
     headers = (
         "decision_class",
         f"{model_a} n", f"{model_a} max_miss%", f"{model_a} policy",
-        f"{model_a} calls", f"{model_a} $$",
+        f"{model_a} calls", f"{model_a} legacy estimate",
         f"{model_b} n", f"{model_b} max_miss%", f"{model_b} policy",
-        f"{model_b} calls", f"{model_b} $$",
+        f"{model_b} calls", f"{model_b} legacy estimate",
     )
     widths = [
         max(len(headers[i]), max((len(str(r[i])) for r in rows), default=0))
@@ -674,7 +685,7 @@ def cmd_summary(args: argparse.Namespace) -> int:
     sc_aliases = {m for (_, m) in sc_models_by_dc}
     for m in sc_aliases:
         u = usage_cell_by_model.get(m)
-        if u and u.calls > 0:
+        if u and u.calls > 0 and u.cost_usd > 0:
             cpc = u.cost_usd / u.calls
             if cheapest is None or cpc < cheapest[1]:
                 cheapest = (m, cpc)
@@ -706,6 +717,8 @@ def cmd_summary(args: argparse.Namespace) -> int:
                 "short_circuit": short_circuit, "learning": learning, "fall_through": fall_through,
             },
             "total_spend_usd": total_cost,
+            "cost_basis": "scorecard_legacy",
+            "usd_authority": "unknown",
             "spend_by_model": dict(cost_per_model),
             "calls_by_model": dict(calls_per_model),
             "most_used": (
@@ -729,11 +742,14 @@ def cmd_summary(args: argparse.Namespace) -> int:
     cost_lines = [f"{_scrub_cell(m)} ${c:.4f}" for m, c in sorted(
         cost_per_model.items(), key=lambda x: -x[1]) if c > 0]
     cost_break = " (" + ", ".join(cost_lines) + ")" if cost_lines else ""
-    print(f"  total spend: ${total_cost:.4f}{cost_break}")
+    print(f"  {LEGACY_COST_LABEL}: ${total_cost:.4f}{cost_break}")
     if most_used[0] and most_used[1] > 0:
         print(f"  most-used: {_scrub_cell(most_used[0])} ({most_used[1]} calls)")
     if cheapest:
-        print(f"  cheapest trusted: {_scrub_cell(cheapest[0])} @ ${cheapest[1]:.4f}/call")
+        print(
+            "  lowest legacy estimate among trusted: "
+            f"{_scrub_cell(cheapest[0])} @ ${cheapest[1]:.4f}/call",
+        )
     print(f"  recent activity: {recent} cells last seen in last 7d")
     return 0
 
@@ -769,7 +785,11 @@ def cmd_recommend(args: argparse.Namespace) -> int:
     for c in candidates:
         ub = _wilson_ub_pct(c, EventType.CHEAP_SHORT_CIRCUIT)
         u = usage_by_model.get(c.model)
-        cpc = (u.cost_usd / u.calls) if u and u.calls else None
+        cpc = (
+            u.cost_usd / u.calls
+            if u and u.calls and u.cost_usd > 0
+            else None
+        )
         ev = c.events[EventType.CHEAP_SHORT_CIRCUIT]
         rows.append((c.model, ub, cpc, _policy_for_stats(c), ev.correct + ev.incorrect))
 
@@ -792,6 +812,8 @@ def cmd_recommend(args: argparse.Namespace) -> int:
         out = {
             "decision_class": target_dc,
             "freshness_half_life_days": hl,
+            "cost_basis": "scorecard_legacy",
+            "usd_authority": "unknown",
             "short_circuit": [_r(r) for r in sc_rows],
             "learning": [r[0] for r in learning],
             "fall_through": [_r(r) for r in fall_through],
@@ -815,7 +837,11 @@ def cmd_recommend(args: argparse.Namespace) -> int:
         return f"{x:.1f}% max_miss" if x is not None else "max_miss=n/a"
 
     def _fmt_cpc(x) -> str:
-        return f"${x:.4f}/call" if x is not None else "no cost data"
+        return (
+            f"${x:.4f}/call legacy estimate"
+            if x is not None
+            else "no usable cost estimate"
+        )
 
     # Model names are sidecar-derived (same forgeable provenance as the
     # table cells) — scrub before the terminal, like every other lane.
@@ -892,13 +918,17 @@ def cmd_chain_closure(args: argparse.Namespace) -> int:
 
     # For each candidate: n = successes + failures on this cell;
     # success_rate = success / n; cost_per_fire from _usage.
-    rows = []
+    rows: list[dict[str, Any]] = []
     for c in candidates:
         ev = c.events[EventType.EXPLOIT_CHAIN_CLOSURE]
         n = ev.correct + ev.incorrect
         rate = (ev.correct / n) if n else None
         u = usage_by_model.get(c.model)
-        cpc = (u.cost_usd / u.calls) if u and u.calls else None
+        cpc = (
+            u.cost_usd / u.calls
+            if u and u.calls and u.cost_usd > 0
+            else None
+        )
         rows.append({
             "model": c.model,
             "n": n,
@@ -945,13 +975,15 @@ def cmd_chain_closure(args: argparse.Namespace) -> int:
             "decision_class": target_dc,
             "candidates": rows,
             "recommendation": _recommendation(),
+            "cost_basis": "scorecard_legacy",
+            "usd_authority": "unknown",
         }))
         return 0
 
     print(f"chain-closure ranking for {target_dc}:")
     print(
         f"  {'model':<28} {'n':>4} {'succ':>4} "
-        f"{'rate':>7} {'cost/fire':>10}",
+        f"{'rate':>7} {'legacy est./fire':>16}",
     )
     for r in rows:
         rate_s = f"{r['success_rate']*100:5.1f}%" if r['success_rate'] is not None else "  n/a"  # type: ignore[operator]
@@ -960,7 +992,7 @@ def cmd_chain_closure(args: argparse.Namespace) -> int:
         # terminal, like the list/compare table cells.
         print(
             f"  {_scrub_cell(r['model']):<28} {r['n']:>4} {r['successes']:>4} "
-            f"{rate_s:>7} {cpc_s:>10}",
+            f"{rate_s:>7} {cpc_s:>16}",
         )
     return 0
 
@@ -1351,7 +1383,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_list.add_argument(
         "--by-cost", action="store_true",
-        help="sort by total spend on this cell (descending) — the $$ column.",
+        help=(
+            "sort by legacy estimated USD on this cell "
+            "(descending)"
+        ),
     )
     p_list.add_argument(
         "--untrusted", action="store_true",
@@ -1403,8 +1438,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_sum = sub.add_parser(
         "summary",
         help=(
-            "one-shot dashboard: cell totals, policy breakdown, total spend, "
-            "most-used model, cheapest trusted, recent activity"
+            "one-shot dashboard: cell totals, policy breakdown, legacy "
+            "estimated USD, most-used model, recent activity"
         ),
     )
     p_sum.add_argument(

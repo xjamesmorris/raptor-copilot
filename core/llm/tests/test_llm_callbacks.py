@@ -640,8 +640,11 @@ class TestBudgetReservationConcurrency:
         # short-circuit — but cache hits don't even reach the loop
         # body's acquire, so we patch _check_budget too to isolate
         # the cache-path behaviour we're asserting.
-        with patch.object(client, "_get_cached_response",
-                          return_value="cached content"), \
+        with patch.object(
+            client,
+            "_get_cached_response",
+            return_value=("cached content", "gpt-5.2", "openai", None),
+        ), \
              patch.object(client, "_check_budget", return_value=True):
             response = client.generate(prompt="anything")
         # Cache hit returned the cached content with cost=0.

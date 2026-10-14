@@ -108,6 +108,64 @@ class TestInputValidation:
                 adapter=IdentityAdapter(),
             )
 
+    def test_same_declared_model_across_routes_refuses_before_submission(self):
+        submitted: list[str] = []
+
+        def task(model):
+            submitted.append(model.model_name)
+            return []
+
+        with pytest.raises(
+            ValueError,
+            match=(
+                "declared same model via different routes is not "
+                "independent consensus"
+            ),
+        ):
+            run_multi_model(
+                task=task,
+                models=[
+                    FakeModel("anthropic/claude-opus-4-8"),
+                    FakeModel("bedrock/anthropic.claude-opus-4-8"),
+                ],
+                adapter=IdentityAdapter(),
+            )
+
+        assert submitted == []
+
+    def test_same_declared_model_comparison_is_case_and_space_safe(self):
+        with pytest.raises(ValueError, match="not independent consensus"):
+            run_multi_model(
+                task=lambda model: [],
+                models=[
+                    FakeModel("  Anthropic/Claude-Opus-4-8  "),
+                    FakeModel("bedrock/anthropic.claude-opus-4-8"),
+                ],
+                adapter=IdentityAdapter(),
+            )
+
+    def test_same_family_distinct_models_remain_allowed(self):
+        result = run_multi_model(
+            task=lambda model: [{"id": model.model_name}],
+            models=[
+                FakeModel("anthropic/claude-opus-4-8"),
+                FakeModel("bedrock/anthropic.claude-sonnet-5"),
+            ],
+            adapter=IdentityAdapter(),
+        )
+        assert len(result.items) == 2
+
+    def test_self_consistency_handles_remain_allowed(self):
+        result = run_multi_model(
+            task=lambda model: [{"id": model.model_name}],
+            models=[
+                FakeModel("claude-opus-4-8#sc0"),
+                FakeModel("claude-opus-4-8#sc1"),
+            ],
+            adapter=IdentityAdapter(),
+        )
+        assert len(result.items) == 2
+
     def test_multiple_duplicates_listed(self):
         with pytest.raises(ValueError, match=r"\['a', 'b'\]"):
             run_multi_model(

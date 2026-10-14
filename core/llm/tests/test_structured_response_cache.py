@@ -58,15 +58,25 @@ def test_cache_key_no_delimiter_injection(tmp_path: Path) -> None:
     (system='A:B', prompt='C') hashed identically pre-fix, replaying
     the wrong cached response across callers."""
     client = _client(tmp_path)
-    k1 = client._get_cache_key("B:C", "A", "m")
-    k2 = client._get_cache_key("C", "A:B", "m")
+    k1 = client._get_cache_key(
+        "B:C", "A", "m", provider="anthropic",
+    )
+    k2 = client._get_cache_key(
+        "C", "A:B", "m", provider="anthropic",
+    )
     assert k1 != k2
     # Model/system boundary too.
-    k3 = client._get_cache_key("p", "s", "m:x")
-    k4 = client._get_cache_key("p", "x:s", "m")
+    k3 = client._get_cache_key(
+        "p", "s", "m:x", provider="anthropic",
+    )
+    k4 = client._get_cache_key(
+        "p", "x:s", "m", provider="anthropic",
+    )
     assert k3 != k4
     # Determinism: same inputs, same key.
-    assert k1 == client._get_cache_key("B:C", "A", "m")
+    assert k1 == client._get_cache_key(
+        "B:C", "A", "m", provider="anthropic",
+    )
 
 
 def test_structured_cache_key_no_delimiter_injection(
@@ -74,10 +84,16 @@ def test_structured_cache_key_no_delimiter_injection(
     """Structured twin of the delimiter-injection guard above."""
     client = _client(tmp_path)
     schema = {"verdict": "string"}
-    k1 = client._get_structured_cache_key("B:C", "A", "m", schema)
-    k2 = client._get_structured_cache_key("C", "A:B", "m", schema)
+    k1 = client._get_structured_cache_key(
+        "B:C", "A", "m", schema, provider="anthropic",
+    )
+    k2 = client._get_structured_cache_key(
+        "C", "A:B", "m", schema, provider="anthropic",
+    )
     assert k1 != k2
-    assert k1 == client._get_structured_cache_key("B:C", "A", "m", schema)
+    assert k1 == client._get_structured_cache_key(
+        "B:C", "A", "m", schema, provider="anthropic",
+    )
 
 
 def test_different_schema_does_not_collide(tmp_path: Path) -> None:
@@ -547,5 +563,13 @@ class TestCacheEnableSwitch:
         # (core.testing) — see test_adoption_driftguard.
         assert LLMConfig().enable_caching is False
         client = _client(tmp_path, enable_caching=False)
-        assert client._get_cached_response("deadbeef") is None
-        assert client._get_cached_structured_response("deadbeef") is None
+        assert client._get_cached_response(
+            "deadbeef",
+            requested_provider="anthropic",
+            requested_model="test-primary",
+        ) is None
+        assert client._get_cached_structured_response(
+            "deadbeef",
+            requested_provider="anthropic",
+            requested_model="test-primary",
+        ) is None

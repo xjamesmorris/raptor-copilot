@@ -29,9 +29,16 @@ import logging
 import math
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from core.llm.accounting import (
+    AccountingSummary,
+    CostBasis,
+    CostObservation,
+    format_accounting_summary,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,11 +80,16 @@ class _ClassStats:
     # cost_usd so mean_call_cost — which sizes budget reservations
     # from COMPLETED calls — never inflates on a failure burst.
     failed_cost_usd: float = 0.0
+    priced_calls: int = 0
+    priced_call_cost_usd: float = 0.0
     duration_s: float = 0.0
     tokens_in: int = 0
     tokens_out: int = 0
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
+    accounting: AccountingSummary = field(
+        default_factory=AccountingSummary,
+    )
 
 
 class TelemetrySink:
@@ -142,6 +154,8 @@ class TelemetrySink:
         cls = str(rec.get("call_class") or "unclassified")
         st = self._by_class.setdefault(cls, _ClassStats())
         event = rec.get("event")
+        is_cache_hit = rec.get("disposition") == "cache_hit"
+        observation = self._record_observation(rec)
         if event == "attempt_failed":
             st.failed_attempts += 1
             if rec.get("disposition") == "timeout":
@@ -150,22 +164,27 @@ class TelemetrySink:
                 st.blocked += 1
             elif rec.get("disposition") == "consumed":
                 st.consumed += 1
-        elif rec.get("disposition") == "cache_hit":
+            if observation.basis is CostBasis.UNKNOWN:
+                retained = self._safe_nonnegative(
+                    rec.get("retained_reservation_estimate_usd"),
+                )
+                st.accounting = st.accounting.add_unknown_failure(
+                    retained_reservation_estimate_usd=retained or 0.0,
+                )
+            else:
+                st.accounting = st.accounting.add(observation)
+                st.failed_cost_usd += observation.legacy_cost_usd
+        elif is_cache_hit:
             st.cache_hits += 1
         else:
             st.calls += 1
-        # sanitize_cost: this aggregate feeds mean_call_cost, which
-        # sizes the client's budget reservations — one NaN record
-        # would poison every later reservation and, through
-        # _acquire_budget's pre-debit, the budget ledger itself.
-        # Failed-attempt spend books into its own counter (see
-        # _ClassStats.failed_cost_usd) so the completed-call mean
-        # stays honest while the money stays visible.
-        from core.llm.cost import sanitize_cost
-        if event == "attempt_failed":
-            st.failed_cost_usd += sanitize_cost(rec.get("cost_usd"))
-        else:
-            st.cost_usd += sanitize_cost(rec.get("cost_usd"))
+            st.accounting = st.accounting.add(observation)
+            st.cost_usd += observation.legacy_cost_usd
+            if observation.has_numeric_usd:
+                st.priced_calls += 1
+                st.priced_call_cost_usd += (
+                    observation.legacy_cost_usd
+                )
         st.duration_s += float(rec.get("duration_s") or 0.0)
         st.tokens_in += int(rec.get("tokens_in") or 0)
         st.tokens_out += int(rec.get("tokens_out") or 0)
@@ -182,9 +201,9 @@ class TelemetrySink:
         ``failed_cost_usd`` — neither skews the mean)."""
         with self._lock:
             st = self._by_class.get(str(call_class))
-            if st is None or st.calls <= 0:
+            if st is None or st.priced_calls <= 0:
                 return None
-            return st.cost_usd / st.calls
+            return st.priced_call_cost_usd / st.priced_calls
 
     def class_costs(self) -> dict[str, tuple[int, float]]:
         """Snapshot of per-class completed-call counts and spend:
@@ -192,7 +211,7 @@ class TelemetrySink:
         reconciliation to book call classes no phase captured."""
         with self._lock:
             return {
-                cls: (s.calls, s.cost_usd)
+                cls: (s.priced_calls, s.priced_call_cost_usd)
                 for cls, s in self._by_class.items()
             }
 
@@ -222,6 +241,14 @@ class TelemetrySink:
                 for s in self._by_class.values()
             )
 
+    def accounting_summary(self) -> AccountingSummary:
+        """Snapshot the complete per-basis telemetry aggregate."""
+        with self._lock:
+            summary = AccountingSummary()
+            for stats in self._by_class.values():
+                summary = summary.merge(stats.accounting)
+            return summary
+
     @property
     def total_records(self) -> int:
         with self._lock:
@@ -243,17 +270,20 @@ class TelemetrySink:
             timeouts = sum(s.timeouts for s in self._by_class.values())
             blocked = sum(s.blocked for s in self._by_class.values())
             consumed = sum(s.consumed for s in self._by_class.values())
-            cost = sum(s.cost_usd for s in self._by_class.values())
             failed_cost = sum(
                 s.failed_cost_usd for s in self._by_class.values()
             )
+            accounting = AccountingSummary()
+            for stats in self._by_class.values():
+                accounting = accounting.merge(stats.accounting)
             tin = sum(s.tokens_in for s in self._by_class.values())
             tout = sum(s.tokens_out for s in self._by_class.values())
             cread = sum(s.cache_read_tokens for s in self._by_class.values())
             cwrite = sum(s.cache_write_tokens for s in self._by_class.values())
 
             parts = [
-                (f"llm telemetry: {calls} calls (${cost:.2f}, "
+                (f"llm telemetry: {calls} calls "
+                 f"({format_accounting_summary(accounting)}, "
                  f"{_k(tin)} in / {_k(tout)} out)"),
             ]
             if cread or cwrite:
@@ -309,6 +339,49 @@ class TelemetrySink:
             if per_class:
                 parts.append(f"classes: {per_class}")
             return "; ".join(parts)
+
+    @staticmethod
+    def _safe_nonnegative(value: Any) -> float | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            amount = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(amount) or amount < 0:
+            return None
+        return amount
+
+    @classmethod
+    def _record_observation(
+        cls, rec: dict[str, Any],
+    ) -> CostObservation:
+        raw_basis = rec.get("cost_basis")
+        if raw_basis is None:
+            basis = CostBasis.CONFIGURED_RATE
+        else:
+            try:
+                basis = CostBasis(raw_basis)
+            except (TypeError, ValueError):
+                basis = CostBasis.UNKNOWN
+        amount = cls._safe_nonnegative(rec.get("cost_usd"))
+        if basis is CostBasis.PROVIDER_BILLED and amount is not None:
+            return CostObservation.provider_billed(amount)
+        if basis is CostBasis.CATALOG_PRICED and amount is not None:
+            catalog_version = rec.get("catalog_version")
+            if catalog_version:
+                return CostObservation.catalog_priced(
+                    amount,
+                    catalog_version=str(catalog_version),
+                )
+            return CostObservation.catalog_priced(amount)
+        if basis is CostBasis.CONFIGURED_RATE and amount is not None:
+            return CostObservation.configured_rate(amount)
+        if basis is CostBasis.CLI_REPORTED and amount is not None:
+            return CostObservation.cli_reported(amount)
+        if basis is CostBasis.SUBSCRIPTION:
+            return CostObservation.subscription()
+        return CostObservation.unknown()
 
 
 # ── Module-level sink registry ────────────────────────────────────────

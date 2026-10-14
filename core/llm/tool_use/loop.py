@@ -55,6 +55,27 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from core.llm.providers import LLMProvider
 
+from core.llm.accounting import (
+    AccountingCapability,
+    AccountingMode,
+    AccountingSummary,
+    AttemptLedger,
+    CostBasis,
+    CostObservation,
+    LLMAccountingUnavailableError,
+    LLMHardLimitUnsupportedError,
+    LLMPolicyError,
+    PinnedRouteSnapshot,
+    PinnedRouteViolation,
+    RouteIdentity,
+    TrustedUsdRoute,
+    UsdBudgetContract,
+    cost_observation_from_exception,
+    is_basis_authorized,
+    is_observation_authorized,
+    normalize_budget_contract,
+    normalize_trusted_routes,
+)
 from core.security.prompt_envelope import unwrap_untrusted, wrap_tool_result
 from core.security.prompt_input_preflight import preflight
 
@@ -213,6 +234,10 @@ class ToolUseLoop:
         terminal_tool: str | None = None,
         max_iterations: int = 50,
         max_cost_usd: float | None = None,
+        usd_budget_contract: UsdBudgetContract | str = (
+            UsdBudgetContract.ADVISORY
+        ),
+        trusted_usd_routes: Sequence[TrustedUsdRoute] = (),
         max_seconds: float | None = None,
         max_total_tokens: int | None = None,
         tool_timeout_s: float | None = None,
@@ -300,6 +325,26 @@ class ToolUseLoop:
         self._terminal_tool = terminal_tool
         self._max_iterations = max_iterations
         self._max_cost_usd = max_cost_usd
+        self._usd_budget_contract = normalize_budget_contract(
+            usd_budget_contract,
+        )
+        self._trusted_usd_routes = normalize_trusted_routes(
+            trusted_usd_routes,
+        )
+        if (
+            self._usd_budget_contract is not UsdBudgetContract.ADVISORY
+            and (max_cost_usd is None or max_cost_usd <= 0)
+        ):
+            raise ValueError(
+                "non-advisory usd_budget_contract requires a positive "
+                "max_cost_usd",
+            )
+        self._accounting_summary = AccountingSummary()
+        self._accounting_terminal_error: (
+            LLMAccountingUnavailableError | None
+        ) = None
+        self._accounting_legacy_total_usd = 0.0
+        self._active_run_cost_start = 0.0
         self._max_seconds = max_seconds
         self._max_total_tokens = max_total_tokens
         self._tool_timeout_s = tool_timeout_s
@@ -393,6 +438,8 @@ class ToolUseLoop:
         total_input_tokens = 0
         total_output_tokens = 0
         total_cost_usd = 0.0
+        run_cost_start = self._accounting_legacy_total_usd
+        self._active_run_cost_start = run_cost_start
         tool_calls_made = 0
         terminal_tool_input: dict[str, Any] | None = None
         # Per-turn token accounting — one (input, output) tuple appended
@@ -515,6 +562,7 @@ class ToolUseLoop:
                         reason="give_up",
                         iterations=iteration,
                         total_cost_usd=total_cost_usd,
+                        accounting=self._accounting_summary,
                     ))
                     return ToolLoopResult(
                         final_text="",
@@ -527,6 +575,7 @@ class ToolUseLoop:
                         total_cost_usd=total_cost_usd,
                         terminated_by="give_up",
                         per_turn_tokens=tuple(per_turn_tokens),
+                        accounting=self._accounting_summary,
                     )
 
             # ---- pre-flight: cost budget --------------------------------
@@ -538,6 +587,7 @@ class ToolUseLoop:
                     reason="max_cost_usd",
                     iterations=iteration,
                     total_cost_usd=total_cost_usd,
+                    accounting=self._accounting_summary,
                 ))
                 msg_0 = (
                     f"cost budget ${self._max_cost_usd:.4f} reached "
@@ -548,6 +598,7 @@ class ToolUseLoop:
                     msg_0,
                     messages=messages,
                     tool_calls_made=tool_calls_made,
+                    accounting=self._accounting_summary,
                 )
 
             # ---- pre-flight: wall-clock budget --------------------------
@@ -565,6 +616,7 @@ class ToolUseLoop:
                     reason="max_seconds",
                     iterations=iteration,
                     total_cost_usd=total_cost_usd,
+                    accounting=self._accounting_summary,
                 ))
                 return ToolLoopResult(
                     final_text="",
@@ -577,6 +629,7 @@ class ToolUseLoop:
                     total_cost_usd=total_cost_usd,
                     terminated_by="max_seconds",
                     per_turn_tokens=tuple(per_turn_tokens),
+                    accounting=self._accounting_summary,
                 )
 
             # ---- pre-flight: total-tokens budget ------------------------
@@ -594,6 +647,7 @@ class ToolUseLoop:
                     reason="max_total_tokens",
                     iterations=iteration,
                     total_cost_usd=total_cost_usd,
+                    accounting=self._accounting_summary,
                 ))
                 return ToolLoopResult(
                     final_text="",
@@ -606,6 +660,7 @@ class ToolUseLoop:
                     total_cost_usd=total_cost_usd,
                     terminated_by="max_total_tokens",
                     per_turn_tokens=tuple(per_turn_tokens),
+                    accounting=self._accounting_summary,
                 )
 
             # ---- pre-flight: context window -----------------------------
@@ -617,6 +672,7 @@ class ToolUseLoop:
                         reason="context_overflow",
                         iterations=iteration,
                         total_cost_usd=total_cost_usd,
+                        accounting=self._accounting_summary,
                     ))
                     msg_0 = (
                         f"request estimate ~{request_estimate} tokens "
@@ -628,6 +684,7 @@ class ToolUseLoop:
                         msg_0,
                         messages=messages,
                         tool_calls_made=tool_calls_made,
+                        accounting=self._accounting_summary,
                     )
                 # TRUNCATE_OLDEST: drop oldest user/assistant pair until
                 # estimate fits. Pairing-aware so tool_use/tool_result
@@ -670,15 +727,23 @@ class ToolUseLoop:
                         iteration, messages, cache_control,
                     )
                 else:
-                    response = self._provider.turn(
+                    response = self._execute_turn_attempt(
                         messages,
-                        self._tools,
-                        system=self._system,
-                        max_tokens=self._max_tokens_per_turn,
-                        cache_control=cache_control,
-                        **self._provider_specific,
+                        lambda: self._provider.turn(
+                            messages,
+                            self._tools,
+                            system=self._system,
+                            max_tokens=self._max_tokens_per_turn,
+                            cache_control=cache_control,
+                            **self._provider_attempt_kwargs(),
+                        ),
                     )
-            except Exception as exc:
+            except BaseException as exc:
+                total_cost_usd = (
+                    self._accounting_legacy_total_usd - run_cost_start
+                )
+                if isinstance(exc, LLMPolicyError):
+                    raise
                 from core.llm.providers import is_credit_exhausted
                 reason = (
                     "credit_exhausted"
@@ -690,11 +755,14 @@ class ToolUseLoop:
                     iterations=iteration,
                     total_cost_usd=total_cost_usd,
                     error_message=str(exc),
+                    accounting=self._accounting_summary,
                 ))
                 raise
 
-            cost = self._provider.compute_cost(response)
-            total_cost_usd += cost
+            cost = response.cost_observation.legacy_cost_usd
+            total_cost_usd = (
+                self._accounting_legacy_total_usd - run_cost_start
+            )
             total_input_tokens += response.input_tokens
             total_output_tokens += response.output_tokens
             self._emit(TurnCompleted(
@@ -744,6 +812,7 @@ class ToolUseLoop:
                     reason="complete",
                     iterations=iteration + 1,
                     total_cost_usd=total_cost_usd,
+                    accounting=self._accounting_summary,
                 ))
                 return ToolLoopResult(
                     final_text=final_text,
@@ -756,6 +825,7 @@ class ToolUseLoop:
                     total_cost_usd=total_cost_usd,
                     terminated_by="complete",
                     per_turn_tokens=tuple(per_turn_tokens),
+                    accounting=self._accounting_summary,
                 )
 
             # ---- PAUSE_TURN: model pause-resumed extended thinking ----
@@ -820,6 +890,7 @@ class ToolUseLoop:
                     iterations=iteration + 1,
                     total_cost_usd=total_cost_usd,
                     error_message=err,
+                    accounting=self._accounting_summary,
                 ))
                 return ToolLoopResult(
                     final_text=_join_text(response.content),
@@ -833,6 +904,7 @@ class ToolUseLoop:
                     terminated_by=term_reason,    # type: ignore[arg-type]
                     error_message=err,
                     per_turn_tokens=tuple(per_turn_tokens),
+                    accounting=self._accounting_summary,
                 )
 
             # ---- dispatch tools -----------------------------------------
@@ -925,6 +997,7 @@ class ToolUseLoop:
                                 reason="tool_timeout",
                                 iterations=iteration + 1,
                                 total_cost_usd=total_cost_usd,
+                                accounting=self._accounting_summary,
                             ))
                             raise
                         result = ToolResult(
@@ -938,6 +1011,7 @@ class ToolUseLoop:
                                 reason="tool_error",
                                 iterations=iteration + 1,
                                 total_cost_usd=total_cost_usd,
+                                accounting=self._accounting_summary,
                             ))
                             raise
                         result = ToolResult(
@@ -1145,6 +1219,7 @@ class ToolUseLoop:
                     reason="terminal_tool",
                     iterations=iteration + 1,
                     total_cost_usd=total_cost_usd,
+                    accounting=self._accounting_summary,
                 ))
                 return ToolLoopResult(
                     final_text=_join_text(response.content),
@@ -1157,6 +1232,7 @@ class ToolUseLoop:
                     total_cost_usd=total_cost_usd,
                     terminated_by="terminal_tool",
                     per_turn_tokens=tuple(per_turn_tokens),
+                    accounting=self._accounting_summary,
                 )
 
         # ---- max_iterations hit -----------------------------------------
@@ -1164,6 +1240,7 @@ class ToolUseLoop:
             reason="max_iterations",
             iterations=self._max_iterations,
             total_cost_usd=total_cost_usd,
+            accounting=self._accounting_summary,
         ))
         return ToolLoopResult(
             final_text="",
@@ -1176,6 +1253,7 @@ class ToolUseLoop:
             total_cost_usd=total_cost_usd,
             terminated_by="max_iterations",
             per_turn_tokens=tuple(per_turn_tokens),
+            accounting=self._accounting_summary,
         )
 
     # ------------------------------------------------------------------
@@ -1186,11 +1264,316 @@ class ToolUseLoop:
         if self._events is not None:
             self._events(event)
 
+    @property
+    def accounting_summary(self) -> AccountingSummary:
+        return self._accounting_summary
+
+    def _route(self) -> RouteIdentity:
+        config = getattr(self._provider, "config", None)
+        provider_name = getattr(config, "provider", None)
+        model_name = getattr(config, "model_name", None)
+        fallback_model_name = getattr(self._provider, "model_name", None)
+        return RouteIdentity(
+            (
+                provider_name
+                if isinstance(provider_name, str) and provider_name.strip()
+                else type(self._provider).__name__
+            ),
+            (
+                model_name
+                if isinstance(model_name, str) and model_name.strip()
+                else (
+                    fallback_model_name
+                    if (
+                        isinstance(fallback_model_name, str)
+                        and fallback_model_name.strip()
+                    )
+                    else type(self._provider).__name__
+                )
+            ),
+        )
+
+    def _capability(self) -> AccountingCapability:
+        method = getattr(self._provider, "accounting_capability", None)
+        if not callable(method):
+            return AccountingCapability()
+        try:
+            capability = method()
+        except Exception:
+            logger.debug(
+                "tool-loop provider accounting capability failed",
+                exc_info=True,
+            )
+            return AccountingCapability()
+        return (
+            capability
+            if isinstance(capability, AccountingCapability)
+            else AccountingCapability()
+        )
+
+    def _expected_basis(self) -> CostBasis:
+        method = getattr(self._provider, "expected_cost_basis", None)
+        if not callable(method):
+            return CostBasis.UNKNOWN
+        try:
+            return CostBasis(method())
+        except (TypeError, ValueError):
+            return CostBasis.UNKNOWN
+
+    def _raise_accounting_latch(self) -> None:
+        if self._accounting_terminal_error is not None:
+            raise self._accounting_terminal_error
+
+    def _validate_pinned_route(self) -> None:
+        validator = getattr(self._provider, "validate_pinned_route", None)
+        if callable(validator):
+            validator()
+            return
+        snapshot = getattr(
+            self._provider, "_raptor_pinned_route_snapshot", None,
+        )
+        if not isinstance(snapshot, PinnedRouteSnapshot):
+            return
+        config = getattr(self._provider, "config", None)
+        current = (
+            PinnedRouteSnapshot.from_model_config(config)
+            if config is not None
+            else None
+        )
+        if current != snapshot:
+            raise PinnedRouteViolation(
+                "Pinned route violation before tool turn: expected "
+                f"{snapshot.provider}/{snapshot.model}; effective route "
+                "or configuration changed",
+            )
+
+    def _ensure_fresh_attempt_allowed(self) -> None:
+        self._validate_pinned_route()
+        self._raise_accounting_latch()
+        if self._usd_budget_contract is UsdBudgetContract.ADVISORY:
+            return
+        route = self._route()
+        if self._usd_budget_contract is UsdBudgetContract.HARD_LIMIT_REQUIRED:
+            raise LLMHardLimitUnsupportedError(
+                "hard_limit_required is unsupported for current route "
+                f"{route.provider}/{route.model}",
+                accounting=self._accounting_summary,
+            )
+        capability = self._capability()
+        basis = self._expected_basis()
+        if (
+            capability.mode is not AccountingMode.AUTHORITATIVE
+            or not is_basis_authorized(
+                basis=basis,
+                route=route,
+                trusted_routes=self._trusted_usd_routes,
+            )
+        ):
+            raise LLMAccountingUnavailableError(
+                "authoritative_required cannot dispatch route "
+                f"{route.provider}/{route.model}: basis={basis.value} "
+                "is not provider_billed or explicitly trusted for this "
+                "exact route",
+                accounting=self._accounting_summary,
+            )
+
+    def _provider_attempt_kwargs(self) -> dict[str, Any]:
+        kwargs = dict(self._provider_specific)
+        if self._usd_budget_contract is not UsdBudgetContract.ADVISORY:
+            # A strict loop settles one transport request per ledger entry.
+            # Provider-internal retries would hide separately billable
+            # attempts behind a single settlement.
+            kwargs["max_retries"] = 0
+        return kwargs
+
+    def _reservation_estimate(
+        self,
+        messages: Sequence[Message],
+    ) -> float:
+        if self._usd_budget_contract is UsdBudgetContract.ADVISORY:
+            return 0.0
+        estimate = 0.0
+        try:
+            response = TurnResponse(
+                content=[],
+                stop_reason=StopReason.COMPLETE,
+                input_tokens=self._estimate_request_tokens(messages),
+                output_tokens=self._max_tokens_per_turn,
+            )
+            estimate = float(self._provider.compute_cost(response) or 0.0)
+        except Exception:
+            estimate = 0.0
+        if estimate <= 0.0:
+            estimate = 0.10
+        return estimate
+
+    def _turn_observation(
+        self,
+        response: TurnResponse,
+    ) -> CostObservation:
+        method = getattr(self._provider, "turn_cost_observation", None)
+        if callable(method):
+            try:
+                observation = method(response)
+            except Exception:
+                logger.debug(
+                    "tool-loop cost observation failed", exc_info=True,
+                )
+            else:
+                if isinstance(observation, CostObservation):
+                    return observation
+        try:
+            legacy_cost = float(self._provider.compute_cost(response) or 0.0)
+        except Exception:
+            legacy_cost = 0.0
+        if legacy_cost > 0.0:
+            try:
+                return CostObservation.configured_rate(
+                    legacy_cost, route=self._route(),
+                )
+            except (TypeError, ValueError):
+                pass
+        return CostObservation.unknown(route=self._route())
+
+    def _latch_accounting_error(
+        self,
+        *,
+        reason: str,
+    ) -> LLMAccountingUnavailableError:
+        if self._accounting_terminal_error is None:
+            route = self._route()
+            self._accounting_terminal_error = (
+                LLMAccountingUnavailableError(
+                    "authoritative USD accounting became unavailable for "
+                    f"{route.provider}/{route.model}: {reason}; no later "
+                    "fresh turn is permitted on this loop",
+                    accounting=self._accounting_summary,
+                )
+            )
+        return self._accounting_terminal_error
+
+    def _settle_turn_observation(
+        self,
+        attempt: AttemptLedger,
+        observation: CostObservation,
+    ) -> CostObservation:
+        settlement = attempt.settle_observation(observation)
+        settled = settlement.observation
+        if settled is None:
+            raise RuntimeError("observed turn settled without observation")
+        self._accounting_summary = self._accounting_summary.add(settled)
+        self._accounting_legacy_total_usd += settled.legacy_cost_usd
+        if (
+            self._usd_budget_contract
+            is UsdBudgetContract.AUTHORITATIVE_REQUIRED
+            and not is_observation_authorized(
+                settled, self._trusted_usd_routes,
+            )
+        ):
+            raise self._latch_accounting_error(
+                reason=f"observed basis {settled.basis.value} is not trusted",
+            )
+        return settled
+
+    def _settle_turn_failure(
+        self,
+        attempt: AttemptLedger,
+        error: BaseException,
+    ) -> LLMAccountingUnavailableError | None:
+        observation = cost_observation_from_exception(error)
+        if observation is not None:
+            try:
+                self._settle_turn_observation(attempt, observation)
+            except LLMAccountingUnavailableError as policy_error:
+                return policy_error
+            return None
+        attempt.settle_unknown_failed()
+        retained = (
+            attempt.reservation_usd
+            if self._usd_budget_contract
+            is UsdBudgetContract.AUTHORITATIVE_REQUIRED
+            else 0.0
+        )
+        self._accounting_summary = (
+            self._accounting_summary.add_unknown_failure(
+                retained_reservation_estimate_usd=retained,
+            )
+        )
+        self._accounting_legacy_total_usd += retained
+        if retained:
+            return self._latch_accounting_error(
+                reason="failed turn returned no authoritative cost",
+            )
+        return None
+
+    def _execute_turn_attempt(
+        self,
+        messages: Sequence[Message],
+        call: Callable[[], TurnResponse],
+    ) -> TurnResponse:
+        self._ensure_fresh_attempt_allowed()
+        reservation = self._reservation_estimate(messages)
+        if (
+            self._usd_budget_contract is not UsdBudgetContract.ADVISORY
+            and self._max_cost_usd is not None
+            and (
+                self._accounting_legacy_total_usd
+                - self._active_run_cost_start
+                + reservation
+            ) > self._max_cost_usd
+        ):
+            raise CostBudgetExceeded(
+                "cost budget cannot admit the next strictly-accounted "
+                f"turn: ${self._accounting_legacy_total_usd - self._active_run_cost_start:.4f} "
+                f"observed + ${reservation:.4f} reservation estimate > "
+                f"${self._max_cost_usd:.4f}",
+                messages=list(messages),
+                accounting=self._accounting_summary,
+            )
+        attempt = AttemptLedger(
+            route=self._route(),
+            reservation_usd=reservation,
+        )
+        try:
+            response = call()
+            observation = self._turn_observation(response)
+            if (
+                response.stop_reason
+                in (StopReason.ERROR, StopReason.REFUSED)
+                and observation.basis is CostBasis.UNKNOWN
+            ):
+                error = RuntimeError(
+                    response.error_message
+                    or f"provider turn ended with {response.stop_reason.value}",
+                )
+                policy_error = self._settle_turn_failure(attempt, error)
+                object.__setattr__(
+                    response, "cost_observation", observation,
+                )
+                if policy_error is not None:
+                    raise policy_error from error
+                return response
+            observation = self._settle_turn_observation(
+                attempt, observation,
+            )
+            object.__setattr__(
+                response, "cost_observation", observation,
+            )
+            return response
+        except BaseException as error:
+            if not attempt.settled:
+                policy_error = self._settle_turn_failure(attempt, error)
+                if policy_error is not None:
+                    raise policy_error from error
+            raise
+        finally:
+            attempt.require_settled()
+
     def _consume_stream(
         self,
         iteration: int,
         messages: list[Message],
-        cache_control: CacheControl,
+        cache_control: CacheControl | None = None,
     ) -> TurnResponse:
         """Call ``turn_stream()`` and accumulate chunks into a
         :class:`TurnResponse`, with bounded pre-content retry.
@@ -1202,13 +1585,20 @@ class ToolUseLoop:
         covers the reconnect). Once partial content was consumed, a
         retry could double-execute the turn, so the failure propagates
         as the provider's converted typed error instead."""
+        if cache_control is None:
+            cache_control = self._cache_control
         for attempt in range(_STREAM_PRE_CONTENT_RETRIES + 1):
             content_seen = [False]
             try:
-                return self._consume_stream_once(
-                    iteration, messages, content_seen, cache_control,
+                return self._execute_turn_attempt(
+                    messages,
+                    lambda: self._consume_stream_once(
+                        iteration, messages, content_seen, cache_control,
+                    ),
                 )
-            except Exception as exc:
+            except BaseException as exc:
+                if isinstance(exc, LLMPolicyError):
+                    raise
                 from core.llm.providers import is_credit_exhausted
                 if (
                     content_seen[0]
@@ -1250,7 +1640,7 @@ class ToolUseLoop:
             system=self._system,
             max_tokens=self._max_tokens_per_turn,
             cache_control=cache_control,
-            **self._provider_specific,
+            **self._provider_attempt_kwargs(),
         ):
             if chunk.type in (
                 "text_delta", "tool_call_start",
@@ -1612,6 +2002,7 @@ class ToolUseLoop:
                 msg,
                 messages=messages,
                 tool_calls_made=tool_calls_made,
+                accounting=self._accounting_summary,
             )
         # The head-cleanup loop stops at one message, so a pathological
         # history can end as a SINGLE leading assistant turn or

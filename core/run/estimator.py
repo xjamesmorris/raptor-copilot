@@ -15,6 +15,8 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 
+from core.llm.accounting import ModelKeyAggregation, UsdBudgetContract
+
 logger = logging.getLogger(__name__)
 
 
@@ -32,7 +34,7 @@ class RunEstimate:
     time_low: int
     time_high: int
     target_type: str
-    source: str = "scorecard"
+    source: str = "scorecard-legacy"
 
 
 def estimate_from_scorecard(
@@ -41,6 +43,12 @@ def estimate_from_scorecard(
     *,
     max_parallel: int = 3,
     scorecard_path: Path | None = None,
+    model_key_aggregation: ModelKeyAggregation | str = (
+        ModelKeyAggregation.LEGACY_MODEL_NAME
+    ),
+    usd_budget_contract: UsdBudgetContract | str = (
+        UsdBudgetContract.ADVISORY
+    ),
 ) -> RunEstimate | None:
     """Derive a cost + time estimate from the model's scorecard history.
 
@@ -51,7 +59,13 @@ def estimate_from_scorecard(
     Returns ``None`` when the scorecard is unavailable, the model has
     no recorded calls, or latency data is missing.
     """
-    if n_findings <= 0:
+    aggregation = ModelKeyAggregation(model_key_aggregation)
+    budget_contract = UsdBudgetContract(usd_budget_contract)
+    if (
+        n_findings <= 0
+        or aggregation is ModelKeyAggregation.REFUSE
+        or budget_contract is not UsdBudgetContract.ADVISORY
+    ):
         return None
     try:
         from core.llm.scorecard.scorecard import ModelScorecard
@@ -108,7 +122,7 @@ def estimate_from_scorecard(
         time_low=time_low,
         time_high=time_high,
         target_type=f"{model} (scorecard)",
-        source="scorecard",
+        source="scorecard-legacy",
     )
 
 
@@ -119,7 +133,8 @@ def format_estimate(est: RunEstimate | None) -> str:
 
     ::
 
-        Expected: $25-$50, 40-75 min (claude-opus-4-7, from scorecard)
+        Expected: $25-$50, 40-75 min
+        (claude-opus-4-7, legacy scorecard estimate; authority unknown)
 
     Ranges with low == high collapse to a single value.
     Cost or time only renders just the populated half.
@@ -146,5 +161,11 @@ def format_estimate(est: RunEstimate | None) -> str:
     parts = [p for p in (money, mins) if p]
     if not parts:
         return ""
-    label = f"{est.target_type.split(' (scorecard)')[0]}, from scorecard"
+    model = est.target_type.split(" (scorecard)")[0]
+    if est.source == "scorecard-legacy":
+        label = (
+            f"{model}, legacy scorecard estimate; authority unknown"
+        )
+    else:
+        label = f"{model}, from {est.source}"
     return f"Expected: {', '.join(parts)} ({label})"

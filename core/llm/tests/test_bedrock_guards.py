@@ -1,5 +1,5 @@
 """Tests for the Bedrock operational guards: the shared-quota worker
-cap, the same-weights multi-model warning, and the entitlement
+cap, duplicate-declared-model panel refusal, and the entitlement
 preflight's classification/caching behavior (probes stubbed — no
 network, no spend).
 """
@@ -62,28 +62,24 @@ class TestBedrockWorkerCap:
 
 
 # ---------------------------------------------------------------------------
-# Same-weights panel warning
+# Same-declared-model panel refusal
 # ---------------------------------------------------------------------------
 
-class TestSameWeightsWarning:
+class TestSameDeclaredModelRefusal:
 
-    def test_warns_on_same_underlying_model(self, caplog):
-        from core.llm.multi_model.dispatch import _warn_same_weights
-        with caplog.at_level("WARNING"):
-            _warn_same_weights([
-                "anthropic.claude-sonnet-5",
-                "us.anthropic.claude-sonnet-5",
-            ])
-        assert any("same" in r.message and "underlying" in r.message
-                   for r in caplog.records)
+    def test_refuses_bedrock_alias_of_declared_model(self):
+        from core.llm.multi_model.dispatch import (
+            _reject_same_declared_model,
+        )
 
-    def test_silent_on_distinct_models(self, caplog):
-        from core.llm.multi_model.dispatch import _warn_same_weights
-        with caplog.at_level("WARNING"):
-            _warn_same_weights([
-                "anthropic.claude-sonnet-5", "gemini-2.5-pro",
+        with pytest.raises(
+            ValueError,
+            match="declared same model via different routes",
+        ):
+            _reject_same_declared_model([
+                "anthropic/claude-sonnet-5",
+                "bedrock/anthropic.claude-sonnet-5",
             ])
-        assert not caplog.records
 
 
 # ---------------------------------------------------------------------------

@@ -16,6 +16,7 @@ import pytest
 # CI matrix runs without it skip cleanly.
 pytest.importorskip("openai")
 
+from core.llm.accounting import CostBasis
 from core.llm.config import ModelConfig
 from core.llm.providers import OpenAICompatibleProvider
 from core.llm.tool_use import (
@@ -323,6 +324,8 @@ def test_text_response_normalises_to_textblock() -> None:
     assert out.content[0].text == "hello world"
     assert out.input_tokens == 20
     assert out.output_tokens == 8
+    assert out.cost_observation.basis is CostBasis.CATALOG_PRICED
+    assert out.cost_observation.estimated_usd is not None
 
 
 def test_tool_calls_response_normalises_to_toolcalls() -> None:
@@ -507,6 +510,7 @@ def test_api_error_returns_error_stop_reason(monkeypatch) -> None:
         max_retries=1,
     )
     assert out.stop_reason is StopReason.ERROR
+    assert out.cost_observation.basis is CostBasis.UNKNOWN
 
 
 def test_transient_then_recovers(monkeypatch) -> None:
