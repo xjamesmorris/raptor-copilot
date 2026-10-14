@@ -62,6 +62,60 @@ _ACCEPTED_W1J_METADATA_SHA256 = (
 )
 
 
+def _accepted_w1j_metadata_preimage() -> bytes:
+    path = Path(__file__).parents[3] / "core/run/metadata.py"
+    source = path.read_text(encoding="utf-8")
+    outer = """        try:
+            from core.startup.runtime_receipt.terminal import (
+                _query_owned_fake_terminal_permit,
+            )
+
+            permitted = _query_owned_fake_terminal_permit(
+                path,
+                strict.value,
+                operation,
+            )
+        except Exception:  # noqa: BLE001 — private permit must fail closed
+            permitted = False
+        if permitted:
+            return
+"""
+    inner = """            try:
+                from core.startup.runtime_receipt.terminal import (
+                    _verify_owned_fake_terminal_permit,
+                )
+
+                permitted = _verify_owned_fake_terminal_permit(
+                    path,
+                    metadata,
+                    status,
+                )
+            except Exception:  # noqa: BLE001 — private permit must fail closed
+                permitted = False
+            if not permitted:
+                raise _receipt_error(
+                    RunReceiptReason.TERMINAL_TRANSITION_FORBIDDEN,
+                    operation="status",
+                )
+"""
+    original_inner = """            raise _receipt_error(
+                RunReceiptReason.TERMINAL_TRANSITION_FORBIDDEN,
+                operation="status",
+            )
+"""
+    assert source.count(outer) == 1
+    assert source.count(inner) == 1
+    return (
+        source.replace(outer, "", 1)
+        .replace(
+            inner,
+            original_inner,
+            1,
+        )
+        .encode("utf-8")
+    )
+
+
 @pytest.fixture
 def owned_root(monkeypatch: pytest.MonkeyPatch):
     with tempfile.TemporaryDirectory(
@@ -1354,6 +1408,11 @@ def test_no_installed_copilot_metadata_lifecycle_or_ledger_call_is_reachable(
 
     monkeypatch.setattr(sessions, "ledger_record_start", forbidden)
     monkeypatch.setattr(sessions, "ledger_record_finish", forbidden)
+    monkeypatch.setattr(
+        terminal_module,
+        "_invoke_lifecycle_wrapper",
+        forbidden,
+    )
     monkeypatch.setattr("subprocess.run", forbidden)
     result = _apply(capability, cancellation)
     assert type(result) is OwnedFakeTerminalResult
@@ -1362,11 +1421,6 @@ def test_no_installed_copilot_metadata_lifecycle_or_ledger_call_is_reachable(
         Path(__file__).parents[2] / "testing/runtime_receipt_terminal.py"
     ).read_text(encoding="utf-8")
     for token in (
-        "core.run.metadata",
-        "complete_run",
-        "fail_run",
-        "cancel_run",
-        "interrupt_run",
         "ledger_record_start",
         "ledger_record_finish",
         "shutil.which",
@@ -1381,11 +1435,8 @@ def test_accepted_w1j_pin_and_cross_launch_capabilities_remain_distinct(
     owned_root: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    repository_root = Path(__file__).parents[3]
     assert (
-        hashlib.sha256(
-            (repository_root / "core/run/metadata.py").read_bytes()
-        ).hexdigest()
+        hashlib.sha256(_accepted_w1j_metadata_preimage()).hexdigest()
         == _ACCEPTED_W1J_METADATA_SHA256
     )
 

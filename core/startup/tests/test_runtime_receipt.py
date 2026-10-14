@@ -1543,6 +1543,8 @@ def test_package_has_no_forbidden_runtime_imports_or_frozen_wiring() -> None:
         allowed = (
             {"core.project.sessions", "core.startup.host"}
             if path.name == "launch.py"
+            else {"core.project.sessions", "core.run.metadata"}
+            if path.name == "terminal.py"
             else set()
         )
         assert not any(
@@ -1590,11 +1592,27 @@ def test_package_has_no_forbidden_runtime_imports_or_frozen_wiring() -> None:
     assert "COMMAND_TERMINAL_ATTACH UINT16_C(106)" in host_source
     assert "TERMINAL_MAGIC UINT32_C(0x5254544d)" in host_source
     assert "__all__: tuple[str, ...] = ()" in terminal_source
-    assert "core.run.metadata" not in terminal_source
-    assert "_query_owned_fake_terminal_permit" not in terminal_source
-    assert "_verify_owned_fake_terminal_permit" not in terminal_source
-    assert "_query_owned_fake_terminal_permit" not in metadata_source
-    assert "_verify_owned_fake_terminal_permit" not in metadata_source
+    assert (
+        _scoped_import_records(
+            terminal_source,
+            filename=_TERMINAL_PATH,
+            module_roots=(
+                ".launch",
+                _RECEIPT_LAUNCH_MODULE,
+                "core.project.sessions",
+                "core.run.metadata",
+            ),
+        )
+        == _TERMINAL_BRIDGE_IMPORT_ALLOWLIST
+    )
+    assert (
+        _scoped_import_records(
+            metadata_source,
+            filename=_METADATA_PATH,
+            module_roots=(_RECEIPT_TERMINAL_MODULE,),
+        )
+        == _METADATA_TERMINAL_BRIDGE_IMPORT_ALLOWLIST
+    )
 
 
 # Stage 3A.1 exact receipt-import policy.
@@ -1728,6 +1746,14 @@ _REVIEWED_STAGE_3A2_METADATA_RUNTIME_IMPORTS = frozenset(
         (_RECEIPT_PROFILE_MODULE, "load_profile_store"),
         (_RECEIPT_REASONS_MODULE, "ReceiptRejection"),
         (_RECEIPT_SCHEMA_MODULE, "RuntimeReceipt"),
+        (
+            _RECEIPT_TERMINAL_MODULE,
+            "_query_owned_fake_terminal_permit",
+        ),
+        (
+            _RECEIPT_TERMINAL_MODULE,
+            "_verify_owned_fake_terminal_permit",
+        ),
         (_RECEIPT_VERIFY_MODULE, "parse_receipt"),
     }
 )
@@ -1756,14 +1782,44 @@ _REVIEWED_RUNTIME_FAKE_RUNTIME_IMPORTS = frozenset(
 _REVIEWED_RUNTIME_TERMINAL_TYPE_IMPORTS = frozenset(
     {
         (_RECEIPT_TERMINAL_MODULE, "OwnedFakeTerminalCapability"),
+        (_RECEIPT_TERMINAL_MODULE, "OwnedFakeTerminalCleanupResult"),
         (_RECEIPT_TERMINAL_MODULE, "OwnedFakeTerminalFailure"),
+        (_RECEIPT_TERMINAL_MODULE, "OwnedFakeTerminalLifecycleResult"),
     }
 )
 _REVIEWED_RUNTIME_TERMINAL_RUNTIME_IMPORTS = frozenset(
     {
+        (_RECEIPT_TERMINAL_MODULE, "OwnedFakeTerminalFailure"),
+        (_RECEIPT_TERMINAL_MODULE, "_TERMINAL_READ_MANIFEST"),
+        (_RECEIPT_TERMINAL_MODULE, "_TERMINAL_RESUME_NOTE"),
+        (_RECEIPT_TERMINAL_MODULE, "_TERMINAL_RUN_COMMAND"),
+        (
+            _RECEIPT_TERMINAL_MODULE,
+            "_apply_owned_fake_terminal_lifecycle",
+        ),
+        (
+            _RECEIPT_TERMINAL_MODULE,
+            "_bind_owned_fake_terminal_run",
+        ),
+        (
+            _RECEIPT_TERMINAL_MODULE,
+            "_cleanup_owned_fake_terminal_lifecycle",
+        ),
         (
             _RECEIPT_TERMINAL_MODULE,
             "_issue_owned_fake_terminal_capability",
+        ),
+        (
+            _RECEIPT_TERMINAL_MODULE,
+            "_owned_fake_terminal_resume_directory",
+        ),
+        (
+            _RECEIPT_TERMINAL_MODULE,
+            "_owned_fake_terminal_runs_root",
+        ),
+        (
+            _RECEIPT_TERMINAL_MODULE,
+            "_rearm_owned_fake_terminal_capability",
         ),
     }
 )
@@ -1799,6 +1855,219 @@ _REFLECTIVE_IMPORT_TOKENS = (
     "zipimport",
     "globals()",
     "vars(",
+)
+_TERMINAL_BRIDGE_IMPORT_ALLOWLIST = frozenset(
+    {
+        (
+            "<module>",
+            ".launch",
+            name,
+            "",
+        )
+        for name in {
+            "LaunchCancellation",
+            "LaunchFailure",
+            "LaunchPhase",
+            "LaunchReason",
+            "OwnedFakeLaunchHandle",
+            "_FrameType",
+            "_HandleRecord",
+            "_ProcessIdentity",
+            "_capture_process_identity",
+            "_child_waitable",
+            "_claim_operation",
+            "_control_channel_state",
+            "_frame_bytes",
+            "_identity_matches",
+            "_process_matches_primary",
+            "_receive_frame",
+            "_record_for_handle",
+            "_registry_matches",
+            "_release_operation",
+            "_witness_state",
+        }
+    }
+    | {
+        (
+            "_cleanup_owned_fake_terminal_lifecycle",
+            _RECEIPT_LAUNCH_MODULE,
+            name,
+            "",
+        )
+        for name in {
+            "LaunchClosed",
+            "_close_owned_runtime_fake",
+        }
+    }
+    | {
+        (
+            "_apply_bound_lifecycle",
+            "core.project.sessions",
+            name,
+            "",
+        )
+        for name in {
+            "_SessionReceiptAbort",
+            "session_runtime_receipt_fence",
+        }
+    }
+    | {
+        (
+            "_capture_bound_receipt",
+            "core.project.sessions",
+            name,
+            "",
+        )
+        for name in {
+            "SessionRuntimeReceiptCapture",
+            "capture_current_session_runtime_receipt",
+        }
+    }
+    | {
+        (
+            "_invoke_lifecycle_wrapper",
+            "core.run.metadata",
+            name,
+            "",
+        )
+        for name in {
+            "cancel_run",
+            "complete_run",
+            "fail_run",
+            "interrupt_run",
+        }
+    }
+    | {
+        (
+            "_metadata_lock_entry_valid",
+            "core.run.metadata",
+            "_metadata_lock_fd_valid",
+            "",
+        )
+    }
+    | {
+        (
+            "_load_run_binding",
+            "core.run.metadata",
+            name,
+            "",
+        )
+        for name in {
+            "MAX_RUN_METADATA_BYTES",
+            "RUN_METADATA_FILE",
+            "RUN_RUNTIME_RECEIPT_KEY",
+            "STATUS_RUNNING",
+            "_parse_receipt_metadata",
+            "_strict_load_run_metadata",
+        }
+    }
+    | {
+        (
+            "_post_lifecycle_applied",
+            "core.run.metadata",
+            name,
+            "",
+        )
+        for name in {
+            "MAX_RUN_METADATA_BYTES",
+            "RUN_METADATA_FILE",
+            "_parse_receipt_metadata",
+            "_strict_load_run_metadata",
+        }
+    }
+)
+_RUNTIME_TERMINAL_BRIDGE_IMPORT_ALLOWLIST = frozenset(
+    {
+        (
+            "<module>",
+            _RECEIPT_TERMINAL_MODULE,
+            name,
+            "",
+        )
+        for name in {
+            "OwnedFakeTerminalCapability",
+            "OwnedFakeTerminalCleanupResult",
+            "OwnedFakeTerminalFailure",
+            "OwnedFakeTerminalLifecycleResult",
+        }
+    }
+    | {
+        (
+            "apply_owned_fake_terminal_lifecycle",
+            _RECEIPT_TERMINAL_MODULE,
+            "_apply_owned_fake_terminal_lifecycle",
+            "",
+        ),
+        (
+            "cleanup_owned_fake_terminal_lifecycle",
+            _RECEIPT_TERMINAL_MODULE,
+            "_cleanup_owned_fake_terminal_lifecycle",
+            "",
+        ),
+        (
+            "make_owned_fake_terminal_capability",
+            _RECEIPT_TERMINAL_MODULE,
+            "_issue_owned_fake_terminal_capability",
+            "",
+        ),
+        (
+            "make_owned_fake_terminal_lifecycle",
+            "core.run.metadata",
+            "start_run",
+            "",
+        ),
+        (
+            "resume_owned_fake_terminal_lifecycle",
+            "core.run.metadata",
+            "resume_run",
+            "",
+        ),
+    }
+    | {
+        (
+            "make_owned_fake_terminal_lifecycle",
+            _RECEIPT_TERMINAL_MODULE,
+            name,
+            "",
+        )
+        for name in {
+            "OwnedFakeTerminalFailure",
+            "_TERMINAL_READ_MANIFEST",
+            "_TERMINAL_RUN_COMMAND",
+            "_bind_owned_fake_terminal_run",
+            "_owned_fake_terminal_runs_root",
+        }
+    }
+    | {
+        (
+            "resume_owned_fake_terminal_lifecycle",
+            _RECEIPT_TERMINAL_MODULE,
+            name,
+            "",
+        )
+        for name in {
+            "OwnedFakeTerminalFailure",
+            "_TERMINAL_RESUME_NOTE",
+            "_owned_fake_terminal_resume_directory",
+            "_rearm_owned_fake_terminal_capability",
+        }
+    }
+)
+_METADATA_TERMINAL_BRIDGE_IMPORT_ALLOWLIST = frozenset(
+    {
+        (
+            "_ensure_receipt_transition_allowed",
+            _RECEIPT_TERMINAL_MODULE,
+            "_query_owned_fake_terminal_permit",
+            "",
+        ),
+        (
+            "_update_status",
+            _RECEIPT_TERMINAL_MODULE,
+            "_verify_owned_fake_terminal_permit",
+            "",
+        ),
+    }
 )
 
 
@@ -2727,6 +2996,61 @@ def _receipt_import_policy_violations(
     return tuple(violations)
 
 
+def _scoped_import_records(
+    source: str,
+    *,
+    filename: str,
+    module_roots: tuple[str, ...],
+) -> frozenset[tuple[str, str, str, str]]:
+    tree = ast.parse(source, filename=filename)
+    parents = {
+        child: parent
+        for parent in ast.walk(tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+
+    def scope_name(node: ast.AST) -> str:
+        current = node
+        while current in parents:
+            current = parents[current]
+            if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return current.name
+        return "<module>"
+
+    def matches(module: str) -> bool:
+        return any(
+            module == root or module.startswith(root + ".") for root in module_roots
+        )
+
+    records: set[tuple[str, str, str, str]] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = "." * node.level + (node.module or "")
+            if not matches(module):
+                continue
+            for alias in node.names:
+                records.add(
+                    (
+                        scope_name(node),
+                        module,
+                        alias.name,
+                        alias.asname or "",
+                    )
+                )
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if matches(alias.name):
+                    records.add(
+                        (
+                            scope_name(node),
+                            alias.name,
+                            "<module>",
+                            alias.asname or "",
+                        )
+                    )
+    return frozenset(records)
+
+
 def _production_python_sources(repository_root: Path) -> dict[str, str]:
     paths = set(repository_root.glob("*.py"))
     for root_name in ("core", "packages", "plugins"):
@@ -3177,7 +3501,7 @@ def test_relative_receipt_import_in_another_production_file_is_forbidden() -> No
     )
 
 
-def test_receipt_importers_are_exact_through_terminal_k1() -> None:
+def test_receipt_importers_are_exact_through_owned_fake_terminal_lifecycle() -> None:
     repository_root = Path(__file__).parents[3]
     production_sources = _production_python_sources(repository_root)
     violations = tuple(
@@ -3298,6 +3622,7 @@ def test_terminal_capability_has_exact_private_authority_surface() -> None:
             module == forbidden or module.startswith(forbidden + ".")
             for module in imported
             for forbidden in forbidden_modules
+            if module not in {"core.project.sessions", "core.run.metadata"}
         )
         if isinstance(node, ast.ImportFrom) and node.module == "os":
             assert not {alias.name for alias in node.names}.intersection(
@@ -3313,10 +3638,6 @@ def test_terminal_capability_has_exact_private_authority_surface() -> None:
     forbidden_names = (
         "DEFAULT_PROFILE_DIRECTORY",
         "SESSIONS_DIR",
-        "cancel_run",
-        "complete_run",
-        "fail_run",
-        "interrupt_run",
         "ledger_record_finish",
         "ledger_record_start",
         "set_process_project",
@@ -3328,15 +3649,6 @@ def test_terminal_capability_has_exact_private_authority_surface() -> None:
         tree = ast.parse(source, filename=relative)
         names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
         assert not names.intersection(forbidden_names)
-        for token in (
-            "_apply_owned_fake_terminal_lifecycle",
-            "_bind_owned_fake_terminal_run",
-            "_cleanup_owned_fake_terminal_lifecycle",
-            "_query_owned_fake_terminal_permit",
-            "_rearm_owned_fake_terminal_capability",
-            "_verify_owned_fake_terminal_permit",
-        ):
-            assert token not in source
 
     assert (
         _receipt_import_policy_violations(
@@ -3344,6 +3656,39 @@ def test_terminal_capability_has_exact_private_authority_surface() -> None:
             helper_source,
         )
         == ()
+    )
+    assert (
+        _scoped_import_records(
+            terminal_source,
+            filename=_TERMINAL_PATH,
+            module_roots=(
+                ".launch",
+                _RECEIPT_LAUNCH_MODULE,
+                "core.project.sessions",
+                "core.run.metadata",
+            ),
+        )
+        == _TERMINAL_BRIDGE_IMPORT_ALLOWLIST
+    )
+    assert (
+        _scoped_import_records(
+            helper_source,
+            filename=_RUNTIME_TERMINAL_PATH,
+            module_roots=(
+                _RECEIPT_TERMINAL_MODULE,
+                "core.run.metadata",
+            ),
+        )
+        == _RUNTIME_TERMINAL_BRIDGE_IMPORT_ALLOWLIST
+    )
+    metadata_source = (repository_root / _METADATA_PATH).read_text(encoding="utf-8")
+    assert (
+        _scoped_import_records(
+            metadata_source,
+            filename=_METADATA_PATH,
+            module_roots=(_RECEIPT_TERMINAL_MODULE,),
+        )
+        == _METADATA_TERMINAL_BRIDGE_IMPORT_ALLOWLIST
     )
     assert "__all__: tuple[str, ...] = ()" in terminal_source
     assert "_issue_owned_fake_terminal_capability" not in (
