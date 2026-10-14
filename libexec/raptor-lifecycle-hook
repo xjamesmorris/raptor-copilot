@@ -242,7 +242,7 @@ def main():
 
     from core.json import load_json
     from core.run.metadata import (
-        _get_session_pid, _session_alive_for_meta,
+        _get_session_pid, _metadata_owned_by_session, _session_alive_for_meta,
         complete_run, fail_run, RUN_METADATA_FILE, STATUS_RUNNING,
         worker_liveness_for_meta,
     )
@@ -264,14 +264,14 @@ def main():
         # happened.
         #
         # Two-tier emit: stderr breadcrumb (one short line, won't
-        # spam interactive sessions because legitimate Claude Code
-        # invocations always find the ancestor) + exit code 0 (the
-        # hook ran successfully — there was just nothing to do;
-        # exiting non-zero here would surface in Claude Code as a
-        # hook error and confuse the operator).
+        # spam interactive sessions because legitimate launcher
+        # invocations carry a verified owner credential) + exit code
+        # 0 (the hook ran successfully — there was just nothing to
+        # do; failing here would surface as a hook error and confuse
+        # the operator).
         sys.stderr.write(
-            f"raptor-lifecycle-hook[{event}]: no claude-code ancestor "
-            f"in pid tree from pid {os.getpid()}; nothing to do\n"
+            f"raptor-lifecycle-hook[{event}]: no verified RAPTOR "
+            f"session owner from pid {os.getpid()}; nothing to do\n"
         )
         return
 
@@ -364,7 +364,7 @@ def main():
             if not isinstance(meta, dict):
                 meta = {}
             if (meta.get("status") != STATUS_RUNNING
-                    or meta.get("session_pid") != session_pid):
+                    or not _metadata_owned_by_session(meta, session_pid)):
                 continue
 
             if event == "tool-failure":

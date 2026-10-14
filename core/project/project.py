@@ -1706,6 +1706,18 @@ class ProjectManager:
                     "target %s", run_src.name, recorded, project.target,
                 )
                 return False
+            from core.run.metadata import (
+                RUN_METADATA_FILE,
+                _metadata_file_has_receipt_state,
+                load_run_metadata,
+            )
+            if _metadata_file_has_receipt_state(run_src / RUN_METADATA_FILE):
+                logger.warning(
+                    "adopt refused for %s: receipt-backed runs are "
+                    "projectless and cannot be adopted",
+                    run_src.name,
+                )
+                return False
             # Liveness BEFORE the move: write_run_pin refuses live
             # runs, and raising after the move leaves a half-adopted
             # dir (moved, pin not rewritten, projections skipped).
@@ -1713,7 +1725,6 @@ class ProjectManager:
                 from core.run.metadata import (
                     STATUS_RUNNING,
                     _session_alive_for_meta,
-                    load_run_metadata,
                 )
                 _meta = load_run_metadata(run_src) or {}
                 if (_meta.get("status") == STATUS_RUNNING

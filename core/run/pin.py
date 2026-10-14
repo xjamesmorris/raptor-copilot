@@ -26,6 +26,8 @@ Two halves:
   pin ``project=P``, P exists               P, authoritative
   pin ``project=null``                      authoritative none — containment
                                             inference FORBIDDEN
+  reserved launch-evidence key             authoritative none — writes denied,
+                                            no containment
   pin ``project=P``, P deleted/renamed      loud warn + authoritative none
   no ``.raptor-run.json`` found             legacy fallback: containment
                                             inference — READS ONLY
@@ -98,8 +100,8 @@ class RunPin:
     ``"unresolved"`` when nothing matched). ``run_dir`` — the dir whose
     marker answered, when one did. ``authoritative`` — True when the
     answer came from a real pin (never from containment inference).
-    ``writes_allowed`` — False on the legacy fallback: containment
-    inference authorizes reads only.
+    ``writes_allowed`` — False on the legacy fallback and on deny-only
+    launch-evidence markers.
     """
 
     project: str | None
@@ -130,7 +132,7 @@ def get_process_project() -> str | None:
 
 class ProjectArgvError(ValueError):
     """``--project`` revalidation failure — a hard error by contract
-   : never a fallback to any ambient layer."""
+    : never a fallback to any ambient layer."""
 
 
 def _machine_project_expired(name: str) -> bool:
@@ -142,11 +144,11 @@ def _machine_project_expired(name: str) -> bool:
             ProjectManager,
             is_machine_project_name,
         )
+
         if not is_machine_project_name(name):
             return False
         project = ProjectManager().load(name)
-        return (project is not None
-                and project.is_expired_machine_project())
+        return project is not None and project.is_expired_machine_project()
     except Exception:  # noqa: BLE001 — vet failure = not expired
         logger.debug("pin: machine-expiry vet failed", exc_info=True)
         return False
@@ -155,6 +157,7 @@ def _machine_project_expired(name: str) -> bool:
 def _project_exists(name: str) -> bool:
     try:
         from core.project.project import ProjectManager
+
         return ProjectManager().load(name) is not None
     except Exception:  # noqa: BLE001 — registry unreadable = not found
         logger.debug("pin: project existence check failed", exc_info=True)
@@ -163,12 +166,38 @@ def _project_exists(name: str) -> bool:
 
 def _validate_argv_project(value: str) -> None:
     from core.project.sessions import _NAME_RE
+
     if not _NAME_RE.match(value):
         msg = f"--project: invalid project name {value!r}"
         raise ProjectArgvError(msg)
     if not _project_exists(value):
         msg = f"--project: project {value!r} does not exist"
         raise ProjectArgvError(msg)
+
+
+def _matching_host_v2_credential() -> bool:
+    from core.project.sessions import (
+        SessionHostV2CredentialState,
+        session_host_v2_credential_state,
+    )
+
+    return (
+        session_host_v2_credential_state()
+        is SessionHostV2CredentialState.MATCHING_HOST_V2
+    )
+
+
+def _process_override_source() -> str:
+    """Provenance for the current process-scoped project override."""
+
+    return (
+        "threaded"
+        if (
+            _process_project_threaded
+            or os.environ.get(PIN_THREADED_ENV) == "1"
+        )
+        else "argv"
+    )
 
 
 def resolve_pin_for_start() -> tuple[str | None, str]:
@@ -180,6 +209,19 @@ def resolve_pin_for_start() -> tuple[str | None, str]:
     authoritative none with a loud warning, never symlink fallthrough.
     """
     override = get_process_project()
+    if _matching_host_v2_credential():
+        if override is not None and override != ARGV_NONE:
+            msg = (
+                f"--project {override!r} is forbidden for a host-v2 "
+                "session; the run must remain projectless"
+            )
+            raise ProjectArgvError(msg)
+        return (
+            None,
+            _process_override_source()
+            if override == ARGV_NONE
+            else "session",
+        )
     if override is not None:
         # Provenance honesty: "argv" is reserved for a flag the
         # OPERATOR typed. A harness-synthesized override — parent-pin
@@ -187,16 +229,14 @@ def resolve_pin_for_start() -> tuple[str | None, str]:
         # child spawn) or an in-process bootstrap adoption — records
         # "threaded" so a null pin can't masquerade as an explicit
         # `--project -`.
-        source = "threaded" if (
-            _process_project_threaded
-            or os.environ.get(PIN_THREADED_ENV) == "1"
-        ) else "argv"
+        source = _process_override_source()
         if override == ARGV_NONE:
             return None, source
         _validate_argv_project(override)
         return override, source
 
     from core.project.sessions import session_binding
+
     name, state = session_binding()
     if state == "bound":
         if name is not None and _project_exists(name):
@@ -210,18 +250,22 @@ def resolve_pin_for_start() -> tuple[str | None, str]:
                     "auto-expiry — clearing this session's binding; "
                     "run starts projectless. '/project use %s' "
                     "re-activates it (clearing the expiry).",
-                    name, name)
+                    name,
+                    name,
+                )
                 try:
                     from core.project.sessions import bind_session
+
                     bind_session(None)
                 except Exception:  # noqa: BLE001 — remediation only
-                    logger.debug("pin: expiry re-bind failed",
-                                 exc_info=True)
+                    logger.debug("pin: expiry re-bind failed", exc_info=True)
                 return None, "session"
             return name, "session"
         logger.warning(
             "pin: session binding names missing project %r — "
-            "authoritatively projectless for this run", name)
+            "authoritatively projectless for this run",
+            name,
+        )
         return None, "session"
     if state == "none":
         return None, "session"
@@ -230,6 +274,7 @@ def resolve_pin_for_start() -> tuple[str | None, str]:
     # applied by get_active itself).
     try:
         from core.project.project import ProjectManager
+
         active = ProjectManager().get_active()
     except Exception:  # noqa: BLE001 — resolution failure = standalone
         logger.debug("pin: symlink resolution failed", exc_info=True)
@@ -242,6 +287,7 @@ def resolve_pin_for_start() -> tuple[str | None, str]:
 # ---------------------------------------------------------------------------
 # in-run resolution
 # ---------------------------------------------------------------------------
+
 
 def _marker_trustworthy(directory: Path) -> bool:
     """A marker only counts when its directory is ours and not open to
@@ -265,8 +311,11 @@ def _marker_trustworthy(directory: Path) -> bool:
         return False
     if st.st_mode & stat_mod.S_IWOTH:
         return False
-    if st.st_mode & stat_mod.S_IWGRP and hasattr(os, "getgid") \
-            and st.st_gid != os.getgid():
+    if (
+        st.st_mode & stat_mod.S_IWGRP
+        and hasattr(os, "getgid")
+        and st.st_gid != os.getgid()
+    ):
         return False
     return True
 
@@ -286,6 +335,7 @@ def _walk_boundary(directory: Path, start_dev: int | None) -> bool:
             return True
     try:
         from core.config import RaptorConfig
+
         if directory == Path(RaptorConfig.get_out_dir()).resolve():
             # Stop AT the out-root: runs live under it, never at it, so
             # a marker planted at out/ itself must not become the
@@ -301,6 +351,7 @@ def _containment_project(start_dir: Path) -> str | None:
     *start_dir* — today's shape inference, reads only."""
     try:
         from core.project.project import ProjectManager
+
         resolved = start_dir.resolve()
         for project in ProjectManager().list_projects():
             try:
@@ -326,14 +377,29 @@ def _containment_project(start_dir: Path) -> str | None:
 _frozen_pins: dict[str, RunPin] = {}
 
 
-def freeze_run_pin(run_dir: str | os.PathLike[str], project: str | None,
-                   source: str) -> None:
+def freeze_run_pin(
+    run_dir: str | os.PathLike[str], project: str | None, source: str
+) -> None:
     """Record the just-written pin in the process freeze cache."""
     try:
-        key = str(Path(run_dir).resolve())
+        resolved = Path(run_dir).resolve()
     except (OSError, ValueError):
         return
-    _frozen_pins[key] = RunPin(project, source, Path(key), True, True)
+    pin = RunPin(project, source, resolved, True, True)
+    try:
+        from core.json import load_json
+
+        meta = load_json(
+            resolved / RUN_METADATA_FILE,
+            max_bytes=_MAX_RUN_META_BYTES,
+        )
+        if isinstance(meta, dict):
+            negative = _negative_marker_pin(meta, resolved)
+            if negative is not None:
+                pin = negative
+    except Exception:  # noqa: BLE001 — absent/bad marker keeps legacy behavior
+        pass
+    _frozen_pins[str(resolved)] = pin
 
 
 def resolve_run_pin(start_dir: str | os.PathLike[str]) -> RunPin:
@@ -382,12 +448,15 @@ def resolve_run_pin(start_dir: str | os.PathLike[str]) -> RunPin:
             else:
                 logger.warning(
                     "pin: ignoring untrustworthy run marker in %s "
-                    "(not owned by us, or group/world-writable)", probe)
+                    "(not owned by us, or group/world-writable)",
+                    probe,
+                )
         parent = probe.parent
         if parent == probe or _walk_boundary(parent, start_dev):
             break
         try:
             from core.project.project import is_project_output_dir
+
             if is_project_output_dir(parent, exact=True):
                 break  # never walk above a project output dir ITSELF
                 # (descendant matching stopped the walk at the first
@@ -413,12 +482,50 @@ def resolve_run_pin(start_dir: str | os.PathLike[str]) -> RunPin:
 _MAX_RUN_META_BYTES = 1024 * 1024
 
 
+def _warning_value(value: object) -> str:
+    if isinstance(value, str):
+        return value[:64]
+    if value is None or isinstance(value, (bool, int, float)):
+        return repr(value)[:64]
+    return f"<{type(value).__name__}>"
+
+
+def _negative_marker_pin(meta: dict, run_dir: Path) -> RunPin | None:
+    from core.run.metadata import _metadata_allows_legacy_attribution
+
+    if _metadata_allows_legacy_attribution(meta):
+        return None
+    raw_project = meta.get("project")
+    raw_source = meta.get("project_source")
+    deny_only_sources = {"session", "argv", "threaded"}
+    source = (
+        raw_source
+        if isinstance(raw_source, str) and raw_source in deny_only_sources
+        else "none"
+    )
+    canonical_source = (
+        isinstance(raw_source, str) and raw_source in deny_only_sources
+    )
+    if raw_project is not None or not canonical_source:
+        logger.warning(
+            "pin: run %s has deny-only metadata with conflicting "
+            "project %r or source %r; resolving authoritatively projectless",
+            run_dir,
+            _warning_value(raw_project),
+            _warning_value(raw_source),
+        )
+    return RunPin(None, source, run_dir, True, False)
+
+
 def _pin_from_marker(run_dir: Path) -> RunPin:
     from core.json import load_json
-    meta = load_json(run_dir / RUN_METADATA_FILE,
-                     max_bytes=_MAX_RUN_META_BYTES)
+
+    meta = load_json(run_dir / RUN_METADATA_FILE, max_bytes=_MAX_RUN_META_BYTES)
     if not isinstance(meta, dict):
         return RunPin(None, "unresolved", run_dir, False, False)
+    negative = _negative_marker_pin(meta, run_dir)
+    if negative is not None:
+        return negative
     if "project" not in meta:
         # Legacy (pre-series) run dir: containment inference, reads only.
         name = _containment_project(run_dir)
@@ -437,13 +544,17 @@ def _pin_from_marker(run_dir: Path) -> RunPin:
         logger.warning(
             "pin: run %s has non-string project %r — authoritatively "
             "projectless; the marker may have been tampered with",
-            run_dir, project)
+            run_dir,
+            project,
+        )
         return RunPin(None, source, run_dir, True, True)
     if not _project_exists(project):
         logger.warning(
             "pin: run %s is pinned to missing project %r — "
             "authoritatively projectless (was it deleted/renamed?)",
-            run_dir, project)
+            run_dir,
+            project,
+        )
         return RunPin(None, source, run_dir, True, True)
     return RunPin(project, source, run_dir, True, True)
 
@@ -512,13 +623,54 @@ def bootstrap_process_pin(out_dir: str | os.PathLike[str] | None) -> None:
     Only AUTHORITATIVE pins bootstrap (a real ``project`` key in the
     owning run's metadata): the legacy containment fallback authorizes
     reads only, and promoting it to a process override would authorize
-    privilege-bearing writes. An explicit ``--project`` argv set by the
-    entry point always wins (never overwritten here).
+    privilege-bearing writes. On legacy paths an explicit ``--project``
+    argv set by the entry point wins. A matching host-v2 credential or
+    deny-only marker instead seals an authoritative projectless result.
     """
     if out_dir is None:
         return
     override = get_process_project()
+    matching_host_v2 = _matching_host_v2_credential()
+    if matching_host_v2 and override is not None and override != ARGV_NONE:
+        msg = (
+            f"--project {override!r} is forbidden for a host-v2 "
+            "session; the run must remain projectless"
+        )
+        raise ProjectArgvError(msg)
     pin = resolve_run_pin(out_dir)
+    if matching_host_v2:
+        set_process_project(ARGV_NONE, threaded=True)
+        if pin.run_dir is not None:
+            source = (
+                pin.source
+                if pin.source in {"session", "argv", "threaded"}
+                else "none"
+            )
+            _frozen_pins[str(pin.run_dir)] = RunPin(
+                None,
+                source,
+                pin.run_dir,
+                True,
+                False,
+            )
+        return
+    if (
+        pin.authoritative
+        and pin.project is None
+        and not pin.writes_allowed
+        and pin.run_dir is not None
+    ):
+        if override is not None and override != ARGV_NONE:
+            msg = (
+                f"--project {override!r} conflicts with the run's "
+                f"existing pin {pin.project!r} in {out_dir} — a "
+                "run dir is pinned to one project for its whole "
+                "lifetime"
+            )
+            raise ProjectArgvError(msg)
+        set_process_project(ARGV_NONE, threaded=True)
+        _frozen_pins[str(pin.run_dir)] = pin
+        return
     if override is not None:
         # Both an explicit --project AND a pinned --out: they must
         # AGREE, or the process would run split — override for the
@@ -565,9 +717,10 @@ def bootstrap_process_pin(out_dir: str | os.PathLike[str] | None) -> None:
         _frozen_pins.setdefault(str(pin.run_dir), pin)
 
 
-def pinned_write_target_ok(out_dir: str | os.PathLike[str],
-                           target: str | os.PathLike[str] | None = None,
-                           ) -> bool:
+def pinned_write_target_ok(
+    out_dir: str | os.PathLike[str],
+    target: str | os.PathLike[str] | None = None,
+) -> bool:
     """ONE-TARGET GATE for pin-keyed privileged writes (engine-rules
     graduation, domain-model promotion, journal-index merges, coverage
     snapshots): the run's target must BE the pinned project's target
@@ -590,8 +743,10 @@ def pinned_write_target_ok(out_dir: str | os.PathLike[str],
         pinned = False
         try:
             from core.json import load_json
-            meta = load_json(Path(out_dir) / RUN_METADATA_FILE,
-                             max_bytes=_MAX_RUN_META_BYTES)
+
+            meta = load_json(
+                Path(out_dir) / RUN_METADATA_FILE, max_bytes=_MAX_RUN_META_BYTES
+            )
             target = (meta or {}).get("target_path")
             pinned = isinstance(meta, dict) and "project" in meta
         except Exception:  # noqa: BLE001 — unreadable metadata: no target
@@ -601,7 +756,10 @@ def pinned_write_target_ok(out_dir: str | os.PathLike[str],
             # is tamper, not legacy tolerance. Fail closed.
             logger.warning(
                 "pin: run %s records a non-string target_path %r — "
-                "suppressing the project-store write", out_dir, target)
+                "suppressing the project-store write",
+                out_dir,
+                target,
+            )
             return False
         if not target and pinned:
             logger.warning(
@@ -614,23 +772,30 @@ def pinned_write_target_ok(out_dir: str | os.PathLike[str],
         return True
     try:
         from core.project.trust import run_target_matches_project
+
         ok = run_target_matches_project(str(target), str(out_dir))
     except Exception:  # noqa: BLE001 — gate guards privileged writes
         logger.warning(
             "pin: one-target gate resolver failed for %s — suppressing "
-            "the project-store write (fail closed)", out_dir,
-            exc_info=True)
+            "the project-store write (fail closed)",
+            out_dir,
+            exc_info=True,
+        )
         return False
     if not ok:
         logger.warning(
             "pin: SUPPRESSED project-store write for %s — the run's "
             "target (%s) is not the pinned project's target. A project "
-            "is an assertion about one target.", out_dir, target)
+            "is an assertion about one target.",
+            out_dir,
+            target,
+        )
     return ok
 
 
-def pin_project_dir(out_dir: str | os.PathLike[str] | None,
-                    for_write: bool = False) -> Path | None:
+def pin_project_dir(
+    out_dir: str | os.PathLike[str] | None, for_write: bool = False
+) -> Path | None:
     """The pinned project's OUTPUT DIR for a run dir, or None.
 
     The drop-in replacement for the ``out_dir.parent``-shape
@@ -652,10 +817,13 @@ def pin_project_dir(out_dir: str | os.PathLike[str] | None,
         logger.info(
             "pin: suppressing project-level write for %s — legacy "
             "(pin-less) run dir; containment inference authorizes "
-            "reads only", out_dir)
+            "reads only",
+            out_dir,
+        )
         return None
     try:
         from core.project.project import ProjectManager
+
         project = ProjectManager().load(pin.project)
         if project is None:
             return None
