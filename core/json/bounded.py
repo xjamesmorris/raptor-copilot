@@ -42,7 +42,12 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
-def loads_bounded(data: str | bytes, *, max_bytes: int) -> Any:
+def loads_bounded(
+    data: str | bytes,
+    *,
+    max_bytes: int,
+    reject_duplicate_keys: bool = False,
+) -> Any:
     """Parse in-memory JSON with a size gate BEFORE the parse.
 
     For ``bytes`` the gate is exact; for ``str`` it counts characters
@@ -54,7 +59,10 @@ def loads_bounded(data: str | bytes, *, max_bytes: int) -> Any:
         JsonBudgetExceededError: input longer than ``max_bytes``.
         ValueError: malformed JSON, or a non-finite constant
             (``NaN`` / ``Infinity`` — same default hardening as
-            ``core.json.utils.load_json``).
+            ``core.json.utils.load_json``). When
+            ``reject_duplicate_keys=True``, duplicate object keys at
+            any nesting level also raise ``ValueError`` before a
+            last-key-wins overwrite can reach the caller.
     """
     unit = "bytes" if isinstance(data, (bytes, bytearray)) else "characters"
     size = len(data)
@@ -65,7 +73,27 @@ def loads_bounded(data: str | bytes, *, max_bytes: int) -> Any:
         )
         logger.warning("%s", msg)
         raise JsonBudgetExceededError(msg)
-    return json.loads(data, parse_constant=_reject_non_finite)
+    object_pairs_hook = (
+        _reject_duplicate_object_pairs if reject_duplicate_keys else None
+    )
+    return json.loads(
+        data,
+        parse_constant=_reject_non_finite,
+        object_pairs_hook=object_pairs_hook,
+    )
+
+
+def _reject_duplicate_object_pairs(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    """Build an object while refusing duplicate keys at every depth."""
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            # Do not echo the attacker-controlled key into the error.
+            raise ValueError("duplicate JSON object key")
+        value[key] = item
+    return value
 
 
 def load_json_bounded(path: str | Path, *, max_bytes: int) -> Any:

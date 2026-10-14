@@ -51,6 +51,25 @@ class TestLoadsBounded:
         with pytest.raises(ValueError):
             loads_bounded('{"x": NaN}', max_bytes=1024)
 
+    def test_duplicate_keys_keep_existing_default_behavior(self) -> None:
+        assert loads_bounded('{"a": 1, "a": 2}', max_bytes=1024) == {"a": 2}
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            '{"a": 1, "a": 2}',
+            '{"outer": {"a": 1, "a": 2}}',
+            '[{"a": 1, "a": 2}]',
+        ],
+    )
+    def test_duplicate_keys_can_be_rejected_at_every_level(self, payload: str) -> None:
+        with pytest.raises(ValueError, match="duplicate JSON object key"):
+            loads_bounded(
+                payload,
+                max_bytes=1024,
+                reject_duplicate_keys=True,
+            )
+
 
 class TestLoadJsonBounded:
     def test_under_budget_parses(self, tmp_path: Path) -> None:
