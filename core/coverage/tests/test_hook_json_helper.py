@@ -26,7 +26,6 @@ from core.run.host_events import MAX_HOST_EVENT_BYTES
 REPO_ROOT = Path(__file__).resolve().parents[3]
 HOOK = REPO_ROOT / "plugins" / "coverage" / "libexec" / "raptor-hook-read"
 RETIRED_HELPER = REPO_ROOT / "plugins" / "coverage" / "libexec" / "raptor-hook-json"
-BASELINE_HEAD = "7eb559ab941fa24a759bdf4c059c081153f0a41f"
 
 _TEMPLATE_LINE = re.compile(
     rb"(?:"
@@ -164,6 +163,17 @@ def test_n7_track_read_has_only_stdlib_module_imports():
         "types",
         "typing",
     }
+
+
+def test_n7_hook_contract_tests_do_not_require_git_history() -> None:
+    source = Path(__file__).read_text(encoding="utf-8")
+
+    for forbidden in (
+        "git" + " show",
+        "BASELINE_" + "HEAD",
+        '["git", ' + '"show"',
+    ):
+        assert forbidden not in source
 
 
 def test_n7_marker_gate_prevents_child_spawn(tmp_path):
@@ -599,42 +609,22 @@ def test_t7_tool_response_counts_toward_real_shim_payload_budget(
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
 @pytest.mark.parametrize("strong", [False, True], ids=["legacy", "strong"])
-def test_e32_head_hook_and_new_shim_write_identical_manifest_bytes(
+def test_e32_shim_writes_claude_manifest_contract_bytes(
     tmp_path,
     monkeypatch,
     strong,
 ):
     with _owned_hook_case(tmp_path, monkeypatch, strong=strong) as case:
-        old_dir = tmp_path / "head" / "plugins" / "coverage" / "libexec"
-        old_dir.mkdir(parents=True)
-        for relative in (
-            "plugins/coverage/libexec/raptor-hook-read",
-            "plugins/coverage/libexec/raptor-hook-json",
-        ):
-            content = subprocess.check_output(
-                ["git", "show", f"{BASELINE_HEAD}:{relative}"],
-                cwd=REPO_ROOT,
-            )
-            destination = old_dir / Path(relative).name
-            destination.write_bytes(content)
-            destination.chmod(0o700)
         payload = json.dumps(
             {
                 "tool_input": {"file_path": str(case["source"])},
             }
         ).encode()
-
-        old = _invoke(
-            old_dir / "raptor-hook-read",
-            env=case["env"],
-            payload=payload,
-        )
+        expected = (str(case["source"].resolve()) + "\n").encode()
         manifest = case["run_dir"] / track_read.MANIFEST_NAME
-        old_bytes = manifest.read_bytes()
-        manifest.unlink()
-        new = _invoke(HOOK, env=case["env"], payload=payload)
-        new_bytes = manifest.read_bytes()
+        result = _invoke(HOOK, env=case["env"], payload=payload)
 
-    assert old.returncode == 0
-    assert new.returncode == 0
-    assert old_bytes == new_bytes == (str(case["source"].resolve()) + "\n").encode()
+    assert result.returncode == 0
+    assert result.stdout == b""
+    assert result.stderr == b""
+    assert manifest.read_bytes() == expected
