@@ -14,9 +14,14 @@ security conventions — lives in [CONTRIBUTING.md](../CONTRIBUTING.md).
 
 RAPTOR is a Python **execution layer** (scanning, subprocess
 management, SARIF parsing, LLM dispatch, cost tracking — no judgement
-calls) driven by a Claude Code **decision layer** (`.claude/`,
-`tiers/`, `CLAUDE.md`) that prioritises findings, interprets results,
-and decides what to do next. The split is deliberate: the Python layer
+calls) driven by an interactive **decision-layer frontend**. Claude
+Code remains the default and currently supported frontend; the
+backend-neutral host/session contract in `core/startup/host.py` keeps
+frontend selection, installed executable presence, verified session
+ownership, and headless provider usability as separate facts. Copilot
+CLI selection is explicit but launch remains gated until its live host
+contract is verified. Native decision assets remain in `.claude/`,
+`tiers/`, and `CLAUDE.md`. The split is deliberate: the Python layer
 runs standalone in CI, the decision layer drives it interactively.
 When you add a capability, the mechanical part goes in Python and the
 judgement part goes in a skill or command file — never the other way

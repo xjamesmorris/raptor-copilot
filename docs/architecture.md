@@ -81,9 +81,14 @@ Two distinct entry points:
 
 - **`bin/raptor`** (bash) launches the interactive Claude Code session:
   startup banner, progressive persona loading from `tiers/`,
-  slash-command dispatch, permission wiring. It also routes a few
-  commands directly without Claude (`raptor project`, `raptor doctor`,
-  `raptor frida`, `raptor sage-setup`).
+  slash-command dispatch, permission wiring. `--frontend` accepts
+  `claude` (the default) or `copilot`, but Claude is the only
+  launch-enabled frontend. An explicit Copilot selection is refused before
+  target trust checks, project activation, session-state creation, plugin
+  loading, or frontend execution; finding an installed executable does not
+  admit a provider. The launcher also routes a few commands directly without
+  Claude (`raptor project`, `raptor doctor`, `raptor frida`,
+  `raptor sage-setup`).
 - **`raptor.py`** (python) is the non-interactive unified CLI:
   `python3 raptor.py <mode>` with modes scan, sca, binary, fuzz, web,
   agentic, codeql, analyze, describe, doctor, frida. Slash commands
