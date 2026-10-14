@@ -10,6 +10,7 @@
 #include <string.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -42,6 +43,7 @@
 #define COMMAND_CONTROLLED_EXIT UINT16_C(103)
 #define COMMAND_REEXEC_SAME UINT16_C(104)
 #define COMMAND_REEXEC_DIFFERENT UINT16_C(105)
+#define COMMAND_TERMINAL_ATTACH UINT16_C(106)
 
 #define SCENARIO_READY UINT32_C(1)
 #define SCENARIO_DELAYED_READY UINT32_C(2)
@@ -60,6 +62,49 @@
 #define SHAPE_CHILD_AND_GRANDCHILD UINT32_C(2)
 
 #define EXEC_STATUS_MAGIC UINT32_C(0x52524558)
+
+#define TERMINAL_MAGIC UINT32_C(0x5254544d)
+#define TERMINAL_VERSION UINT16_C(1)
+#define TERMINAL_MAX_WORK_COUNT UINT32_C(64)
+
+#define TERMINAL_FRAME_ARM UINT16_C(1)
+#define TERMINAL_FRAME_ARMED UINT16_C(2)
+#define TERMINAL_FRAME_START UINT16_C(3)
+#define TERMINAL_FRAME_WORK_STARTED UINT16_C(4)
+#define TERMINAL_FRAME_REQUESTED UINT16_C(5)
+#define TERMINAL_FRAME_RELEASE_WORK UINT16_C(6)
+#define TERMINAL_FRAME_WORK_DRAINED UINT16_C(7)
+#define TERMINAL_FRAME_READY UINT16_C(8)
+#define TERMINAL_FRAME_ACK UINT16_C(9)
+#define TERMINAL_FRAME_ACKED UINT16_C(10)
+
+#define TERMINAL_EVENT_COMPLETE UINT32_C(1)
+#define TERMINAL_EVENT_FAIL UINT32_C(2)
+#define TERMINAL_EVENT_INTERRUPT UINT32_C(3)
+#define TERMINAL_EVENT_CANCEL UINT32_C(4)
+
+#define TERMINAL_SEQUENCE_IMMEDIATE UINT32_C(1)
+#define TERMINAL_SEQUENCE_BACKGROUND_DRAIN UINT32_C(2)
+#define TERMINAL_SEQUENCE_EXACT_DUPLICATE UINT32_C(3)
+#define TERMINAL_SEQUENCE_CONFLICTING_DUPLICATE UINT32_C(4)
+#define TERMINAL_SEQUENCE_OUT_OF_ORDER UINT32_C(5)
+#define TERMINAL_SEQUENCE_FOREIGN_NONCE UINT32_C(6)
+#define TERMINAL_SEQUENCE_WRONG_KIND UINT32_C(7)
+#define TERMINAL_SEQUENCE_MALFORMED UINT32_C(8)
+#define TERMINAL_SEQUENCE_TIMEOUT UINT32_C(9)
+#define TERMINAL_SEQUENCE_CHILD_EXIT UINT32_C(10)
+#define TERMINAL_SEQUENCE_CONTROL_EOF UINT32_C(11)
+#define TERMINAL_SEQUENCE_EXIT_AFTER_ACK UINT32_C(12)
+
+#define TERMINAL_STAGE_ATTACHED UINT32_C(1)
+#define TERMINAL_STAGE_ARMED UINT32_C(2)
+#define TERMINAL_STAGE_RELEASE UINT32_C(3)
+#define TERMINAL_STAGE_ACK UINT32_C(4)
+#define TERMINAL_STAGE_EXIT_AFTER_ACK UINT32_C(5)
+
+#define TERMINAL_ACTION_CONTINUE 0
+#define TERMINAL_ACTION_EXIT_OK 1
+#define TERMINAL_ACTION_EXIT_ERROR 2
 
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((used))
@@ -90,8 +135,28 @@ struct __attribute__((packed)) exec_status_frame {
     int32_t error_number;
 };
 
+struct __attribute__((packed)) terminal_frame {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t type;
+    uint32_t event;
+    uint32_t sequence;
+    uint32_t work_count;
+    unsigned char nonce[16];
+};
+
+struct terminal_state {
+    int fd;
+    uint32_t event;
+    uint32_t sequence_mode;
+    uint32_t work_count;
+    uint32_t stage;
+    unsigned char nonce[16];
+};
+
 _Static_assert(sizeof(struct protocol_frame) == 36, "protocol frame size");
 _Static_assert(sizeof(struct exec_status_frame) == 8, "exec status frame size");
+_Static_assert(sizeof(struct terminal_frame) == 36, "terminal frame size");
 
 static volatile sig_atomic_t stop_requested = 0;
 
@@ -189,6 +254,516 @@ static int receive_frame(
     }
     memcpy(frame, raw, sizeof(*frame));
     return frame_is_valid(frame, expected_type) ? 0 : -1;
+}
+
+static int terminal_event_valid(uint32_t event)
+{
+    return event >= TERMINAL_EVENT_COMPLETE && event <= TERMINAL_EVENT_CANCEL;
+}
+
+static int terminal_sequence_valid(uint32_t sequence)
+{
+    return sequence >= TERMINAL_SEQUENCE_IMMEDIATE
+        && sequence <= TERMINAL_SEQUENCE_EXIT_AFTER_ACK;
+}
+
+static int terminal_plan_valid(
+    uint32_t event,
+    uint32_t sequence,
+    uint32_t work_count
+)
+{
+    if (!terminal_event_valid(event)
+            || !terminal_sequence_valid(sequence)
+            || work_count > TERMINAL_MAX_WORK_COUNT) {
+        return 0;
+    }
+    if (sequence == TERMINAL_SEQUENCE_BACKGROUND_DRAIN) {
+        return work_count > 0;
+    }
+    return work_count == 0;
+}
+
+static int terminal_nonce_valid(const unsigned char nonce[16])
+{
+    size_t index;
+    unsigned char combined = 0;
+
+    for (index = 0; index < 16; ++index) {
+        combined = (unsigned char)(combined | nonce[index]);
+    }
+    return combined != 0;
+}
+
+static void terminal_close(struct terminal_state *state)
+{
+    if (state->fd >= 0) {
+        (void)close(state->fd);
+    }
+    memset(state, 0, sizeof(*state));
+    state->fd = -1;
+}
+
+static int terminal_socket_valid(int fd)
+{
+    int descriptor_flags;
+    int file_flags;
+    int socket_type = 0;
+    socklen_t socket_type_length = sizeof(socket_type);
+    struct sockaddr_storage address;
+    socklen_t address_length = sizeof(address);
+    struct stat value;
+
+    descriptor_flags = fcntl(fd, F_GETFD);
+    if (descriptor_flags < 0 || (descriptor_flags & FD_CLOEXEC) == 0) {
+        return 0;
+    }
+    if (fstat(fd, &value) != 0 || !S_ISSOCK(value.st_mode)) {
+        return 0;
+    }
+    if (getsockopt(
+            fd,
+            SOL_SOCKET,
+            SO_TYPE,
+            &socket_type,
+            &socket_type_length) != 0
+            || socket_type_length != sizeof(socket_type)
+            || socket_type != SOCK_SEQPACKET) {
+        return 0;
+    }
+    memset(&address, 0, sizeof(address));
+    if (getsockname(fd, (struct sockaddr *)&address, &address_length) != 0
+            || address.ss_family != AF_UNIX) {
+        return 0;
+    }
+    file_flags = fcntl(fd, F_GETFL);
+    if (file_flags < 0 || fcntl(fd, F_SETFL, file_flags | O_NONBLOCK) != 0) {
+        return 0;
+    }
+    return 1;
+}
+
+static int receive_terminal_attach(
+    struct protocol_frame *frame,
+    int *terminal_fd
+)
+{
+    unsigned char raw[sizeof(*frame) + 1];
+    struct iovec payload;
+    union {
+        struct cmsghdr alignment;
+        unsigned char bytes[CMSG_SPACE(sizeof(int) * 2)];
+    } control;
+    struct msghdr message;
+    struct cmsghdr *header;
+    int received[2] = {-1, -1};
+    size_t received_count = 0;
+    int invalid = 0;
+    ssize_t count;
+
+    memset(&message, 0, sizeof(message));
+    memset(&control, 0, sizeof(control));
+    payload.iov_base = raw;
+    payload.iov_len = sizeof(raw);
+    message.msg_iov = &payload;
+    message.msg_iovlen = 1;
+    message.msg_control = control.bytes;
+    message.msg_controllen = sizeof(control.bytes);
+    do {
+        count = recvmsg(FD_CONTROL, &message, MSG_CMSG_CLOEXEC);
+    } while (count < 0 && errno == EINTR);
+    if (count != (ssize_t)sizeof(*frame)
+            || (message.msg_flags & (MSG_CTRUNC | MSG_TRUNC)) != 0) {
+        invalid = 1;
+    }
+    for (header = CMSG_FIRSTHDR(&message);
+            header != NULL;
+            header = CMSG_NXTHDR(&message, header)) {
+        size_t payload_bytes;
+        size_t descriptor_count;
+        size_t index;
+        int *descriptors;
+
+        if (header->cmsg_level != SOL_SOCKET
+                || header->cmsg_type != SCM_RIGHTS
+                || header->cmsg_len < CMSG_LEN(0)) {
+            invalid = 1;
+            continue;
+        }
+        payload_bytes = header->cmsg_len - CMSG_LEN(0);
+        if (payload_bytes == 0 || payload_bytes % sizeof(int) != 0) {
+            invalid = 1;
+            continue;
+        }
+        descriptor_count = payload_bytes / sizeof(int);
+        descriptors = (int *)CMSG_DATA(header);
+        for (index = 0; index < descriptor_count; ++index) {
+            int fd = descriptors[index];
+            int flags = fcntl(fd, F_GETFD);
+
+            if (flags < 0 || (flags & FD_CLOEXEC) == 0) {
+                invalid = 1;
+            }
+            if (received_count < 2) {
+                received[received_count] = fd;
+            } else {
+                (void)close(fd);
+                invalid = 1;
+            }
+            ++received_count;
+        }
+    }
+    if (count == (ssize_t)sizeof(*frame)) {
+        memcpy(frame, raw, sizeof(*frame));
+        if (!frame_is_valid(frame, COMMAND_TERMINAL_ATTACH)
+                || !terminal_plan_valid(
+                    frame->argument0,
+                    frame->argument1,
+                    frame->argument2)) {
+            invalid = 1;
+        }
+    }
+    if (received_count != 1 || received[0] < 0) {
+        invalid = 1;
+    }
+    if (!invalid && !terminal_socket_valid(received[0])) {
+        invalid = 1;
+    }
+    if (invalid) {
+        size_t index;
+
+        for (index = 0; index < received_count && index < 2; ++index) {
+            if (received[index] >= 0) {
+                (void)close(received[index]);
+            }
+        }
+        return -1;
+    }
+    *terminal_fd = received[0];
+    return 0;
+}
+
+static void build_terminal_frame(
+    struct terminal_frame *frame,
+    uint16_t type,
+    uint32_t event,
+    uint32_t sequence,
+    uint32_t work_count,
+    const unsigned char nonce[16]
+)
+{
+    memset(frame, 0, sizeof(*frame));
+    frame->magic = TERMINAL_MAGIC;
+    frame->version = TERMINAL_VERSION;
+    frame->type = type;
+    frame->event = event;
+    frame->sequence = sequence;
+    frame->work_count = work_count;
+    memcpy(frame->nonce, nonce, sizeof(frame->nonce));
+}
+
+static int send_terminal_frame(
+    const struct terminal_state *state,
+    uint16_t type,
+    uint32_t sequence,
+    uint32_t work_count
+)
+{
+    struct terminal_frame frame;
+    ssize_t written;
+
+    build_terminal_frame(
+        &frame,
+        type,
+        state->event,
+        sequence,
+        work_count,
+        state->nonce
+    );
+    written = send(state->fd, &frame, sizeof(frame), MSG_NOSIGNAL);
+    return written == (ssize_t)sizeof(frame) ? 0 : -1;
+}
+
+static int receive_terminal_frame(
+    const struct terminal_state *state,
+    struct terminal_frame *frame
+)
+{
+    unsigned char raw[sizeof(*frame) + 1];
+    ssize_t count;
+
+    do {
+        count = recv(state->fd, raw, sizeof(raw), 0);
+    } while (count < 0 && errno == EINTR);
+    if (count == 0) {
+        return 1;
+    }
+    if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        return 2;
+    }
+    if (count != (ssize_t)sizeof(*frame)) {
+        return -1;
+    }
+    memcpy(frame, raw, sizeof(*frame));
+    return 0;
+}
+
+static int terminal_frame_matches(
+    const struct terminal_state *state,
+    const struct terminal_frame *frame,
+    uint16_t type,
+    uint32_t sequence,
+    uint32_t work_count
+)
+{
+    return frame->magic == TERMINAL_MAGIC
+        && frame->version == TERMINAL_VERSION
+        && frame->type == type
+        && frame->event == state->event
+        && frame->sequence == sequence
+        && frame->work_count == work_count
+        && memcmp(frame->nonce, state->nonce, sizeof(state->nonce)) == 0;
+}
+
+static uint32_t alternate_terminal_event(uint32_t event)
+{
+    return event == TERMINAL_EVENT_COMPLETE
+        ? TERMINAL_EVENT_FAIL : TERMINAL_EVENT_COMPLETE;
+}
+
+static int emit_terminal_ready(struct terminal_state *state)
+{
+    struct terminal_frame frame;
+    unsigned char foreign_nonce[16];
+
+    switch (state->sequence_mode) {
+    case TERMINAL_SEQUENCE_IMMEDIATE:
+    case TERMINAL_SEQUENCE_EXIT_AFTER_ACK:
+        if (send_terminal_frame(state, TERMINAL_FRAME_READY, 4, 0) != 0) {
+            return -1;
+        }
+        break;
+    case TERMINAL_SEQUENCE_EXACT_DUPLICATE:
+        if (send_terminal_frame(state, TERMINAL_FRAME_READY, 4, 0) != 0
+                || send_terminal_frame(
+                    state,
+                    TERMINAL_FRAME_READY,
+                    4,
+                    0) != 0) {
+            return -1;
+        }
+        break;
+    case TERMINAL_SEQUENCE_CONFLICTING_DUPLICATE:
+        if (send_terminal_frame(state, TERMINAL_FRAME_READY, 4, 0) != 0) {
+            return -1;
+        }
+        build_terminal_frame(
+            &frame,
+            TERMINAL_FRAME_READY,
+            alternate_terminal_event(state->event),
+            4,
+            0,
+            state->nonce
+        );
+        if (send(state->fd, &frame, sizeof(frame), MSG_NOSIGNAL)
+                != (ssize_t)sizeof(frame)) {
+            return -1;
+        }
+        break;
+    case TERMINAL_SEQUENCE_OUT_OF_ORDER:
+        if (send_terminal_frame(state, TERMINAL_FRAME_READY, 5, 0) != 0) {
+            return -1;
+        }
+        break;
+    case TERMINAL_SEQUENCE_FOREIGN_NONCE:
+        memcpy(foreign_nonce, state->nonce, sizeof(foreign_nonce));
+        foreign_nonce[0] ^= UINT8_C(1);
+        build_terminal_frame(
+            &frame,
+            TERMINAL_FRAME_READY,
+            state->event,
+            4,
+            0,
+            foreign_nonce
+        );
+        if (send(state->fd, &frame, sizeof(frame), MSG_NOSIGNAL)
+                != (ssize_t)sizeof(frame)) {
+            return -1;
+        }
+        break;
+    case TERMINAL_SEQUENCE_WRONG_KIND:
+        build_terminal_frame(
+            &frame,
+            TERMINAL_FRAME_READY,
+            alternate_terminal_event(state->event),
+            4,
+            0,
+            state->nonce
+        );
+        if (send(state->fd, &frame, sizeof(frame), MSG_NOSIGNAL)
+                != (ssize_t)sizeof(frame)) {
+            return -1;
+        }
+        break;
+    case TERMINAL_SEQUENCE_MALFORMED:
+        build_terminal_frame(
+            &frame,
+            TERMINAL_FRAME_READY,
+            state->event,
+            4,
+            0,
+            state->nonce
+        );
+        if (send(state->fd, &frame, sizeof(frame) - 1, MSG_NOSIGNAL)
+                != (ssize_t)sizeof(frame) - 1) {
+            return -1;
+        }
+        break;
+    case TERMINAL_SEQUENCE_TIMEOUT:
+        return 0;
+    case TERMINAL_SEQUENCE_CHILD_EXIT:
+        return TERMINAL_ACTION_EXIT_ERROR;
+    case TERMINAL_SEQUENCE_CONTROL_EOF:
+        (void)close(FD_CONTROL);
+        return TERMINAL_ACTION_EXIT_ERROR;
+    default:
+        return -1;
+    }
+    state->stage = TERMINAL_STAGE_ACK;
+    return TERMINAL_ACTION_CONTINUE;
+}
+
+static int handle_terminal_input(struct terminal_state *state)
+{
+    struct terminal_frame frame;
+    int received = receive_terminal_frame(state, &frame);
+
+    if (received == 1) {
+        if (state->stage == TERMINAL_STAGE_EXIT_AFTER_ACK) {
+            terminal_close(state);
+            return TERMINAL_ACTION_EXIT_OK;
+        }
+        terminal_close(state);
+        return TERMINAL_ACTION_CONTINUE;
+    }
+    if (received == 2) {
+        return TERMINAL_ACTION_CONTINUE;
+    }
+    if (received != 0) {
+        terminal_close(state);
+        return TERMINAL_ACTION_CONTINUE;
+    }
+    if (state->stage == TERMINAL_STAGE_ATTACHED) {
+        if (frame.magic != TERMINAL_MAGIC
+                || frame.version != TERMINAL_VERSION
+                || frame.type != TERMINAL_FRAME_ARM
+                || frame.event != state->event
+                || frame.sequence != 1
+                || frame.work_count != state->work_count
+                || !terminal_nonce_valid(frame.nonce)) {
+            terminal_close(state);
+            return TERMINAL_ACTION_CONTINUE;
+        }
+        memcpy(state->nonce, frame.nonce, sizeof(state->nonce));
+        if (send_terminal_frame(
+                state,
+                TERMINAL_FRAME_ARMED,
+                2,
+                state->work_count) != 0) {
+            terminal_close(state);
+            return TERMINAL_ACTION_CONTINUE;
+        }
+        state->stage = TERMINAL_STAGE_ARMED;
+        return TERMINAL_ACTION_CONTINUE;
+    }
+    if (state->stage == TERMINAL_STAGE_ARMED) {
+        int action;
+
+        if (!terminal_frame_matches(
+                state,
+                &frame,
+                TERMINAL_FRAME_START,
+                3,
+                state->work_count)) {
+            terminal_close(state);
+            return TERMINAL_ACTION_CONTINUE;
+        }
+        if (state->sequence_mode == TERMINAL_SEQUENCE_BACKGROUND_DRAIN) {
+            if (send_terminal_frame(
+                    state,
+                    TERMINAL_FRAME_WORK_STARTED,
+                    4,
+                    state->work_count) != 0
+                    || send_terminal_frame(
+                        state,
+                        TERMINAL_FRAME_REQUESTED,
+                        5,
+                        state->work_count) != 0) {
+                terminal_close(state);
+                return TERMINAL_ACTION_CONTINUE;
+            }
+            state->stage = TERMINAL_STAGE_RELEASE;
+            return TERMINAL_ACTION_CONTINUE;
+        }
+        action = emit_terminal_ready(state);
+        if (action == TERMINAL_ACTION_EXIT_ERROR) {
+            terminal_close(state);
+        } else if (action < 0) {
+            terminal_close(state);
+            action = TERMINAL_ACTION_CONTINUE;
+        }
+        return action;
+    }
+    if (state->stage == TERMINAL_STAGE_RELEASE) {
+        if (!terminal_frame_matches(
+                state,
+                &frame,
+                TERMINAL_FRAME_RELEASE_WORK,
+                6,
+                state->work_count)
+                || send_terminal_frame(
+                    state,
+                    TERMINAL_FRAME_WORK_DRAINED,
+                    7,
+                    0) != 0
+                || send_terminal_frame(
+                    state,
+                    TERMINAL_FRAME_READY,
+                    8,
+                    0) != 0) {
+            terminal_close(state);
+            return TERMINAL_ACTION_CONTINUE;
+        }
+        state->stage = TERMINAL_STAGE_ACK;
+        return TERMINAL_ACTION_CONTINUE;
+    }
+    if (state->stage == TERMINAL_STAGE_ACK) {
+        uint32_t ready_sequence =
+            state->sequence_mode == TERMINAL_SEQUENCE_BACKGROUND_DRAIN ? 8 : 4;
+
+        if (!terminal_frame_matches(
+                state,
+                &frame,
+                TERMINAL_FRAME_ACK,
+                ready_sequence + 1,
+                0)
+                || send_terminal_frame(
+                    state,
+                    TERMINAL_FRAME_ACKED,
+                    ready_sequence + 2,
+                    0) != 0) {
+            terminal_close(state);
+            return TERMINAL_ACTION_CONTINUE;
+        }
+        if (state->sequence_mode == TERMINAL_SEQUENCE_EXIT_AFTER_ACK) {
+            state->stage = TERMINAL_STAGE_EXIT_AFTER_ACK;
+        } else {
+            terminal_close(state);
+        }
+        return TERMINAL_ACTION_CONTINUE;
+    }
+    terminal_close(state);
+    return TERMINAL_ACTION_CONTINUE;
 }
 
 static int write_exec_failure(int error_number)
@@ -440,8 +1015,12 @@ static void stop_descendants(pid_t child)
 
 static int active_loop(pid_t descendant)
 {
+    struct terminal_state terminal;
+
+    memset(&terminal, 0, sizeof(terminal));
+    terminal.fd = -1;
     while (!stop_requested) {
-        struct pollfd items[2];
+        struct pollfd items[3];
         struct protocol_frame frame;
         int result;
 
@@ -451,7 +1030,10 @@ static int active_loop(pid_t descendant)
         items[1].fd = FD_LIVENESS;
         items[1].events = POLLIN | POLLHUP | POLLERR;
         items[1].revents = 0;
-        result = poll(items, 2, -1);
+        items[2].fd = terminal.fd;
+        items[2].events = POLLIN | POLLHUP | POLLERR | POLLNVAL;
+        items[2].revents = 0;
+        result = poll(items, 3, -1);
         if (result < 0) {
             if (errno == EINTR) {
                 continue;
@@ -466,18 +1048,37 @@ static int active_loop(pid_t descendant)
             break;
         }
         if ((items[0].revents & POLLIN) == 0) {
+            if (terminal.fd >= 0
+                    && (items[2].revents
+                        & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) != 0) {
+                int action = handle_terminal_input(&terminal);
+
+                if (action == TERMINAL_ACTION_EXIT_OK) {
+                    stop_descendants(descendant);
+                    (void)close(FD_LIVENESS);
+                    return 0;
+                }
+                if (action == TERMINAL_ACTION_EXIT_ERROR) {
+                    stop_descendants(descendant);
+                    (void)close(FD_LIVENESS);
+                    return 1;
+                }
+            }
             continue;
         }
         if (receive_frame(&frame, COMMAND_CONTROLLED_EXIT, MSG_PEEK) == 0) {
             if (receive_frame(&frame, COMMAND_CONTROLLED_EXIT, 0) != 0) {
                 break;
             }
+            terminal_close(&terminal);
             (void)send_frame(EVENT_CONTROLLED_EXITING, 0, 0, 0);
             stop_descendants(descendant);
             (void)close(FD_LIVENESS);
             return 0;
-        }
-        if (receive_frame(&frame, COMMAND_REEXEC_SAME, MSG_PEEK) == 0) {
+        } else if (receive_frame(
+                &frame,
+                COMMAND_REEXEC_SAME,
+                MSG_PEEK) == 0) {
             static char *const argv[] = {
                 (char *)"owned-runtime-host",
                 (char *)"--reexec-hold",
@@ -491,8 +1092,10 @@ static int active_loop(pid_t descendant)
             fexecve(FD_PRIMARY_EXECUTABLE, argv, empty_environment);
             (void)send_frame(EVENT_PROTOCOL_ERROR, (uint32_t)errno, 0, 0);
             break;
-        }
-        if (receive_frame(&frame, COMMAND_REEXEC_DIFFERENT, MSG_PEEK) == 0) {
+        } else if (receive_frame(
+                &frame,
+                COMMAND_REEXEC_DIFFERENT,
+                MSG_PEEK) == 0) {
             static char *const argv[] = {
                 (char *)"owned-runtime-host",
                 (char *)"--reexec-hold",
@@ -506,10 +1109,48 @@ static int active_loop(pid_t descendant)
             fexecve(FD_ALTERNATE_EXECUTABLE, argv, empty_environment);
             (void)send_frame(EVENT_PROTOCOL_ERROR, (uint32_t)errno, 0, 0);
             break;
+        } else if (receive_frame(
+                &frame,
+                COMMAND_TERMINAL_ATTACH,
+                MSG_PEEK) == 0) {
+            int received_fd = -1;
+
+            if (receive_terminal_attach(&frame, &received_fd) != 0
+                    || terminal.fd >= 0) {
+                if (received_fd >= 0) {
+                    (void)close(received_fd);
+                }
+                (void)send_frame(EVENT_PROTOCOL_ERROR, UINT32_C(8), 0, 0);
+            } else {
+                terminal.fd = received_fd;
+                terminal.event = frame.argument0;
+                terminal.sequence_mode = frame.argument1;
+                terminal.work_count = frame.argument2;
+                terminal.stage = TERMINAL_STAGE_ATTACHED;
+                memset(terminal.nonce, 0, sizeof(terminal.nonce));
+            }
+        } else {
+            (void)send_frame(EVENT_PROTOCOL_ERROR, UINT32_C(1), 0, 0);
+            break;
         }
-        (void)send_frame(EVENT_PROTOCOL_ERROR, UINT32_C(1), 0, 0);
-        break;
+        if (terminal.fd >= 0
+                && (items[2].revents
+                    & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) != 0) {
+            int action = handle_terminal_input(&terminal);
+
+            if (action == TERMINAL_ACTION_EXIT_OK) {
+                stop_descendants(descendant);
+                (void)close(FD_LIVENESS);
+                return 0;
+            }
+            if (action == TERMINAL_ACTION_EXIT_ERROR) {
+                stop_descendants(descendant);
+                (void)close(FD_LIVENESS);
+                return 1;
+            }
+        }
     }
+    terminal_close(&terminal);
     stop_descendants(descendant);
     (void)close(FD_LIVENESS);
     return 1;

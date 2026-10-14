@@ -232,6 +232,7 @@ class _FrameType(int, Enum):
     CONTROLLED_EXIT = 103
     REEXEC_SAME = 104
     REEXEC_DIFFERENT = 105
+    TERMINAL_ATTACH = 106
 
 
 class _ReexecMode(int, Enum):
@@ -1562,6 +1563,22 @@ def _claim_operation(
         elif operation == "close":
             if found.close_result is not None:
                 return found, False
+        elif operation == "terminal":
+            if (
+                found.close_result is not None
+                or found.failure_result is not None
+                or found.verified_result is None
+                or found.phase is not LaunchPhase.SUPERVISED
+                or not isinstance(found.current_receipt, VerifiedReceiptIssued)
+            ):
+                return _failure(
+                    LaunchDisposition.STATE_CONFLICT,
+                    LaunchReason.FINAL_CAS_CONFLICT,
+                    phase=found.phase,
+                    receipt_state=_receipt_state(found),
+                    diagnostics={"stage": "terminal_state"},
+                    trace=found.trace,
+                )
         else:
             raise ValueError("unknown owned fake operation")
         found.operation = operation
