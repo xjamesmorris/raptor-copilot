@@ -769,6 +769,21 @@
     "plumbing:orphan_config_field:core/build/build_detector.py:BuildSystem.detected_files": {
       "note": "construction-time provenance: the detector stores which build files drove the detection (the same list its confidence score is computed from) on the result object for debugging and tests; nothing dereferences the field programmatically by design"
     },
+    "plumbing:orphan_config_field:core/llm/copilot_protocol.py:CandidateBillingTokenDetail.cost_per_batch": {
+      "note": "pending wiring: typed protocol evidence parsed and schema-validated from the candidate JSONL profile and retained on the transcript for record-only inspection and the future per-call accounting/identity reconciliation layer; not configuration and never a budget input \u2014 revisit when that layer lands"
+    },
+    "plumbing:orphan_config_field:core/llm/copilot_protocol.py:CandidateBillingTokenDetail.token_type": {
+      "note": "pending wiring: typed protocol evidence parsed and schema-validated from the candidate JSONL profile and retained on the transcript for record-only inspection and the future per-call accounting/identity reconciliation layer; not configuration and never a budget input \u2014 revisit when that layer lands"
+    },
+    "plumbing:orphan_config_field:core/llm/copilot_protocol.py:CandidateProtocolProvenance.source_cli_version": {
+      "note": "kept: fixed candidate-protocol provenance member (init=False; cannot be caller-promoted). Consumed reflectively by the frozen-dataclass equality gate in admit_candidate_completion, which refuses transcripts whose provenance differs (provenance_mismatch); no attribute read by design \u2014 revisit if the provenance object gains a serializer"
+    },
+    "plumbing:orphan_config_field:core/llm/copilot_protocol.py:CandidateProtocolProvenance.source_schema_sha256": {
+      "note": "kept: fixed candidate-protocol provenance member (init=False; cannot be caller-promoted). Consumed reflectively by the frozen-dataclass equality gate in admit_candidate_completion, which refuses transcripts whose provenance differs (provenance_mismatch); no attribute read by design \u2014 revisit if the provenance object gains a serializer"
+    },
+    "plumbing:orphan_config_field:core/llm/copilot_protocol.py:CandidateShutdownUsage.total_premium_requests": {
+      "note": "pending wiring: typed protocol evidence parsed and schema-validated from the candidate JSONL profile and retained on the transcript for record-only inspection and the future per-call accounting/identity reconciliation layer; not configuration and never a budget input \u2014 revisit when that layer lands"
+    },
     "plumbing:orphan_config_field:core/llm/tool_use/types.py:TurnStarted.input_token_estimate": {
       "note": "kept: published observability API (2026-08-17 config-orphan pass). TurnStarted is a frozen event dataclass exported in core.llm.tool_use.__all__ for external subscribers; per-turn input-token telemetry is the point of the event. The in-repo hunt_dispatch subscriber deliberately skips TurnStarted; the value is computed regardless for the context-policy gate (loop.py)."
     }

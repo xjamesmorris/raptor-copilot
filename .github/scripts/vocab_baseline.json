@@ -1549,6 +1549,16 @@
     "kind": "literal",
     "note": "allowlist of RAPTOR's own run-lifecycle command names that hold LLM quota mid-run (the sibling-observation classifier; includes forward-compat members that cannot occur on the ledger yet \u2014 rationale inline), not a learned name vocabulary; same class as core/run/provenance.py::_DETERMINISTIC_COMMANDS"
   },
+  "core/llm/copilot_protocol.py::_EVENT_SHAPES": {
+    "count": 28,
+    "kind": "literal",
+    "note": "candidate-profile event-type shapes mirroring the pinned upstream session-event schema (version/sha fixed in module provenance); unknown events fail closed; widening only by an evidenced admission change"
+  },
+  "core/llm/copilot_protocol.py::_MODEL_CHANGE_SOURCES": {
+    "count": 11,
+    "kind": "literal",
+    "note": "closed enum mirroring the pinned upstream session-event schema's model-change source values; used to classify substitution signals; widening requires a schema-evidenced change, not name learning"
+  },
   "core/llm/dispatcher/auth.py::__init__": {
     "count": 21,
     "kind": "literal"
