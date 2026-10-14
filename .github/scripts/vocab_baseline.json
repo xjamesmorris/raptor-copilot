@@ -1767,7 +1767,7 @@
     "note": "RPC reply payload keys (wire shape of the spawn verb, not a name vocabulary)"
   },
   "core/sandbox/context.py::_NETWORKED_ALLOWED_KWARGS": {
-    "count": 19,
+    "count": 21,
     "kind": "literal"
   },
   "core/sandbox/context.py::_UNTRUSTED_ALLOWED_KWARGS": {
@@ -1790,7 +1790,7 @@
     "note": "kernel-defined /proc/softirqs row names (fixed external contract mirrored verbatim for the persona stub) - not a learnable vocabulary"
   },
   "core/sandbox/profiles.py::_SANDBOX_KWARGS": {
-    "count": 34,
+    "count": 35,
     "kind": "literal"
   },
   "core/sandbox/proxy.py::_KNOWN_DOH_PROVIDERS": {

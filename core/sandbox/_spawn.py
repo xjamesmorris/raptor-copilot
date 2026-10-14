@@ -58,6 +58,7 @@ from __future__ import annotations
 import array
 import contextlib
 import errno
+import fcntl
 import logging
 import os
 import platform
@@ -77,7 +78,7 @@ import threading
 import time
 import traceback
 import warnings
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -1051,6 +1052,7 @@ def _pin_bind_sources(
     rootfs: str | None,
     readable_paths: Iterable[str] | None,
     writable_extra_paths: Iterable[str] | None = None,
+    expected_identities: Mapping[str, tuple[int, int]] | None = None,
 ) -> dict[str, int]:
     """Validation-time O_PATH pins for every mount-ns bind SOURCE.
 
@@ -1134,6 +1136,20 @@ def _pin_bind_sources(
                 # optional tool dir). The child skips unpinned
                 # extra_ro_paths entries outright.
                 continue
+        for raw_path, expected in (expected_identities or {}).items():
+            key = _canonical_bind_path(raw_path)
+            fd = fds.get(key)
+            if fd is None:
+                raise OSError(
+                    _PIN_TAMPER_ERRNO,
+                    f"required bind source was not pinned: {key}",
+                )
+            pinned = os.fstat(fd)
+            if (pinned.st_dev, pinned.st_ino) != expected:
+                raise OSError(
+                    _PIN_TAMPER_ERRNO,
+                    f"required bind source identity changed: {key}",
+                )
         return fds
     except BaseException:
         for fd in fds.values():
@@ -1452,6 +1468,85 @@ _POST_EXIT_DRAIN_SECONDS = 0.5
 _P_READY_DEADLINE_S = 15.0
 
 
+def _read_capture_chunk(fd: int) -> bytes:
+    return os.read(fd, 65536)
+
+
+def _append_capture(
+    chunks: list[bytes],
+    current_len: int,
+    chunk: bytes,
+    capture_cap: int,
+) -> tuple[int, bool]:
+    remaining = max(0, capture_cap - current_len)
+    kept = chunk[:remaining]
+    if kept:
+        chunks.append(kept)
+    return current_len + len(kept), len(kept) < len(chunk)
+
+
+def _capture_output(
+    buffer: bytes,
+    *,
+    truncated: bool,
+    stream: str,
+    text: bool,
+    capture_cap: int,
+) -> str | bytes:
+    rendered = buffer
+    if truncated:
+        rendered += (
+            f"\n[sandbox: {stream} capture truncated at "
+            f"{capture_cap} bytes]\n"
+        ).encode("ascii")
+    if text:
+        return rendered.decode("utf-8", errors="replace")
+    return rendered
+
+
+def _backend_id(
+    *,
+    block_network: bool,
+    inherit_netns: bool,
+    skip_mount_ns: bool,
+    skip_pid_ns: bool,
+) -> str:
+    parts = ["linux-fork"]
+    if not skip_mount_ns:
+        parts.append("mount")
+    if not skip_pid_ns:
+        parts.append("pid")
+    if block_network and not inherit_netns:
+        parts.append("netns")
+    return "-".join(parts)
+
+
+def _attach_capture_metadata(
+    result_or_error,
+    *,
+    capture_output: bool,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+    stdout_bytes_kept: int,
+    stderr_bytes_kept: int,
+    backend: str,
+) -> None:
+    result_or_error.stdout_truncated = bool(stdout_truncated)
+    result_or_error.stderr_truncated = bool(stderr_truncated)
+    result_or_error.stdout_bytes_kept = int(stdout_bytes_kept)
+    result_or_error.stderr_bytes_kept = int(stderr_bytes_kept)
+    info = dict(getattr(result_or_error, "sandbox_info", {}) or {})
+    info["capture"] = {
+        "enabled": bool(capture_output),
+        "stdout_truncated": bool(stdout_truncated),
+        "stderr_truncated": bool(stderr_truncated),
+        "stdout_bytes_kept": int(stdout_bytes_kept),
+        "stderr_bytes_kept": int(stderr_bytes_kept),
+    }
+    info.setdefault("backend", backend)
+    result_or_error.sandbox_info = info
+
+
 def run_sandboxed(
     cmd: Sequence[str],
     *,
@@ -1498,6 +1593,8 @@ def run_sandboxed(
     child_pid_callback: Callable[[int], None] | None = None,
     rootfs: str | None = None,
     max_capture_bytes: int | None = None,
+    cancel_fd: int | None = None,
+    bind_source_identities: Mapping[str, tuple[int, int]] | None = None,
 ) -> subprocess.CompletedProcess:
     """Run `cmd` inside a fully-isolated sandbox.
 
@@ -1584,6 +1681,52 @@ def run_sandboxed(
     degrade marker, instead of running the command without a tracer.
     The raise happens before the fork, so the target never executes.
     """
+    if cancel_fd is not None:
+        if isinstance(cancel_fd, bool) or not isinstance(cancel_fd, int):
+            raise TypeError("cancel_fd must be an integer file descriptor")
+        if cancel_fd < 3:
+            raise ValueError("cancel_fd must not alias stdin/stdout/stderr")
+        try:
+            cancel_flags = fcntl.fcntl(cancel_fd, fcntl.F_GETFD)
+        except OSError as exc:
+            raise ValueError(f"cancel_fd is not open: {exc}") from exc
+        if not cancel_flags & fcntl.FD_CLOEXEC:
+            raise ValueError("cancel_fd must be close-on-exec")
+        for stream_name, stream in (
+            ("stdin", stdin),
+            ("stdout", stdout),
+            ("stderr", stderr),
+        ):
+            if stream is None or stream in (
+                subprocess.DEVNULL,
+                subprocess.PIPE,
+                subprocess.STDOUT,
+            ):
+                continue
+            try:
+                stream_fd = stream if isinstance(stream, int) else stream.fileno()
+            except (AttributeError, OSError, ValueError):
+                continue
+            if stream_fd == cancel_fd:
+                raise ValueError(
+                    f"cancel_fd must not alias the child {stream_name}"
+                )
+
+    if bind_source_identities is not None:
+        for path, identity in bind_source_identities.items():
+            if not isinstance(path, str) or not os.path.isabs(path):
+                raise ValueError(
+                    "bind_source_identities keys must be absolute paths"
+                )
+            if (
+                not isinstance(identity, tuple)
+                or len(identity) != 2
+                or any(type(value) is not int for value in identity)
+            ):
+                raise ValueError(
+                    "bind_source_identities values must be (device, inode)"
+                )
+
     if rootfs is not None:
         # Rootfs mode is mount-ns-or-nothing: without the pivot there is
         # no image filesystem to run against — the command would execute
@@ -1916,6 +2059,50 @@ def run_sandboxed(
                     "degradation.",
                 )
 
+    # Snapshot descriptors that pre-date this spawn as a fallback for hosts
+    # where the post-fork child cannot enumerate /proc/self/fd. The setup
+    # child must not hold arbitrary caller fds for the lifetime of the
+    # sandbox: they are not target capabilities (the grandchild already
+    # sweeps before exec), but a leaked pipe writer defeats EOF-based parent
+    # cancellation.
+    #
+    # This snapshot is NOT authoritative by fd number. Another thread can
+    # close one of these fds before the sandbox pipes below are created, and
+    # pipe() can reuse that number. Closing the stale numeric snapshot in the
+    # child then closes a live handshake fd. Enumerate the child's actual fd
+    # table after fork and subtract the sandbox-owned keep set instead.
+    _stdio_source_fds: set[int] = set()
+    for _stream in (stdin, stdout, stderr):
+        if _stream is None or _stream in (
+            subprocess.DEVNULL,
+            subprocess.PIPE,
+            subprocess.STDOUT,
+        ):
+            continue
+        try:
+            _stream_fd = (
+                _stream
+                if isinstance(_stream, int)
+                else _stream.fileno()
+            )
+        except (AttributeError, OSError, ValueError):
+            continue
+        if _stream_fd > 2:
+            _stdio_source_fds.add(_stream_fd)
+    try:
+        _preexisting_fds = set()
+        for _name in os.listdir("/proc/self/fd"):
+            _fd = int(_name)
+            if _fd <= 2:
+                continue
+            try:
+                fcntl.fcntl(_fd, fcntl.F_GETFD)
+            except OSError:
+                continue
+            _preexisting_fds.add(_fd)
+    except (OSError, ValueError):
+        _preexisting_fds = set()
+
     # Track every fd we hold in the parent so a failure ANYWHERE from
     # pipe()/fork() through the newuidmap handshake closes the lot.
     # Built before any pipe is opened so partial-open failures also get
@@ -2121,7 +2308,8 @@ def run_sandboxed(
             try:
                 _bind_src_fds = _pin_bind_sources(
                     target, output, rootfs, readable_paths,
-                    writable_extra_paths=_carry_rw_paths)
+                    writable_extra_paths=_carry_rw_paths,
+                    expected_identities=bind_source_identities)
             except OSError as _pin_exc:
                 from .errors import SandboxSetupError
                 msg = (
@@ -2593,6 +2781,22 @@ def run_sandboxed(
         raise
     if child_pid == 0:
         # ================ CHILD ================
+        _child_keep_fds = set(_parent_fds) | _stdio_source_fds
+        for _sock in (_unix_scope_parent_sock, _unix_scope_child_sock):
+            if _sock is not None:
+                with contextlib.suppress(OSError, ValueError):
+                    _child_keep_fds.add(_sock.fileno())
+        try:
+            _child_open_fds = {
+                int(_name)
+                for _name in os.listdir("/proc/self/fd")
+                if _name.isdigit() and int(_name) > 2
+            }
+        except (OSError, ValueError):
+            _child_open_fds = set(_preexisting_fds)
+        for _fd in _child_open_fds - _child_keep_fds:
+            with contextlib.suppress(OSError):
+                os.close(_fd)
         # Close the ends of the pipes we don't use.
         os.close(p_ready_r)
         os.close(p_go_w)
@@ -4395,6 +4599,96 @@ def run_sandboxed(
     if max_capture_bytes is not None:
         _capture_cap = max(0, min(int(max_capture_bytes), _CAPTURE_CAP))
     _truncated = {1: False, 2: False}
+    _sandbox_backend = _backend_id(
+        block_network=block_network,
+        inherit_netns=inherit_netns,
+        skip_mount_ns=skip_mount_ns,
+        skip_pid_ns=skip_pid_ns,
+    )
+    _teardown_done = False
+    stdout_chunks: list[bytes] = []
+    stderr_chunks: list[bytes] = []
+    out_len = err_len = 0
+
+    def _materialize() -> None:
+        nonlocal stdout_buf, stderr_buf
+        if stdout_chunks:
+            stdout_buf += b"".join(stdout_chunks)  # type: ignore[operator]
+            stdout_chunks.clear()
+        if stderr_chunks:
+            stderr_buf += b"".join(stderr_chunks)  # type: ignore[operator]
+            stderr_chunks.clear()
+
+    def _teardown_once() -> None:
+        nonlocal _teardown_done
+        if _teardown_done:
+            return
+        _teardown_done = True
+        _teardown_target(child_pid, death_w, _parent_fds)
+
+    def _render_partial() -> tuple[str | bytes | None, str | bytes | None]:
+        if not capture_output:
+            return None, None
+        _materialize()
+        return (
+            _capture_output(
+                stdout_buf or b"",
+                truncated=_truncated[1],
+                stream="stdout",
+                text=text,
+                capture_cap=_capture_cap,
+            ),
+            _capture_output(
+                stderr_buf or b"",
+                truncated=_truncated[2],
+                stream="stderr",
+                text=text,
+                capture_cap=_capture_cap,
+            ),
+        )
+
+    def _stamp_partial(error) -> None:
+        _attach_capture_metadata(
+            error,
+            capture_output=capture_output,
+            stdout_truncated=_truncated[1],
+            stderr_truncated=_truncated[2],
+            stdout_bytes_kept=out_len,
+            stderr_bytes_kept=err_len,
+            backend=_sandbox_backend,
+        )
+
+    def _raise_timeout() -> None:
+        _teardown_once()
+        out_value, err_value = _render_partial()
+        error = subprocess.TimeoutExpired(
+            list(cmd),
+            timeout if timeout is not None else 0.0,
+            output=out_value,
+            stderr=err_value,
+        )
+        _stamp_partial(error)
+        raise error
+
+    def _raise_cancelled() -> None:
+        from .errors import SandboxCancelled
+
+        _teardown_once()
+        out_value, err_value = _render_partial()
+        error = SandboxCancelled(
+            list(cmd),
+            output=out_value,
+            stderr=err_value,
+        )
+        _stamp_partial(error)
+        raise error
+
+    def _cancel_ready(wait_s: float = 0.0) -> bool:
+        if cancel_fd is None:
+            return False
+        ready, _, _ = _select_mod.select([cancel_fd], [], [], wait_s)
+        return bool(ready)
+
     # Raw wait-status once the capture loop's exit poll reaps the
     # child (None = not yet reaped there).
     child_status = None
@@ -4431,19 +4725,6 @@ def run_sandboxed(
             # pending chunks into stdout_buf/stderr_buf at every loop
             # exit (including the in-loop TimeoutExpired raises and
             # the finally, so no path observes a stale buffer).
-            stdout_chunks: list[bytes] = []
-            stderr_chunks: list[bytes] = []
-            out_len = err_len = 0
-
-            def _materialize() -> None:
-                nonlocal stdout_buf, stderr_buf
-                if stdout_chunks:
-                    stdout_buf += b"".join(stdout_chunks)  # type: ignore[operator]
-                    stdout_chunks.clear()
-                if stderr_chunks:
-                    stderr_buf += b"".join(stderr_chunks)  # type: ignore[operator]
-                    stderr_chunks.clear()
-
             drain_deadline = None
             try:
                 while fds:
@@ -4480,13 +4761,7 @@ def run_sandboxed(
                         # setsid()'d target escapes the killpg sweep
                         # and only the (still-alive) watcher can
                         # reach it by pid.
-                        _teardown_target(child_pid, death_w, _parent_fds)
-                        _materialize()
-                        out_str = stdout_buf.decode("utf-8", errors="replace") if text else stdout_buf  # type: ignore[union-attr]
-                        err_str = stderr_buf.decode("utf-8", errors="replace") if text else stderr_buf  # type: ignore[union-attr]
-                        raise subprocess.TimeoutExpired(
-                            list(cmd), timeout, output=out_str, stderr=err_str  # type: ignore[arg-type]
-                        )
+                        _raise_timeout()
                     waits = []
                     if remaining is not None:
                         waits.append(remaining)
@@ -4499,36 +4774,40 @@ def run_sandboxed(
                         # Reap-poll cadence while the child is alive
                         # (same order as the waitpid poll loop below).
                         waits.append(0.05)
-                    ready, _, _ = select.select(fds, [], [], min(waits))
-                    for fd in ready:
-                        chunk = os.read(fd, 65536)
+                    watched = list(fds)
+                    if cancel_fd is not None and child_status is None:
+                        watched.append(cancel_fd)
+                    ready, _, _ = select.select(
+                        watched, [], [], min(waits))
+                    if (cancel_fd is not None
+                            and child_status is None
+                            and cancel_fd in ready):
+                        _raise_cancelled()
+                    for fd in tuple(ready):
+                        if fd == cancel_fd:
+                            continue
+                        chunk = _read_capture_chunk(fd)
                         if not chunk:
                             os.close(fd)
                             _parent_fds.discard(fd)
                             fds.remove(fd)
                         elif fd == out_r:
-                            if out_len < _capture_cap:
-                                stdout_chunks.append(chunk)
-                                out_len += len(chunk)
-                            else:
-                                _truncated[1] = True
+                            out_len, lost = _append_capture(
+                                stdout_chunks,
+                                out_len,
+                                chunk,
+                                _capture_cap,
+                            )
+                            _truncated[1] = _truncated[1] or lost
                         else:
-                            if err_len < _capture_cap:
-                                stderr_chunks.append(chunk)
-                                err_len += len(chunk)
-                            else:
-                                _truncated[2] = True
+                            err_len, lost = _append_capture(
+                                stderr_chunks,
+                                err_len,
+                                chunk,
+                                _capture_cap,
+                            )
+                            _truncated[2] = _truncated[2] or lost
                 _materialize()
-                if _truncated[1]:
-                    stdout_buf += (  # type: ignore[operator]
-                        b"\n[sandbox: stdout capture truncated "
-                        b"at %d bytes]\n" % _capture_cap
-                    )
-                if _truncated[2]:
-                    stderr_buf += (  # type: ignore[operator]
-                        b"\n[sandbox: stderr capture truncated "
-                        b"at %d bytes]\n" % _capture_cap
-                    )
             finally:
                 # Fold pending chunks on EVERY exit path (the normal
                 # exit above already did; this covers exceptions) so
@@ -4551,21 +4830,26 @@ def run_sandboxed(
             if child_status is not None:
                 # Already reaped by the capture loop's exit poll.
                 status = child_status
-            elif deadline is not None:
+            elif deadline is not None or cancel_fd is not None:
                 while True:
                     pid_, status = os.waitpid(child_pid, os.WNOHANG)
                     if pid_ != 0:
                         break
-                    if time.monotonic() > deadline:
-                        # Death-pipe EOF first — same setsid-escape
-                        # rationale as the capture_output branch above.
-                        _teardown_target(child_pid, death_w, _parent_fds)
-                        out_str = (stdout_buf or b"").decode("utf-8", errors="replace") if text else stdout_buf
-                        err_str = (stderr_buf or b"").decode("utf-8", errors="replace") if text else stderr_buf
-                        raise subprocess.TimeoutExpired(
-                            list(cmd), timeout, output=out_str, stderr=err_str  # type: ignore[arg-type]
-                        )
-                    time.sleep(0.01)
+                    if _cancel_ready():
+                        _raise_cancelled()
+                    if deadline is not None and time.monotonic() > deadline:
+                        _raise_timeout()
+                    if cancel_fd is not None:
+                        wait_s = 0.01
+                        if deadline is not None:
+                            wait_s = max(
+                                0.0,
+                                min(wait_s, deadline - time.monotonic()),
+                            )
+                        if _cancel_ready(wait_s):
+                            _raise_cancelled()
+                    else:
+                        time.sleep(0.01)
             else:
                 _, status = os.waitpid(child_pid, 0)
         except ChildProcessError:
@@ -4575,6 +4859,22 @@ def run_sandboxed(
             logger.warning("waitpid: child %d already reaped (ECHILD); "
                            "exit status unknown", child_pid)
             status = 9
+    except BaseException as exc:
+        try:
+            _teardown_once()
+        except Exception:
+            logger.debug(
+                "child teardown during collection failed",
+                exc_info=True,
+            )
+        if not hasattr(exc, "output"):
+            out_value, err_value = _render_partial()
+            with contextlib.suppress(Exception):
+                setattr(exc, "output", out_value)
+                setattr(exc, "stdout", out_value)
+                setattr(exc, "stderr", err_value)
+        _stamp_partial(exc)
+        raise
     finally:
         # Drain + close the exec-status pipe FIRST so status_r is reclaimed
         # even if a cleanup step below raises — an unclosed status_r leaks
@@ -4662,8 +4962,7 @@ def run_sandboxed(
         setup_status = None
     stdout_out = stderr_out = None
     if capture_output:
-        stdout_out = stdout_buf.decode("utf-8", errors="replace") if text else stdout_buf  # type: ignore[union-attr]
-        stderr_out = stderr_buf.decode("utf-8", errors="replace") if text else stderr_buf  # type: ignore[union-attr]
+        stdout_out, stderr_out = _render_partial()
 
     cp = subprocess.CompletedProcess(
         args=list(cmd),
@@ -4673,5 +4972,15 @@ def run_sandboxed(
     )
     # Authoritative setup-failure signal for context.py's decision table
     # (degrade on M/X, fail loud on L/S/U). None ⇒ target execed.
-    cp._setup_status = setup_status  # type: ignore[attr-defined]
+    setattr(cp, "_setup_status", setup_status)
+    setattr(cp, "_sandbox_backend", _sandbox_backend)
+    _attach_capture_metadata(
+        cp,
+        capture_output=capture_output,
+        stdout_truncated=_truncated[1],
+        stderr_truncated=_truncated[2],
+        stdout_bytes_kept=out_len,
+        stderr_bytes_kept=err_len,
+        backend=_sandbox_backend,
+    )
     return cp

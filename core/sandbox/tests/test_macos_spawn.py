@@ -116,8 +116,8 @@ def test_run_sandboxed_signature_matches_linux_spawn():
     _spawn.run_sandboxed but absent on _macos_spawn.run_sandboxed
     becomes an unexpected-keyword TypeError on macOS at runtime.
     Inspect both signatures and assert _macos_spawn accepts every
-    Linux kwarg (extra Linux-only kwargs are accepted-and-ignored,
-    which the explicit `noqa: ARG001` annotations document)."""
+    Linux kwarg. Unsupported execution capabilities accept their neutral
+    defaults but must refuse non-default values before any spawn."""
     import inspect
 
     from core.sandbox import _spawn as linux_spawn
@@ -132,6 +132,50 @@ def test_run_sandboxed_signature_matches_linux_spawn():
         f"_macos_spawn.run_sandboxed missing kwargs from Linux "
         f"_spawn.run_sandboxed: {missing}"
     )
+    for name in ("cancel_fd", "bind_source_identities"):
+        assert inspect.signature(
+            _macos_spawn.run_sandboxed
+        ).parameters[name].default is None
+        assert inspect.signature(
+            linux_spawn.run_sandboxed
+        ).parameters[name].default is None
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"cancel_fd": 7},
+        {"bind_source_identities": {"/owned/fixture": (1, 2)}},
+        {"bind_source_identities": {}},
+    ],
+)
+def test_linux_execution_contracts_refused_before_macos_setup(monkeypatch, kwargs):
+    from core.sandbox.errors import SandboxSetupError
+
+    def unexpected(*args, **kw):
+        pytest.fail("unsupported capability reached macOS setup or spawn")
+
+    monkeypatch.setattr(_macos_spawn.os, "pipe", unexpected)
+    monkeypatch.setattr(_macos_spawn.seatbelt, "build_profile", unexpected)
+    monkeypatch.setattr(_macos_spawn.subprocess, "Popen", unexpected)
+    with pytest.raises(SandboxSetupError, match="require the Linux"):
+        _macos_spawn.run_sandboxed(["/bin/true"], **kwargs)
+
+
+def test_neutral_linux_execution_contracts_keep_macos_path(monkeypatch):
+    class ReachedExistingProfilePath(Exception):
+        pass
+
+    def profile(**kwargs):
+        raise ReachedExistingProfilePath()
+
+    monkeypatch.setattr(_macos_spawn.seatbelt, "build_profile", profile)
+    with pytest.raises(ReachedExistingProfilePath):
+        _macos_spawn.run_sandboxed(
+            ["/bin/true"],
+            cancel_fd=None,
+            bind_source_identities=None,
+        )
 
 
 def test_is_available_returns_bool():

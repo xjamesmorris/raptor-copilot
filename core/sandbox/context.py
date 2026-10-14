@@ -106,6 +106,12 @@ def spawn_backend_available() -> bool:
     return _spawn_mod.mount_ns_available()
 
 
+def _degraded_untrusted_allowed(*, no_degrade: bool = False) -> bool:
+    if no_degrade:
+        return False
+    return _degraded_untrusted_waiver()
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -1410,7 +1416,8 @@ def sandbox(block_network=_UNSET, target: str | None = None, output: str | None 
             omit_etc_reads: bool = False,
             require_proxy_netns: bool = False,
             rootfs: str | None = None,
-            output_run_root_ok: bool = False):
+            output_run_root_ok: bool = False,
+            no_degrade: bool = False):
     """Context manager for sandboxed subprocess execution.
 
     Each run() call inside the context runs the target command with the
@@ -1714,6 +1721,12 @@ def sandbox(block_network=_UNSET, target: str | None = None, output: str | None 
                  (core.sandbox.work_dir.hostile_work_subdir).
                  Detection only — never a refusal, and never consulted
                  when the sandbox is effectively disabled.
+        no_degrade: Opt-in backend ratchet. Requires the Linux fork-based
+                 user/mount/pid namespace backend, ignores every lowered
+                 untrusted-floor consent surface for this call, forces the
+                 fresh-procfs contract, and refuses every subprocess,
+                 seatbelt, or mountless/Landlock-only fallback before
+                 target exec.
 
     Landlock activation: engaged when any of `target`, `output`, or
     `allowed_tcp_ports` is set. Default filesystem policy is read-
@@ -1743,6 +1756,73 @@ def sandbox(block_network=_UNSET, target: str | None = None, output: str | None 
     (Complete member list, kept in sync with profiles.PROFILES — the
     operator-facing help in cli.py derives from the same table.)
     """
+    if not isinstance(no_degrade, bool):
+        raise TypeError("no_degrade must be a boolean")
+    if no_degrade:
+        require_proxy_netns = True
+        degraded_net_deny = True
+        if sys.platform != "linux":
+            from .errors import SandboxSetupError
+
+            raise SandboxSetupError(
+                "sandbox(no_degrade=True) requires the Linux "
+                "fork/mount/pid namespace backend."
+            )
+        if disabled or state._cli_sandbox_disabled:
+            from .errors import SandboxSetupError
+
+            raise SandboxSetupError(
+                "sandbox(no_degrade=True) cannot run with sandboxing disabled."
+            )
+        selected_profile = state._cli_sandbox_profile or profile
+        if selected_profile in ("none", "network-only"):
+            from .errors import SandboxSetupError
+
+            raise SandboxSetupError(
+                "sandbox(no_degrade=True) refuses a profile without the "
+                "mount/Landlock backend."
+            )
+        profile_config = PROFILES.get(
+            selected_profile or DEFAULT_PROFILE,
+            {},
+        )
+        netns_requested = (
+            bool(profile_config.get("block_network", True))
+            if block_network is _UNSET
+            else bool(block_network)
+        )
+        if not netns_requested and not use_egress_proxy:
+            from .errors import SandboxSetupError
+
+            raise SandboxSetupError(
+                "sandbox(no_degrade=True) requires a fresh network "
+                "namespace or the proxy-netns egress lane."
+            )
+        if (
+            profile_config.get("seccomp")
+            and not _seccomp.check_seccomp_available()
+        ):
+            from .errors import SandboxSetupError
+
+            raise SandboxSetupError(
+                "sandbox(no_degrade=True) requires the configured seccomp "
+                "filter, but libseccomp is unavailable."
+            )
+        if not (target or output or rootfs):
+            from .errors import SandboxSetupError
+
+            raise SandboxSetupError(
+                "sandbox(no_degrade=True) requires target=, output=, or "
+                "rootfs= so the mount namespace has an isolation anchor."
+            )
+        if not spawn_backend_available():
+            from .errors import SandboxSetupError
+
+            raise SandboxSetupError(
+                "sandbox(no_degrade=True) requires the Linux fork-based "
+                "user/mount/pid namespace backend, but it is unavailable."
+            )
+
     # Rootfs pre-flight: cheap shape errors raise here (caller bug,
     # ValueError); "the backend can't honour rootfs on this host/config"
     # raises SandboxSetupError at the use_mount decision below.
@@ -2213,7 +2293,9 @@ def sandbox(block_network=_UNSET, target: str | None = None, output: str | None 
         # One parse, owned by _degraded_untrusted_waiver — the AXIS
         # semantics (network waiver, not a tier floor) stay this
         # site's; only the value grammar is shared.
-        _degraded_ok = _degraded_untrusted_waiver()
+        _degraded_ok = _degraded_untrusted_allowed(
+            no_degrade=no_degrade,
+        )
         if (
             sys.platform != 'darwin'
             and use_egress_proxy
@@ -2725,7 +2807,9 @@ def sandbox(block_network=_UNSET, target: str | None = None, output: str | None 
                     "ABI v4+)." if allowed_tcp_ports else "")
             # Shared parse (see _degraded_untrusted_waiver); the
             # network-axis meaning stays this site's.
-            _degraded_ok = _degraded_untrusted_waiver()
+            _degraded_ok = _degraded_untrusted_allowed(
+                no_degrade=no_degrade,
+            )
             if _degraded_ok:
                 if state.warn_once("_degraded_net_open_override_warned"):
                     logger.warning(
@@ -3773,6 +3857,11 @@ def sandbox(block_network=_UNSET, target: str | None = None, output: str | None 
         env_caller_filtered = kwargs.pop("env_caller_filtered", False)
         _skip_pid_ns = kwargs.pop("skip_pid_ns", False)
         _skip_mount_ns = kwargs.pop("skip_mount_ns", False)
+        _cancel_fd = kwargs.pop("cancel_fd", None)
+        _bind_source_identities = kwargs.pop(
+            "bind_source_identities",
+            None,
+        )
         # Kept separate from require_fresh_procfs: the operator's degraded
         # untrusted opt-in relaxes the fresh-procfs requirement, but it must
         # not erase the fact that the workload is untrusted. The waived
@@ -3809,6 +3898,9 @@ def sandbox(block_network=_UNSET, target: str | None = None, output: str | None 
             # {None, True, False} — a literal 0 must resolve like
             # False (present-but-zeroed), not like an absent kwarg.
             _rfp_kwarg = bool(_rfp_kwarg)
+        if no_degrade:
+            _rfp_kwarg = True
+            _untrusted_workload = True
         _require_fresh_procfs = bool(_rfp_kwarg)
 
         # ---- containment-floor contract, side 1: entry-time check ----
@@ -3874,6 +3966,10 @@ def sandbox(block_network=_UNSET, target: str | None = None, output: str | None 
             # record it into the run-dir evidence stream like every
             # other floor refusal, then let it propagate.
             raise _note_floor_refusal(_resolve_exc)
+
+        if no_degrade:
+            _floor = _tiers.ContainmentTier.MOUNT_NS
+            _floor_source = _tiers.FLOOR_SOURCE_DEFAULT
 
         if (_floor_source == _tiers.FLOOR_SOURCE_ENV
                 and sys.platform == "linux"
@@ -4013,7 +4109,10 @@ def sandbox(block_network=_UNSET, target: str | None = None, output: str | None 
                 # per degraded call, not twice; the refusal branches
                 # below are unreachable for them (the entry gate
                 # raised first), so only the warning needs the dedup.
-                "sandbox run()", warn=not _untrusted_workload)
+                "sandbox run()",
+                warn=not _untrusted_workload,
+                no_degrade=no_degrade,
+            )
             if _seccomp_refusal is not None:
                 raise _note_floor_refusal(_errors.SandboxFloorError(
                     *_seccomp_refusal,
@@ -4157,6 +4256,7 @@ def sandbox(block_network=_UNSET, target: str | None = None, output: str | None 
                     environmental=not use_sandbox,
                     skip_mount_ns=_skip_mount_ns,
                     literal_contract=(_rfp_kwarg is True),
+                    no_degrade=no_degrade,
                 ))
 
         def _floor_remedy(extra: str = "") -> str:
@@ -4168,7 +4268,8 @@ def sandbox(block_network=_UNSET, target: str | None = None, output: str | None 
             will NOT relax it when the caller passed a literal
             require_fresh_procfs=True (see _fresh_procfs_override_hint)."""
             hint = _fresh_procfs_override_hint(
-                literal_contract=(_rfp_kwarg is True))
+                literal_contract=(_rfp_kwarg is True),
+                no_degrade=no_degrade)
             return f"{extra} {hint}".strip() if extra else hint
 
         def _dispatch_floor_check(
@@ -5311,6 +5412,7 @@ def sandbox(block_network=_UNSET, target: str | None = None, output: str | None 
         _grant_ids_before: "dict[str, tuple] | None" = None
         _grant_pin_fds: list[int] = []
         _audit_landlock_engaged = False
+        _stdin_spool_ro = None
         # Why audit could not engage for this call, for the degrade
         # marker / audit_required raise at the no-audit bottleneck
         # below. Set by the pre-flight ineligibility block and by the
@@ -5563,6 +5665,50 @@ def sandbox(block_network=_UNSET, target: str | None = None, output: str | None 
                     "and write policy. Later cache hits log at debug level.",
                     cmd[0],
                 )
+        if no_degrade and (
+            use_seatbelt
+            or not use_mount
+            or not spawn_eligible
+            or _skip_mount_ns
+            or _skip_pid_ns
+            or _inherit_netns
+            or _prefer_mountless_spawn
+            or not _mount_ns_avail()
+        ):
+            reason = (
+                _b_fallback_reason
+                or (
+                    "the macOS seatbelt backend was selected"
+                    if use_seatbelt
+                    else "the Linux fork/mount/pid/netns backend is "
+                         "not eligible"
+                )
+            )
+            raise _errors.SandboxSetupError(
+                "sandbox(no_degrade=True) refused before target spawn: "
+                f"{reason}."
+            )
+        if _cancel_fd is not None and (
+            use_seatbelt
+            or not use_mount
+            or not spawn_eligible
+            or not _mount_ns_avail()
+        ):
+            raise _errors.SandboxSetupError(
+                "cancel_fd requires the Linux fork-based sandbox backend; "
+                "refusing before target spawn."
+            )
+        if _bind_source_identities is not None and (
+            use_seatbelt
+            or not spawn_eligible
+            or _skip_mount_ns
+            or _prefer_mountless_spawn
+            or not _mount_ns_avail()
+        ):
+            raise _errors.SandboxSetupError(
+                "bind_source_identities requires the Linux mount-tree "
+                "sandbox backend; refusing before target spawn."
+            )
         # Persona fail-closed gate (pre-spawn arm): every route that
         # abandons the mount-ns spawn path — pass_fds/input= kwarg
         # compat, the B fallback (cmd[0] outside the bind tree), a
@@ -6118,6 +6264,10 @@ def sandbox(block_network=_UNSET, target: str | None = None, output: str | None 
                                 ),
                                 exec_pid_callback=_exec_pid_callback,
                                 child_pid_callback=_register_lane_peer,
+                                cancel_fd=_cancel_fd,
+                                bind_source_identities=(
+                                    _bind_source_identities
+                                ),
                             )
 
                         def _capture_grant_identities() -> dict[str, tuple]:
@@ -6461,7 +6611,8 @@ def sandbox(block_network=_UNSET, target: str | None = None, output: str | None 
                                 "persistent failure as an environment bug "
                                 "worth reporting. "
                                 + _fresh_procfs_override_hint(
-                                    literal_contract=(_rfp_kwarg is True)),
+                                    literal_contract=(_rfp_kwarg is True),
+                                    no_degrade=no_degrade),
                                 setup_category=_setup_status[0],
                             )
                             if _floor > _tiers.ContainmentTier.BARE:
@@ -6661,6 +6812,21 @@ def sandbox(block_network=_UNSET, target: str | None = None, output: str | None 
                         # no longer defeat OR forge this via stderr; the old
                         # rc==126/127 + empty-stderr heuristic could be both).
                         if _setup_status is not None and _setup_status[0] in ("M", "X"):
+                            if no_degrade:
+                                raise _errors.SandboxSetupError(
+                                    "sandbox(no_degrade=True) mount-tree "
+                                    "setup or exec failed; refusing the "
+                                    "mountless fallback.",
+                                    setup_category=_setup_status[0],
+                                )
+                            if _bind_source_identities is not None:
+                                raise _errors.SandboxSetupError(
+                                    "the Linux mount-tree sandbox failed "
+                                    "after selection; refusing a mountless "
+                                    "fallback that cannot honor bind-source "
+                                    "identity contracts.",
+                                    setup_category=_setup_status[0],
+                                )
                             # Rootfs fail-closed gate #4: an M/X status
                             # for a rootfs run means the image pivot or
                             # the exec inside the image failed. The
@@ -7002,6 +7168,36 @@ def sandbox(block_network=_UNSET, target: str | None = None, output: str | None 
                                 "vocabulary.",
                                 setup_category=_setup_status[0],
                             )
+                except (
+                    subprocess.TimeoutExpired,
+                    _errors.SandboxCancelled,
+                ) as _runtime_error:
+                    _info = dict(
+                        getattr(_runtime_error, "sandbox_info", {}) or {}
+                    )
+                    _runtime_backend = _info.get(
+                        "backend",
+                        "linux-fork",
+                    )
+                    _info.update({
+                        "backend": _runtime_backend,
+                        "mount_ns_active": (
+                            "mount" in _runtime_backend.split("-")
+                        ),
+                        "restrict_reads": bool(restrict_reads),
+                        "proxy_enforcement": (
+                            "netns" if _use_proxy_netns else None
+                        ),
+                        "degrade_waiver_honored": bool(
+                            _degraded_untrusted_allowed(
+                                no_degrade=no_degrade,
+                            )
+                            and not _use_proxy_netns
+                        ),
+                        "no_degrade": bool(no_degrade),
+                    })
+                    setattr(_runtime_error, "sandbox_info", _info)
+                    raise
                 except (FileNotFoundError, RuntimeError, OSError,
                         _errors.SandboxSetupError) as _spawn_err:
                     # _spawn raised mid-setup (uidmap uninstalled,
@@ -7046,6 +7242,30 @@ def sandbox(block_network=_UNSET, target: str | None = None, output: str | None 
                     if (isinstance(_spawn_err, _errors.SandboxSetupError)
                             and _spawn_err.setup_category != "U"):
                         raise
+                    if no_degrade:
+                        if isinstance(
+                            _spawn_err,
+                            _errors.SandboxSetupError,
+                        ):
+                            raise
+                        raise _errors.SandboxSetupError(
+                            "sandbox(no_degrade=True) mount-ns spawn "
+                            f"failed before target execution: {_spawn_err}"
+                        ) from _spawn_err
+                    if (
+                        _cancel_fd is not None
+                        or _bind_source_identities is not None
+                    ):
+                        if isinstance(
+                            _spawn_err,
+                            _errors.SandboxSetupError,
+                        ):
+                            raise
+                        raise _errors.SandboxSetupError(
+                            "the Linux fork sandbox failed before it could "
+                            "honor cancel_fd/bind identity contracts; "
+                            "refusing the unsupported fallback."
+                        ) from _spawn_err
                     #
                     # This except is for ENVIRONMENTAL failures only.
                     # A caller-input error — the audit target dir
@@ -7119,6 +7339,26 @@ def sandbox(block_network=_UNSET, target: str | None = None, output: str | None 
                          if (map_root or target) else ""),
                     )
             if not used_spawn:
+                if _cancel_fd is not None:
+                    raise _errors.SandboxSetupError(
+                        "cancel_fd cannot be honored on a subprocess "
+                        "fallback; refusing before target exec."
+                    )
+                if _bind_source_identities is not None:
+                    raise _errors.SandboxSetupError(
+                        "bind_source_identities cannot be honored on a "
+                        "non-mount fallback; refusing before target exec."
+                    )
+                if no_degrade:
+                    _demote_why = (
+                        _mount_ns_degraded or _b_fallback_reason
+                        or "the Linux fork/mount/pid/netns backend did "
+                           "not complete the call"
+                    )
+                    raise _errors.SandboxSetupError(
+                        "sandbox(no_degrade=True) refused a subprocess "
+                        f"fallback before target exec ({_demote_why})."
+                    )
                 # Grant-identity re-check for the demotion ladder: the
                 # fallback lanes below re-consume the caller's grants
                 # on the HOST filesystem (no bind tree), so a grant
@@ -7996,6 +8236,8 @@ def sandbox(block_network=_UNSET, target: str | None = None, output: str | None 
                 proxy_instance.unregister_sandbox(proxy_token)  # type: ignore[union-attr]
                 if proxy_token is not None else []
             )
+            if _stdin_spool_ro is not None:
+                _stdin_spool_ro.close()
         # Accumulate into the sandbox()-scoped cumulative view so callers
         # can inspect `run.events` for a unified stream across multiple
         # run() calls within one `with sandbox()` block.
@@ -8025,8 +8267,77 @@ def sandbox(block_network=_UNSET, target: str | None = None, output: str | None 
                 achievable=_tiers.ContainmentTier.BARE,
                 floor=_floor,
             )
+        # Preserve backend-owned metadata (capture loss and backend id)
+        # across _interpret_result(), whose legacy contract replaces
+        # sandbox_info with its termination analysis.
+        _backend_info = dict(getattr(result, "sandbox_info", {}) or {})
         # Interpret process termination for observability
         _interpret_result(result, cmd_display)
+        result.sandbox_info.update(_backend_info)
+
+        _capture_attrs = (
+            "stdout_truncated",
+            "stderr_truncated",
+            "stdout_bytes_kept",
+            "stderr_bytes_kept",
+        )
+        _capture_metadata_present = all(
+            hasattr(result, name) for name in _capture_attrs
+        )
+        result.sandbox_info["capture"] = {
+            "enabled": bool(kwargs.get("capture_output", False)),
+            "stdout_truncated": (
+                bool(result.stdout_truncated)
+                if _capture_metadata_present else None
+            ),
+            "stderr_truncated": (
+                bool(result.stderr_truncated)
+                if _capture_metadata_present else None
+            ),
+            "stdout_bytes_kept": (
+                int(result.stdout_bytes_kept)
+                if _capture_metadata_present else None
+            ),
+            "stderr_bytes_kept": (
+                int(result.stderr_bytes_kept)
+                if _capture_metadata_present else None
+            ),
+        }
+        if used_spawn:
+            _backend = getattr(
+                result,
+                "_sandbox_backend",
+                None,
+            )
+        elif use_seatbelt:
+            _backend = "macos-seatbelt"
+        elif _audit_landlock_engaged:
+            _backend = "linux-landlock-audit"
+        elif effectively_disabled:
+            _backend = "subprocess-unconfined"
+        else:
+            _backend = "linux-landlock-subprocess"
+        if _backend is not None:
+            result.sandbox_info["backend"] = _backend
+        if (
+            no_degrade
+            and _backend != "linux-fork-mount-pid-netns"
+        ):
+            from .errors import SandboxSetupError
+
+            raise SandboxSetupError(
+                "sandbox(no_degrade=True) completed on an unexpected "
+                f"backend {_backend!r}; refusing the result."
+            )
+        result.sandbox_info["degrade_waiver_honored"] = bool(
+            _degraded_untrusted_allowed(no_degrade=no_degrade)
+            and (
+                not used_spawn
+                or (use_egress_proxy and not _use_proxy_netns)
+                or _mount_ns_degraded is not None
+            )
+        )
+        result.sandbox_info["no_degrade"] = bool(no_degrade)
 
         # Synthetic-result stamp transfer (EBADF teardown race): the
         # handler minted a CompletedProcess whose rc=-9 reflects no
@@ -8789,6 +9100,7 @@ def run(cmd: list[str], block_network: bool = True, target: str | None = None,
         omit_etc_reads: bool = False,
         rootfs: str | None = None,
         output_run_root_ok: bool = False,
+        no_degrade: bool = False,
         **kwargs) -> subprocess.CompletedProcess:
     """Run a single command in a sandbox. Convenience wrapper.
 
@@ -8843,7 +9155,8 @@ def run(cmd: list[str], block_network: bool = True, target: str | None = None,
                 omit_proc_reads=omit_proc_reads,
                 omit_etc_reads=omit_etc_reads,
                 rootfs=rootfs,
-                output_run_root_ok=output_run_root_ok))
+                output_run_root_ok=output_run_root_ok,
+                no_degrade=no_degrade))
         except SandboxSetupError as _construction_refusal:
             # Refusal PRIORITY at the one-shot boundary. Context
             # construction refuses on capability grounds (e.g.
@@ -8995,20 +9308,29 @@ def _record_floor_refusal(
     return exc
 
 
-def _untrusted_refusal_floor() -> "_tiers.ContainmentTier":
+def _untrusted_refusal_floor(
+    *,
+    no_degrade: bool = False,
+) -> "_tiers.ContainmentTier":
     """Floor field for an untrusted entry-gate refusal: the consent
     chain's resolved floor, with a pinned ``none`` (BARE) mapped back
     to the class default — never-BARE-by-consent keeps the default
     contract in force for the refusal, and a record claiming floor
     ``none`` would read as no violation at all."""
+    if no_degrade:
+        return _tiers.untrusted_default_floor()
     floor, _src = resolve_untrusted_floor()
     if floor is _tiers.ContainmentTier.BARE:
         return _tiers.untrusted_default_floor()
     return floor
 
 
-def _seccomp_axis_arm(entry: str, *,
-                      warn: bool = True) -> "tuple[str, str] | None":
+def _seccomp_axis_arm(
+    entry: str,
+    *,
+    warn: bool = True,
+    no_degrade: bool = False,
+) -> "tuple[str, str] | None":
     """Refuse-or-waive decision for the seccomp capability axis of the
     untrusted-execution contract — ONE text, shared by the
     run_untrusted entry gate (:func:`_require_userns_or_optin`) and
@@ -9079,7 +9401,7 @@ def _seccomp_axis_arm(entry: str, *,
             "--sandbox-floor tier waives seccomp absence (every "
             "tier includes the filter).",
         )
-    if _degraded_untrusted_waiver():
+    if _degraded_untrusted_allowed(no_degrade=no_degrade):
         if warn:
             logger.warning(
                 "%s: libseccomp unavailable — running UNTRUSTED code "
@@ -9103,8 +9425,13 @@ def _seccomp_axis_arm(entry: str, *,
     )
 
 
-def _require_userns_or_optin(entry: str, restrict_reads: bool = True,
-                             *, record_dir: "str | None" = None) -> bool:
+def _require_userns_or_optin(
+    entry: str,
+    restrict_reads: bool = True,
+    *,
+    record_dir: "str | None" = None,
+    no_degrade: bool = False,
+) -> bool:
     """Fail closed when the untrusted-execution contract cannot hold.
 
     ``record_dir`` — the caller's evidence-attribution dir
@@ -9162,7 +9489,7 @@ def _require_userns_or_optin(entry: str, restrict_reads: bool = True,
     if sys.platform == "darwin":
         if check_seatbelt_available():
             return False
-        if _degraded_untrusted_waiver():
+        if _degraded_untrusted_allowed(no_degrade=no_degrade):
             logger.warning(
                 "%s: sandbox-exec unavailable or failed its smoke "
                 "test — running UNTRUSTED code with rlimits-only "
@@ -9179,7 +9506,7 @@ def _require_userns_or_optin(entry: str, restrict_reads: bool = True,
             "minimal profile, or set RAPTOR_ALLOW_DEGRADED_UNTRUSTED=1 "
             "to explicitly accept rlimits-only containment.",
             achievable=_tiers.ContainmentTier.BARE,
-            floor=_untrusted_refusal_floor(),
+            floor=_untrusted_refusal_floor(no_degrade=no_degrade),
         ))
     # libseccomp is part of the untrusted-execution contract on
     # Linux, not an optional layer — see _seccomp_axis_arm (shared
@@ -9190,14 +9517,17 @@ def _require_userns_or_optin(entry: str, restrict_reads: bool = True,
     # only a warning — the exact silent-downgrade shape the userns
     # gate below exists to refuse. Same explicit operator override
     # governs it.
-    _seccomp_refusal = _seccomp_axis_arm(entry)
+    _seccomp_refusal = _seccomp_axis_arm(
+        entry,
+        no_degrade=no_degrade,
+    )
     if _seccomp_refusal is not None:
         raise _record_floor_refusal(record_dir, _errors.SandboxFloorError(
             *_seccomp_refusal,
             # Same mapping as run()'s seccomp axis arm: no tier's
             # contract is deliverable without the filter.
             achievable=_tiers.ContainmentTier.BARE,
-            floor=_untrusted_refusal_floor(),
+            floor=_untrusted_refusal_floor(no_degrade=no_degrade),
         ))
     if check_net_available():
         return False
@@ -9210,6 +9540,9 @@ def _require_userns_or_optin(entry: str, restrict_reads: bool = True,
     # nothing and refuses too — untrusted work never runs bare by
     # consent.
     _floor, _floor_src = resolve_untrusted_floor()
+    if no_degrade:
+        _floor = _tiers.untrusted_default_floor()
+        _floor_src = _tiers.FLOOR_SOURCE_DEFAULT
     if (_floor is _tiers.ContainmentTier.LANDLOCK_ONLY
             and _floor_src in _tiers.CONSENT_FLOOR_SOURCES):
         if _floor_src == _tiers.FLOOR_SOURCE_FLAG:
@@ -9242,18 +9575,26 @@ def _require_userns_or_optin(entry: str, restrict_reads: bool = True,
             "host's userns restriction.", entry, _consent_name,
         )
         return True
-    msg = (
-        f"{entry}: this host cannot create unprivileged user "
-        f"namespaces, so the untrusted-execution contract (PID-ns "
-        f"hides host /proc; credential exfil blocked) cannot be met. "
-        f"Refusing to run untrusted code with degraded containment. "
-        f"Fix the host (e.g. the kernel/LSM userns restriction — see "
-        f"core/sandbox/helpers/) or explicitly accept "
-        f"Landlock/seccomp-only containment: --sandbox-floor landlock "
-        f"(this run), /project set sandbox-floor landlock (standing "
-        f"for the project), or RAPTOR_ALLOW_DEGRADED_UNTRUSTED=1 "
-        f"(host-wide)."
-    )
+    if no_degrade:
+        msg = (
+            f"{entry}: no_degrade=True requires unprivileged user "
+            f"namespaces and the Linux fork/mount/pid backend, but "
+            f"this host cannot create them. Refusing every degraded "
+            f"containment lane."
+        )
+    else:
+        msg = (
+            f"{entry}: this host cannot create unprivileged user "
+            f"namespaces, so the untrusted-execution contract (PID-ns "
+            f"hides host /proc; credential exfil blocked) cannot be met. "
+            f"Refusing to run untrusted code with degraded containment. "
+            f"Fix the host (e.g. the kernel/LSM userns restriction — see "
+            f"core/sandbox/helpers/) or explicitly accept "
+            f"Landlock/seccomp-only containment: --sandbox-floor landlock "
+            f"(this run), /project set sandbox-floor landlock (standing "
+            f"for the project), or RAPTOR_ALLOW_DEGRADED_UNTRUSTED=1 "
+            f"(host-wide)."
+        )
     if _floor_src in (_tiers.FLOOR_SOURCE_FLAG,
                       _tiers.FLOOR_SOURCE_PROJECT):
         _surface = ("--sandbox-floor" if _floor_src
@@ -9279,7 +9620,7 @@ def _require_userns_or_optin(entry: str, restrict_reads: bool = True,
         achievable=(_tiers.ContainmentTier.LANDLOCK_ONLY
                     if check_landlock_available()
                     else _tiers.ContainmentTier.BARE),
-        floor=_untrusted_refusal_floor(),
+        floor=_untrusted_refusal_floor(no_degrade=no_degrade),
     ))
 
 
@@ -9455,7 +9796,9 @@ def _untrusted_stdio_write_only(kwargs: dict, caller: str) -> "list[int]":
 
 
 def _fresh_procfs_override_hint(
-        literal_contract: "bool | None" = None) -> str:
+        literal_contract: "bool | None" = None,
+        *,
+        no_degrade: bool = False) -> str:
     """The override sentence for a fresh-procfs refusal, told honestly.
 
     Every in-tree untrusted caller derives require_fresh_procfs from
@@ -9481,6 +9824,11 @@ def _fresh_procfs_override_hint(
       unknown (out-of-run callers), told as the literal-ask case
       (the only reachable shape for derived callers).
     """
+    if no_degrade:
+        return (
+            "no_degrade=True is an in-path ratchet and cannot be relaxed "
+            "by any lowered containment-floor consent surface."
+        )
     _floor, _source = resolve_untrusted_floor()
     if _source == _tiers.FLOOR_SOURCE_FLAG:
         if untrusted_fresh_procfs_required():
@@ -9570,6 +9918,7 @@ def _fresh_procfs_env_refusal(
     achievable: "_tiers.ContainmentTier | None" = None,
     floor: "_tiers.ContainmentTier | None" = None,
     literal_contract: "bool | None" = None,
+    no_degrade: bool = False,
 ) -> "_errors.SandboxFloorError":
     """Build the refusal for a fresh-procfs contract call on a host
     where no isolation backend engaged for ENVIRONMENTAL reasons
@@ -9607,7 +9956,8 @@ def _fresh_procfs_env_refusal(
     )
     return _errors.SandboxFloorError(
         msg, fix + " " + _fresh_procfs_override_hint(
-            literal_contract=literal_contract),
+            literal_contract=literal_contract,
+            no_degrade=no_degrade),
         achievable=achievable,
         floor=(floor if floor is not None
                else _tiers.untrusted_default_floor()))
@@ -9620,6 +9970,7 @@ def _entry_floor_refusal(
     environmental: bool,
     skip_mount_ns: bool,
     literal_contract: "bool | None" = None,
+    no_degrade: bool = False,
 ) -> "_errors.SandboxFloorError":
     """Build the entry-time containment-floor refusal for the shape
     at hand, preserving the message texts operators (and tests) know
@@ -9633,7 +9984,8 @@ def _entry_floor_refusal(
     """
     if environmental:
         return _fresh_procfs_env_refusal(achievable=intended, floor=floor,
-                                         literal_contract=literal_contract)
+                                         literal_contract=literal_contract,
+                                         no_degrade=no_degrade)
     if skip_mount_ns:
         msg = (
             "sandbox run(): the fresh-procfs contract cannot be met "
@@ -9643,7 +9995,8 @@ def _entry_floor_refusal(
         )
         return _errors.SandboxFloorError(
             msg, _fresh_procfs_override_hint(
-                literal_contract=literal_contract),
+                literal_contract=literal_contract,
+                no_degrade=no_degrade),
             achievable=intended, floor=floor)
     msg = (
         "sandbox run(): the fresh-procfs contract cannot be "
@@ -9655,7 +10008,9 @@ def _entry_floor_refusal(
         msg,
         "install newuidmap/newgidmap (uidmap package) so the "
         "mount-ns backend can engage. "
-        + _fresh_procfs_override_hint(literal_contract=literal_contract),
+        + _fresh_procfs_override_hint(
+            literal_contract=literal_contract,
+            no_degrade=no_degrade),
         achievable=intended, floor=floor)
 
 
@@ -9757,7 +10112,7 @@ def resolve_untrusted_floor() -> "tuple[_tiers.ContainmentTier, str]":
     return _tiers.untrusted_default_floor(), _tiers.FLOOR_SOURCE_DEFAULT
 
 
-def untrusted_fresh_procfs_required() -> bool:
+def untrusted_fresh_procfs_required(*, no_degrade: bool = False) -> bool:
     """True while the resolved untrusted floor demands a fresh pid-ns
     procfs — i.e. every tier the consent chain admits delivers one
     (Linux: floor above the landlock tier; macOS: the unwaived
@@ -9777,6 +10132,8 @@ def untrusted_fresh_procfs_required() -> bool:
     fresh-procfs contract instead of silently accepting host-procfs
     visibility.
     """
+    if no_degrade:
+        return True
     floor, _source = resolve_untrusted_floor()
     if sys.platform == "darwin":
         return floor >= _tiers.ContainmentTier.SEATBELT
@@ -10020,6 +10377,7 @@ def run_untrusted_networked(
     fake_home: bool = False,
     keep_trust_markers: bool = False,
     loopback_unix_bridges: dict | None = None,
+    no_degrade: bool = False,
     **kwargs,
 ) -> subprocess.CompletedProcess:
     """Variant of :func:`run_untrusted` that allows hostname-allowlisted
@@ -10082,6 +10440,11 @@ def run_untrusted_networked(
     loopback traffic goes direct instead of dying at the CONNECT
     proxy's loopback rejection.
 
+    ``no_degrade=True`` is the per-call ratchet for consumers that require
+    the Linux fork/mount/PID/netns backend. It ignores the host-wide degraded
+    waiver, forces the fresh-procfs and proxy-netns contracts, and refuses
+    every fallback before executing the target.
+
     Callers: Claude Code sub-agent dispatch (packages/llm_analysis/
     cc_dispatch.py, core/orchestration/agentic_passes.py,
     core/audit/validate.py), git network operations
@@ -10110,6 +10473,7 @@ def run_untrusted_networked(
         # Evidence attribution for the gate's floor-class refusals:
         # same precedence as run()'s own refusal chokepoint.
         record_dir=kwargs.get("audit_run_dir") or output,
+        no_degrade=no_degrade,
     )
     # start_new_session refused for the same reason as run_untrusted:
     # setsid detachment is contract, not preference (see the rationale
@@ -10118,6 +10482,7 @@ def run_untrusted_networked(
         "env", "cwd", "timeout", "capture_output", "text",
         "encoding", "errors",
         "stdin", "input", "pass_fds",
+        "cancel_fd", "bind_source_identities",
         "caller_label",
         "audit", "audit_verbose", "audit_run_dir", "audit_required",
         "observe", "exclude_tmp_baseline",
@@ -10191,8 +10556,11 @@ def run_untrusted_networked(
             # too — dispatch children are trusted, but the pid-ns/procfs
             # posture is about what the SANDBOXED TREE can read, and the
             # dispatch tree runs target-influenced tools.
-            require_fresh_procfs=untrusted_fresh_procfs_required(),
+            require_fresh_procfs=untrusted_fresh_procfs_required(
+                no_degrade=no_degrade,
+            ),
             loopback_unix_bridges=loopback_unix_bridges,
+            no_degrade=no_degrade,
             **kwargs,
         )
     finally:

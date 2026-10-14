@@ -7,6 +7,7 @@ without pulling in the sandbox machinery or risking a circular import.
 
 from __future__ import annotations
 
+import subprocess
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # annotation-only; no runtime import (tiers imports us)
@@ -152,3 +153,25 @@ class SandboxFloorError(SandboxSetupError):
                          setup_category=setup_category)
         self.achievable = achievable
         self.floor = floor
+
+
+class SandboxCancelled(subprocess.SubprocessError):
+    """Raised when a caller-owned cancellation fd becomes readable.
+
+    Mirrors ``subprocess.TimeoutExpired``'s partial-output attributes while
+    keeping cancellation semantically distinct from a deadline.
+    """
+
+    def __init__(
+        self,
+        cmd,
+        *,
+        output=None,
+        stderr=None,
+    ) -> None:
+        self.cmd = cmd
+        self.output = output
+        self.stdout = output
+        self.stderr = stderr
+        self.cancelled = True
+        super().__init__(f"Command {cmd!r} cancelled")

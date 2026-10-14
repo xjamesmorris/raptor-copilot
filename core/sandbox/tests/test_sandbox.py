@@ -2586,6 +2586,13 @@ class TestSandboxKwargsGuard(unittest.TestCase):
                 run(["true"], writable_paths=["/tmp/x"])
             self.assertIn("sandbox kwargs", str(ctx.exception))
 
+    def test_no_degrade_is_rejected_on_inner_run(self):
+        from core.sandbox import sandbox
+
+        with sandbox(disabled=True) as run:
+            with self.assertRaisesRegex(TypeError, "sandbox kwargs"):
+                run(["true"], no_degrade=True)
+
     @requires_network_block_backend
     def test_non_sandbox_kwargs_still_pass_the_guard(self):
         """Opposite direction: ordinary subprocess kwargs must not be

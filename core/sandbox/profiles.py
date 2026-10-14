@@ -127,7 +127,7 @@ _SANDBOX_KWARGS = frozenset({
     "block_network", "target", "output", "allowed_tcp_ports",
     "profile", "disabled", "limits", "map_root",
     "use_egress_proxy", "proxy_hosts", "proxy_allowed_ports",
-    "require_proxy_netns",
+    "require_proxy_netns", "no_degrade",
     "restrict_reads", "readable_paths",
     # writable_paths / exclude_tmp_baseline are sandbox()-level (the
     # Landlock rule set and the tmp-baseline exception list are

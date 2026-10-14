@@ -114,7 +114,7 @@ import signal
 import stat
 import subprocess
 import sys
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 
 from . import seatbelt
@@ -704,6 +704,8 @@ def run_sandboxed(cmd: list[str], *,
                   # has no unix lanes (netns tier never engages on
                   # darwin); accepted + ignored for signature parity.
                   child_pid_callback=None,
+                  cancel_fd: int | None = None,
+                  bind_source_identities: Mapping[str, tuple[int, int]] | None = None,
                   ) -> subprocess.CompletedProcess:
     """Run ``cmd`` under macOS sandbox-exec with an SBPL profile
     derived from the logical sandbox kwargs.
@@ -745,6 +747,13 @@ def run_sandboxed(cmd: list[str], *,
     are bounded by core.sandbox.audit_budget.AuditBudget's per-
     category caps + 1-in-N sampling so the JSONL doesn't bloat.
     """
+    if cancel_fd is not None or bind_source_identities is not None:
+        from .errors import SandboxSetupError
+        raise SandboxSetupError(
+            "cancel_fd and bind_source_identities require the Linux "
+            "fork-based sandbox backend; macOS cannot honor these contracts.",
+            "omit these capabilities or use a supported Linux backend.",
+        )
     if rootfs is not None:
         from .errors import SandboxSetupError
         msg = (

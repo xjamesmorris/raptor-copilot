@@ -702,6 +702,7 @@ from .context import (
 )
 from .errors import (
     SANDBOX_ENGAGE_EXIT_CODE,
+    SandboxCancelled,
     SandboxDisableRefusedError,
     SandboxFloorError,
     SandboxSetupError,
@@ -779,6 +780,7 @@ __all__ = [
     # Containment-floor refusal (typed subtype with achievable/floor)
     "SandboxFloorError",
     # Engagement-failure signal (fail-loud, never silently degrade)
+    "SandboxCancelled",
     "SandboxSetupError",
     # Containment-tier lattice (the floor contract's vocabulary)
     "ContainmentTier",
