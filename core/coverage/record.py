@@ -5,6 +5,7 @@ Built from the reads manifest (populated by the PostToolUse hook),
 Semgrep JSON output, CodeQL SARIF, and findings.json.
 """
 
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -141,55 +142,63 @@ def read_manifest_lines(manifest_path: Path) -> set[str]:
     the FIFO/symlink/unbounded-read attacks documented below.
 
     Line integrity against in-flight writers (the PostToolUse hook in
-    plugins/coverage/) comes from the writers themselves: both hook
-    writers (the bash ``raptor-hook-json _append`` helper and
-    track_read.py) emit each line as a single lock-free
-    ``O_APPEND`` write, which POSIX keeps un-interleaved. The LOCK_SH
-    taken here is belt-and-braces only — it no longer pairs with a
-    writer-side LOCK_EX (that serialisation was removed) and guards
-    solely against hypothetical non-append writers. fcntl.flock is
-    non-fatal: on platforms without flock (Windows; raptor doesn't
-    really support them but the import is best-effort) we fall back
-    to an unlocked read. On WSL drvfs/9p mounts the LOCK_SH here is
-    additionally client-local (serialises against same-distro writers
-    only) — inert for this reader, whose integrity already rests on
-    the writers' single-write ``O_APPEND`` discipline, not the lock;
-    see docs/wsl.md for the general caveat.
+    plugins/coverage/) comes from ``track_read.py`` emitting each line
+    as one lock-free ``O_APPEND`` write, which POSIX keeps
+    un-interleaved. The terminating-newline check below rejects a
+    partial tail if a short write or truncation is observed. The
+    ``LOCK_SH`` taken here is belt-and-braces only — it no longer
+    pairs with a writer-side ``LOCK_EX`` and guards solely against
+    hypothetical non-append writers. ``fcntl.flock`` is non-fatal:
+    on platforms without flock (Windows; raptor doesn't really
+    support them but the import is best-effort) we fall back to an
+    unlocked read. On WSL drvfs/9p mounts the lock is additionally
+    client-local; integrity still rests on the writer's single-write
+    ``O_APPEND`` discipline, not the lock.
 
     Use ``rstrip("\r\n")`` not ``strip()`` — the latter also trims
     leading/trailing spaces, but POSIX permits filenames that
     legitimately START or END with a space. ``track_read`` already
     rejects NUL/CR/LF in the path itself, so a manifest line carrying
     a filename with a trailing space made it in legitimately. Only
-    newline-style line terminators need removing.
+    newline-style line terminators need removing. A final line without
+    ``\n`` is discarded: the writer emits one complete line in one
+    write, so an unterminated tail is evidence of a short write or
+    truncation, not a valid observation.
 
     Best-effort: returns an empty set when the manifest is missing or
     unreadable.
     """
+    import logging
+    import stat as _stat_mod
+
     files: set[str] = set()
-    # fd-discipline open (core.source.open_regular): the manifest is
-    # inside the sandbox write grant, so any check-by-name probe
-    # races a swap — the pre-fix lstat→open window ingested a
-    # swapped-in symlink's FOREIGN file into the coverage record, and
-    # a planted FIFO blocked the open forever. O_NOFOLLOW +
-    # O_NONBLOCK + fstat(S_ISREG) on the OPENED fd close both.
-    from core.source import open_regular
-    f = open_regular(manifest_path, "rb")
-    if f is None:
-        if manifest_path.exists():
-            # Existed but refused: FIFO/device/symlink plant (or a
-            # vanish race). Loud — same message class as before.
-            import logging
-            logging.getLogger(__name__).warning(
-                "reads-manifest at %s is not a regular file — ignored",
-                manifest_path)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        return files
+    flags = (
+        os.O_RDONLY
+        | nofollow
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        fd = os.open(str(manifest_path), flags)
+    except OSError:
         return files
     try:
-        try:
-            import fcntl as _fcntl
-        except ImportError:
-            _fcntl = None  # type: ignore[assignment]
-        with f:
+        st = os.fstat(fd)
+        if not _stat_mod.S_ISREG(st.st_mode):
+            logging.getLogger(__name__).warning(
+                "reads-manifest at %s is not a regular file — ignored",
+                manifest_path,
+            )
+            return files
+        with os.fdopen(fd, "rb") as f:
+            fd = -1
+            try:
+                import fcntl as _fcntl
+            except ImportError:
+                _fcntl = None  # type: ignore[assignment]
             if _fcntl is not None:
                 try:
                     _fcntl.flock(f, _fcntl.LOCK_SH)
@@ -207,22 +216,38 @@ def read_manifest_lines(manifest_path: Path) -> set[str]:
                     break
                 budget -= len(line)
                 if budget < 0:
-                    # Cap hit — log and stop. The remaining entries
-                    # don't make it into the coverage record.
-                    import logging
                     logging.getLogger(__name__).warning(
                         "coverage manifest %s exceeded %d-byte cap; "
                         "truncating coverage record (read %d files)",
-                        manifest_path, _MANIFEST_CAP, len(files),
+                        manifest_path,
+                        _MANIFEST_CAP,
+                        len(files),
                     )
                     break
-                text = line.rstrip(b"\r\n").decode("utf-8", "replace")
-                if text:
-                    files.add(text)
+                if not line.endswith(b"\n"):
+                    logging.getLogger(__name__).debug(
+                        "coverage manifest %s has an unterminated tail; "
+                        "discarding it",
+                        manifest_path,
+                    )
+                    break
+                decoded = line.rstrip(b"\r\n").decode("utf-8", "replace")
+                if decoded:
+                    files.add(decoded)
             # The flock releases when the file is closed.
     except OSError:
         pass
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
     return files
+
+
+# Compatibility for callers from the pre-public-helper coverage path.
+_read_manifest_lines = read_manifest_lines
 
 
 def build_from_manifest(run_dir: Path, tool: str,
@@ -247,9 +272,9 @@ def build_from_manifest(run_dir: Path, tool: str,
     run_dir = Path(run_dir)
     manifest = run_dir / READS_MANIFEST
 
-    # Locked, capped, streaming read — the manifest is appended to by
-    # the PostToolUse hook (LOCK_EX side), so this reader needs the
-    # same LOCK_SH coordination as ``build_from_findings``.
+    # Locked, capped, streaming read — the PostToolUse hook appends
+    # each line with one O_APPEND write; this reader shares the same
+    # path and partial-tail discipline as ``build_from_findings``.
     files = read_manifest_lines(manifest)
 
     # Add extra files from tool-specific sources

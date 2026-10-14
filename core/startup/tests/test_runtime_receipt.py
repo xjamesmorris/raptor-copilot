@@ -2071,6 +2071,186 @@ _METADATA_TERMINAL_BRIDGE_IMPORT_ALLOWLIST = frozenset(
 )
 
 
+_FROZEN_LITERAL_GUARD_PATHS = (
+    "bin/raptor",
+    "core/startup/host.py",
+    "core/coverage/track_read.py",
+    "core/llm/providers.py",
+    "core/run/host_events.py",
+    "core/run/pin.py",
+    "libexec/raptor-lifecycle-hook",
+    "libexec/raptor-run-lifecycle",
+)
+_PIN_PATH = "core/run/pin.py"
+_TRACK_READ_PATH = "core/coverage/track_read.py"
+_BRIDGE_MODULE_ROOTS = (
+    "core.project.sessions",
+    "core.run.metadata",
+)
+_BRIDGE_IMPORT_ALLOWLIST = {
+    _PIN_PATH: frozenset(
+        {
+            (
+                "_validate_argv_project",
+                "core.project.sessions",
+                "_NAME_RE",
+                "",
+                False,
+                "from",
+            ),
+            (
+                "_matching_host_v2_credential",
+                "core.project.sessions",
+                "SessionHostV2CredentialState",
+                "",
+                False,
+                "from",
+            ),
+            (
+                "_matching_host_v2_credential",
+                "core.project.sessions",
+                "session_host_v2_credential_state",
+                "",
+                False,
+                "from",
+            ),
+            (
+                "resolve_pin_for_start",
+                "core.project.sessions",
+                "session_binding",
+                "",
+                False,
+                "from",
+            ),
+            (
+                "resolve_pin_for_start",
+                "core.project.sessions",
+                "bind_session",
+                "",
+                False,
+                "from",
+            ),
+            (
+                "resolve_witnessed_run_pin",
+                "core.project.sessions",
+                "ledger_pin_witness",
+                "",
+                False,
+                "from",
+            ),
+            (
+                "_negative_marker_pin",
+                "core.run.metadata",
+                "_metadata_allows_legacy_attribution",
+                "",
+                False,
+                "from",
+            ),
+        }
+    ),
+    _TRACK_READ_PATH: frozenset(
+        {
+            (
+                "_owner_target",
+                "core.project.sessions",
+                "<module>",
+                "",
+                False,
+                "from-module",
+            ),
+            (
+                "_owner_target",
+                "core.run.metadata",
+                "RUN_METADATA_FILE",
+                "",
+                False,
+                "from",
+            ),
+            (
+                "_owner_target",
+                "core.run.metadata",
+                "STATUS_RUNNING",
+                "",
+                False,
+                "from",
+            ),
+            (
+                "_owner_target",
+                "core.run.metadata",
+                "_metadata_owned_by_session",
+                "",
+                False,
+                "from",
+            ),
+            (
+                "_owner_target",
+                "core.run.metadata",
+                "_run_recently_active",
+                "",
+                False,
+                "from",
+            ),
+            (
+                "_owner_target",
+                "core.run.metadata",
+                "worker_liveness_for_meta",
+                "",
+                False,
+                "from",
+            ),
+            (
+                "_find_global_run",
+                "core.run.metadata",
+                "_metadata_allows_legacy_attribution",
+                "",
+                False,
+                "from",
+            ),
+            (
+                "_metadata_still_owned",
+                "core.run.metadata",
+                "RUN_METADATA_FILE",
+                "",
+                False,
+                "from",
+            ),
+            (
+                "_metadata_still_owned",
+                "core.run.metadata",
+                "STATUS_RUNNING",
+                "",
+                False,
+                "from",
+            ),
+            (
+                "_metadata_still_owned",
+                "core.run.metadata",
+                "_metadata_allows_legacy_attribution",
+                "",
+                False,
+                "from",
+            ),
+            (
+                "_metadata_still_owned",
+                "core.run.metadata",
+                "_metadata_owned_by_session",
+                "",
+                False,
+                "from",
+            ),
+        }
+    ),
+}
+_TRACK_READ_SESSION_ATTRIBUTES = frozenset(
+    {
+        ("_owner_target", "ENV_SESSION_PID"),
+        ("_owner_target", "ENV_SESSION_TOKEN"),
+        ("_owner_target", "ledger_runs"),
+        ("_owner_target", "resolve_session_owner"),
+    }
+)
+
+
 @dataclasses.dataclass(frozen=True)
 class _GuardString:
     parts: tuple[str | None, ...]
@@ -3051,6 +3231,157 @@ def _scoped_import_records(
     return frozenset(records)
 
 
+def _bridge_context(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> str:
+    current = node
+    while current in parents:
+        current = parents[current]
+        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return current.name
+    return "<module>"
+
+
+def _bridge_import_records(
+    source: str,
+    *,
+    filename: str,
+    module_roots: tuple[str, ...] = _BRIDGE_MODULE_ROOTS,
+) -> set[tuple[str, str, str, str, bool, str]]:
+    tree = ast.parse(source, filename=filename)
+    parents: dict[ast.AST, ast.AST] = {}
+    for parent in ast.walk(tree):
+        parents.update((child, parent) for child in ast.iter_child_nodes(parent))
+
+    records: set[tuple[str, str, str, str, bool, str]] = set()
+    for node in ast.walk(tree):
+        context = _bridge_context(node, parents)
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if _module_matches_roots(alias.name, module_roots):
+                    records.add(
+                        (
+                            context,
+                            alias.name,
+                            "<module>",
+                            alias.asname or "",
+                            False,
+                            "import",
+                        )
+                    )
+            continue
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        imported_from = _relative_import_module(node, filename=filename)
+        if imported_from is None:
+            continue
+        for alias in node.names:
+            if _module_matches_roots(imported_from, module_roots):
+                records.add(
+                    (
+                        context,
+                        imported_from,
+                        alias.name,
+                        alias.asname or "",
+                        bool(node.level),
+                        "from",
+                    )
+                )
+                continue
+            imported_module = f"{imported_from}.{alias.name}"
+            if _module_matches_roots(imported_module, module_roots):
+                records.add(
+                    (
+                        context,
+                        imported_module,
+                        "<module>",
+                        alias.asname or "",
+                        bool(node.level),
+                        "from-module",
+                    )
+                )
+
+    dynamic = _DynamicReceiptImportScanner(
+        module_roots=module_roots,
+        unresolved_module="<dynamic sensitive module>",
+    ).scan(tree)
+    records.update(
+        (
+            context,
+            module,
+            symbol,
+            "",
+            False,
+            "dynamic",
+        )
+        for context, module, symbol in dynamic
+    )
+    return records
+
+
+def _track_read_session_attribute_records(
+    source: str,
+) -> set[tuple[str, str]]:
+    tree = ast.parse(source, filename=_TRACK_READ_PATH)
+    parents: dict[ast.AST, ast.AST] = {}
+    for parent in ast.walk(tree):
+        parents.update((child, parent) for child in ast.iter_child_nodes(parent))
+
+    records: set[tuple[str, str]] = set()
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "sessions"
+        ):
+            records.add((_bridge_context(node, parents), node.attr))
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and node.args
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id == "sessions"
+        ):
+            records.add((_bridge_context(node, parents), "<reflective>"))
+        elif (
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and node.id == "sessions"
+            and not (
+                isinstance(parents.get(node), ast.Attribute)
+                and parents[node].value is node
+            )
+            and not (
+                isinstance(parents.get(node), ast.Call)
+                and isinstance(parents[node].func, ast.Name)
+                and parents[node].func.id == "getattr"
+            )
+        ):
+            records.add((_bridge_context(node, parents), "<bare-name>"))
+    return records
+
+
+def _bridge_policy_violations(
+    relative_path: str,
+    source: str,
+) -> tuple[str, ...]:
+    records = _bridge_import_records(source, filename=relative_path)
+    expected = _BRIDGE_IMPORT_ALLOWLIST.get(relative_path, frozenset())
+    violations: list[str] = []
+    if records != expected:
+        violations.append(
+            f"{relative_path}: reviewed bridge imports changed: "
+            f"{sorted(records, key=repr)!r}"
+        )
+    if relative_path == _TRACK_READ_PATH:
+        attributes = _track_read_session_attribute_records(source)
+        if attributes != _TRACK_READ_SESSION_ATTRIBUTES:
+            violations.append(
+                f"{relative_path}: sessions attribute uses changed: "
+                f"{sorted(attributes)!r}"
+            )
+    return tuple(violations)
+
+
 def _production_python_sources(repository_root: Path) -> dict[str, str]:
     paths = set(repository_root.glob("*.py"))
     for root_name in ("core", "packages", "plugins"):
@@ -3697,6 +4028,232 @@ def test_terminal_capability_has_exact_private_authority_surface() -> None:
     assert "runtime_receipt_terminal" not in (
         repository_root / "core/testing/__init__.py"
     ).read_text(encoding="utf-8")
+
+
+def test_stage3a2b_bridge_imports_and_session_attributes_are_exact() -> None:
+    repository_root = Path(__file__).parents[3]
+    for relative in (_PIN_PATH, _TRACK_READ_PATH):
+        source = (repository_root / relative).read_text(encoding="utf-8")
+        assert _bridge_policy_violations(relative, source) == ()
+
+
+@pytest.mark.parametrize(
+    ("relative", "extra"),
+    (
+        (
+            _PIN_PATH,
+            "\nfrom core.run.metadata import complete_run\n",
+        ),
+        (
+            _PIN_PATH,
+            (
+                "\ndef broadened():\n"
+                "    from core.project.sessions import "
+                "capture_current_session_runtime_receipt\n"
+            ),
+        ),
+        (
+            _PIN_PATH,
+            (
+                "\ndef aliased():\n"
+                "    from core.run.metadata import "
+                "_metadata_allows_legacy_attribution as hidden\n"
+            ),
+        ),
+        (
+            _PIN_PATH,
+            "\ndef wildcard():\n    from core.run.metadata import *\n",
+        ),
+        (
+            _PIN_PATH,
+            (
+                "\ndef relative_import():\n"
+                "    from ..project.sessions import session_binding\n"
+            ),
+        ),
+        (
+            _TRACK_READ_PATH,
+            (
+                "\ndef broadened_sessions_use():\n"
+                "    return sessions.capture_current_session_runtime_receipt\n"
+            ),
+        ),
+        (
+            _TRACK_READ_PATH,
+            "\ndef broadened_metadata():\n    from core.run.metadata import fail_run\n",
+        ),
+    ),
+)
+def test_stage3a2b_bridge_guard_rejects_broader_imports_and_uses(
+    relative: str,
+    extra: str,
+) -> None:
+    repository_root = Path(__file__).parents[3]
+    source = (repository_root / relative).read_text(encoding="utf-8") + extra
+
+    assert _bridge_policy_violations(relative, source)
+
+
+_DYNAMIC_BRIDGE_IMPORT_CASES = (
+    """
+import importlib
+def load():
+    return importlib.import_module("core.run.metadata")
+""",
+    """
+from importlib import import_module as load_module
+def load():
+    return load_module("core.project.sessions")
+""",
+    """
+def load():
+    return __import__("core.run.metadata")
+""",
+    """
+import builtins as builtin_api
+def load():
+    return builtin_api.__import__("core.project.sessions")
+""",
+    """
+from importlib import import_module
+BASE = "core." + "run."
+def load():
+    return import_module(BASE + "metadata")
+""",
+    """
+from importlib import import_module
+def load(value):
+    match value:
+        case 1:
+            return import_module("core.project.sessions")
+""",
+)
+
+
+@pytest.mark.parametrize("source", _DYNAMIC_BRIDGE_IMPORT_CASES)
+def test_stage3a2b_dynamic_bridge_imports_are_forbidden(source: str) -> None:
+    records = _bridge_import_records(source, filename=_PIN_PATH)
+
+    assert any(record[-1] == "dynamic" for record in records)
+    assert _bridge_policy_violations(_PIN_PATH, source)
+
+
+def test_stage3a2b_dynamic_bridge_guard_descends_into_except_star() -> None:
+    if getattr(ast, "TryStar", None) is None:
+        pytest.skip("except-star AST unavailable")
+    source = """
+from importlib import import_module
+def load():
+    try:
+        raise ExceptionGroup("x", [ValueError()])
+    except* ValueError:
+        return import_module("core.run.metadata")
+"""
+
+    records = _bridge_import_records(source, filename=_PIN_PATH)
+
+    assert any(record[-1] == "dynamic" for record in records)
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        """
+def import_module(name):
+    return name
+def load():
+    return import_module("core.run.metadata")
+""",
+        """
+import importlib
+class LocalLoader:
+    def import_module(self, name):
+        return name
+importlib = LocalLoader()
+def load():
+    return importlib.import_module("core.project.sessions")
+""",
+        """
+from importlib import import_module
+def load(name):
+    return import_module(name)
+""",
+        """
+from importlib import import_module
+def load():
+    return import_module("core.audit.context")
+""",
+    ),
+)
+def test_stage3a2b_dynamic_bridge_guard_ignores_unrelated_or_shadowed_calls(
+    source: str,
+) -> None:
+    scanner = _DynamicReceiptImportScanner(
+        module_roots=_BRIDGE_MODULE_ROOTS,
+        unresolved_module="<dynamic sensitive module>",
+    )
+
+    assert scanner.scan(ast.parse(source)) == set()
+
+
+def test_stage3a2b_coverage_predicate_has_exactly_two_calls() -> None:
+    repository_root = Path(__file__).parents[3]
+    source = (repository_root / _TRACK_READ_PATH).read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=_TRACK_READ_PATH)
+
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_metadata_allows_legacy_attribution"
+    ]
+    assert len(calls) == 2
+
+
+def test_stage3a2b_consumer_imports_keep_receipt_package_lazy() -> None:
+    repository_root = Path(__file__).parents[3]
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; "
+            "import core.run.pin; "
+            "import core.coverage.track_read; "
+            "print(','.join(sorted(name for name in sys.modules "
+            "if name.startswith('core.startup.runtime_receipt'))))",
+        ],
+        cwd=repository_root,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "\n"
+
+
+def test_t38_frozen_literal_guard_path_set_is_unchanged() -> None:
+    assert _FROZEN_LITERAL_GUARD_PATHS == (
+        "bin/raptor",
+        "core/startup/host.py",
+        "core/coverage/track_read.py",
+        "core/llm/providers.py",
+        "core/run/host_events.py",
+        "core/run/pin.py",
+        "libexec/raptor-lifecycle-hook",
+        "libexec/raptor-run-lifecycle",
+    )
+    repository_root = Path(__file__).parents[3]
+    for relative in _FROZEN_LITERAL_GUARD_PATHS:
+        assert "runtime_receipt" not in (repository_root / relative).read_text(
+            encoding="utf-8"
+        )
 
 
 def test_extra_production_receipt_importer_is_forbidden() -> None:

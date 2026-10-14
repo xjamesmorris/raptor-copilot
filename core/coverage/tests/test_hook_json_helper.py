@@ -1,314 +1,640 @@
-"""The coverage read hook's named python helper (plugins/coverage/
-libexec/raptor-hook-json) and the hook's no-jq fallback path.
-
-EDR-coexistence refactor: the hook used to spawn ``python3 -c`` with
-embedded source (three JSON extractors) plus a ``python3 -`` heredoc
-(manifest append) — on EVERY tracked file read. Those are now a named
-on-disk helper executed by path. These tests pin (a) the helper's
-behaviour, (b) the hook's end-to-end behaviour when jq is absent so
-every JSON parse goes through the helper, and (c) that the inline-code
-process shapes never regrow.
-"""
+"""Thin coverage shim and retired-helper regression contracts."""
 
 from __future__ import annotations
 
+import ast
+import contextlib
 import json
+import logging
 import os
-import shutil
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
+from core.coverage import track_read
+from core.coverage.tests.test_track_read_session import (
+    _owned_claude,
+    _owner_env,
+    _write_run,
+)
+from core.project import sessions
+from core.run.host_events import MAX_HOST_EVENT_BYTES
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
 HOOK = REPO_ROOT / "plugins" / "coverage" / "libexec" / "raptor-hook-read"
-HELPER = REPO_ROOT / "plugins" / "coverage" / "libexec" / "raptor-hook-json"
+RETIRED_HELPER = REPO_ROOT / "plugins" / "coverage" / "libexec" / "raptor-hook-json"
+BASELINE_HEAD = "7eb559ab941fa24a759bdf4c059c081153f0a41f"
+
+_TEMPLATE_LINE = re.compile(
+    rb"(?:"
+    rb"raptor-hook-read: "
+    rb"(?:trust marker absent|python3 unavailable|"
+    rb"repository root unavailable|coverage helper failed \(rc=\d+\)); "
+    rb"coverage read not recorded"
+    rb"|raptor-read-hook\[[a-z0-9_]+\]: [ -~]+"
+    rb")\n"
+)
 
 
-def _helper(*args: str, stdin: str = "") -> subprocess.CompletedProcess:
-    return subprocess.run(
-        [sys.executable, str(HELPER), *args],
-        input=stdin, capture_output=True, text=True,
-        timeout=30, check=False,
+@contextlib.contextmanager
+def _owned_hook_case(tmp_path: Path, monkeypatch, *, strong: bool = False):
+    home = tmp_path / "home"
+    home.mkdir()
+    sessions_dir = home / ".local" / "share" / "raptor" / "sessions.d"
+    monkeypatch.setattr(sessions, "SESSIONS_DIR", sessions_dir)
+    with _owned_claude(tmp_path, strong=strong) as (
+        process,
+        _executable,
+        token,
+        _claim,
+    ):
+        target = tmp_path / "target"
+        target.mkdir()
+        source = target / "a.py"
+        source.write_text("x = 1\n")
+        run_dir = _write_run(tmp_path, pid=process.pid, name="run1", target=str(target))
+        yield {
+            "env": _owner_env(home, process.pid, token),
+            "source": source,
+            "run_dir": run_dir,
+        }
+
+
+def _invoke(
+    hook: Path,
+    *,
+    env: dict[str, str],
+    payload: bytes = b"{}",
+    stdin=None,
+    timeout: float = 10,
+) -> subprocess.CompletedProcess:
+    kwargs = {
+        "env": env,
+        "capture_output": True,
+        "timeout": timeout,
+        "check": False,
+    }
+    if stdin is None:
+        kwargs["input"] = payload
+    else:
+        kwargs["stdin"] = stdin
+    return subprocess.run([str(hook)], **kwargs)
+
+
+def _assert_template_lines(stderr: bytes, count: int) -> None:
+    lines = stderr.splitlines(keepends=True)
+    assert len(lines) == count, stderr
+    assert all(_TEMPLATE_LINE.fullmatch(line) for line in lines), stderr
+
+
+def _python_stub(directory: Path, body: str) -> tuple[Path, Path]:
+    directory.mkdir(parents=True)
+    marker = directory / "python-invoked"
+    python = directory / "python3"
+    python.write_text(
+        f"#!/usr/bin/env bash\nMARKER={str(marker)!r}\n{body}\n",
+        encoding="utf-8",
+    )
+    python.chmod(0o700)
+    return python, marker
+
+
+def _copy_shim_tree(tmp_path: Path, module_source: str) -> tuple[Path, Path]:
+    root = tmp_path / "copied-root"
+    hook = root / "plugins" / "coverage" / "libexec" / "raptor-hook-read"
+    hook.parent.mkdir(parents=True)
+    hook.write_bytes(HOOK.read_bytes())
+    hook.chmod(0o700)
+    for package in ("core", "core/coverage"):
+        package_dir = root / package
+        package_dir.mkdir(parents=True, exist_ok=True)
+        (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    module = root / "core" / "coverage" / "track_read.py"
+    module.write_text(module_source, encoding="utf-8")
+    return root, hook
+
+
+def test_n7_shim_static_contract_and_helper_retirement():
+    text = HOOK.read_text(encoding="utf-8")
+    code_lines = [
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    ]
+    code = "\n".join(code_lines)
+
+    assert "set -euo pipefail" in code
+    assert "umask 077" in code
+    assert 'cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")/../../..' in code
+    assert '$(dirname -- "${BASH_SOURCE[0]}")/../.."' not in code
+    assert '[ -f "$REPO_ROOT/core/coverage/track_read.py" ]' in code
+    assert code.count("python3 -E -s -m core.coverage.track_read 1>&2 2>/dev/null") == 1
+    assert "exec python3" not in code
+    assert "jq" not in code
+    assert "tool_input" not in code
+    assert "file_path" not in code
+    assert "python3 -c" not in code
+    assert "<<" not in code
+    assert re.search(r"(^|[;&|]\s*)read(?:\s|$)", code, re.MULTILINE) is None
+    assert "exit 0" in code
+    assert not RETIRED_HELPER.exists()
+
+
+def test_n7_track_read_has_only_stdlib_module_imports():
+    tree = ast.parse(
+        (REPO_ROOT / "core" / "coverage" / "track_read.py").read_text(encoding="utf-8")
+    )
+    imports = []
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            imports.extend(alias.name.split(".", 1)[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imports.append((node.module or "").split(".", 1)[0])
+
+    assert set(imports) <= {
+        "__future__",
+        "dataclasses",
+        "json",
+        "logging",
+        "os",
+        "pathlib",
+        "stat",
+        "sys",
+        "types",
+        "typing",
+    }
+
+
+def test_n7_marker_gate_prevents_child_spawn(tmp_path):
+    bindir = tmp_path / "bin"
+    _python, marker = _python_stub(
+        bindir,
+        'printf invoked >"$MARKER"\nexit 0',
+    )
+    env = {"PATH": f"{bindir}:/usr/bin:/bin", "HOME": str(tmp_path)}
+
+    proc = _invoke(HOOK, env=env)
+
+    assert proc.returncode == 0
+    assert proc.stdout == b""
+    _assert_template_lines(proc.stderr, 1)
+    assert b"trust marker absent" in proc.stderr
+    assert not marker.exists()
+
+
+def test_e31_python_absent_is_one_fixed_line(tmp_path):
+    empty_path = tmp_path / "empty-bin"
+    empty_path.mkdir()
+    env = {
+        "PATH": str(empty_path),
+        "HOME": str(tmp_path),
+        "_RAPTOR_TRUSTED": "1",
+    }
+
+    proc = subprocess.run(
+        ["/usr/bin/bash", str(HOOK)],
+        input=b"{}",
+        env=env,
+        capture_output=True,
+        timeout=10,
+        check=False,
     )
 
-
-class TestGet:
-    def test_top_level_key_from_file(self, tmp_path):
-        f = tmp_path / "p.json"
-        f.write_text(json.dumps({"output_dir": "/some/dir", "n": 3}))
-        proc = _helper("get", str(f), "output_dir")
-        assert proc.returncode == 0
-        assert proc.stdout.strip() == "/some/dir"
-
-    def test_dotted_key_from_stdin(self):
-        payload = json.dumps({"tool_input": {"file_path": "/a/b.py"}})
-        proc = _helper("get", "-", "tool_input.file_path", stdin=payload)
-        assert proc.returncode == 0
-        assert proc.stdout.strip() == "/a/b.py"
-
-    def test_missing_key_prints_nothing(self, tmp_path):
-        f = tmp_path / "p.json"
-        f.write_text(json.dumps({"other": "x"}))
-        proc = _helper("get", str(f), "output_dir")
-        assert proc.returncode == 0
-        assert proc.stdout == ""
-
-    def test_non_string_value_prints_nothing(self, tmp_path):
-        f = tmp_path / "p.json"
-        f.write_text(json.dumps({"output_dir": {"nested": 1}}))
-        proc = _helper("get", str(f), "output_dir")
-        assert proc.returncode == 0
-        assert proc.stdout == ""
-
-    def test_control_byte_value_prints_nothing(self, tmp_path):
-        """A status of "running\n<pid>" in the agent-writable
-        .raptor-run.json shifted the bash consumer's field reads —
-        forging the owner check in the jq lane. Both twins now reject
-        control-byte values (the candidate is skipped, in lock-step,
-        never misread)."""
-        f = tmp_path / "run.json"
-        f.write_text(json.dumps({"status": "running\n88771",
-                                 "session_pid": 99999}))
-        proc = _helper("get", str(f), "status")
-        assert proc.returncode == 0
-        assert proc.stdout == ""
-
-    def test_multi_key_prints_one_line_per_key(self, tmp_path):
-        """The hook consumes three newline-delimited fields with three
-        positional `read`s — a missing field must hold its slot as an
-        EMPTY line, never shift its neighbours."""
-        f = tmp_path / "run.json"
-        f.write_text(json.dumps({"status": "running",
-                                 "target_path": "/tgt"}))
-        proc = _helper("get", str(f), "status", "session_pid",
-                       "target_path")
-        assert proc.returncode == 0
-        assert proc.stdout.split("\n") == ["running", "", "/tgt", ""]
-
-    def test_multi_key_rejects_control_byte_values(self, tmp_path):
-        """A control-byte field reads as EMPTY in its slot: an
-        interior newline in .status otherwise lands the pid of a
-        victim session in the owner field (three positional `read`s
-        in the bash consumer)."""
-        f = tmp_path / "run.json"
-        f.write_text(json.dumps({"status": "running\n88771",
-                                 "session_pid": 99999,
-                                 "target_path": "/tgt"}))
-        proc = _helper("get", str(f), "status", "session_pid",
-                       "target_path")
-        assert proc.returncode == 0
-        lines = proc.stdout.split("\n")
-        # status rejected -> empty; owner is field 2 (the real pid),
-        # target field 3 — no shift.
-        assert lines[0] == ""
-        assert lines[1] == "99999"
-        assert lines[2] == "/tgt"
+    assert proc.returncode == 0
+    assert proc.stdout == b""
+    _assert_template_lines(proc.stderr, 1)
+    assert b"python3 unavailable" in proc.stderr
 
 
-class TestFileGates:
-    """The file form parses `.raptor-run.json` — run metadata in the
-    sandbox-writable run dir — so the open is fd-gated: symlinks
-    refused (O_NOFOLLOW), FIFOs refused without blocking (O_NONBLOCK
-    + S_ISREG on the opened fd), over-budget files refused."""
+def test_n7_relocated_shim_fails_before_child_spawn(tmp_path):
+    root = tmp_path / "relocated"
+    relocated = root / "plugins" / "coverage" / "libexec" / HOOK.name
+    relocated.parent.mkdir(parents=True)
+    relocated.write_bytes(HOOK.read_bytes())
+    relocated.chmod(0o700)
+    bindir = tmp_path / "bin"
+    _python, marker = _python_stub(
+        bindir,
+        'printf invoked >"$MARKER"\nexit 0',
+    )
+    env = {
+        "PATH": f"{bindir}:/usr/bin:/bin",
+        "HOME": str(tmp_path),
+        "_RAPTOR_TRUSTED": "1",
+    }
 
-    def test_symlinked_source_not_read_through(self, tmp_path):
-        victim = tmp_path / "victim.json"
-        victim.write_text(json.dumps({"status": "running"}))
-        link = tmp_path / "run.json"
-        link.symlink_to(victim)
-        proc = _helper("get", str(link), "status")
-        assert proc.returncode == 0
-        assert proc.stdout == ""
+    proc = _invoke(relocated, env=env)
 
-    def test_symlinked_source_multi_key_prints_nothing(self, tmp_path):
-        victim = tmp_path / "victim.json"
-        victim.write_text(json.dumps({"status": "running",
-                                      "session_pid": 1}))
-        link = tmp_path / "run.json"
-        link.symlink_to(victim)
-        proc = _helper("get", str(link), "status", "session_pid")
-        assert proc.returncode == 0
-        assert proc.stdout == ""
-
-    @pytest.mark.skipif(not hasattr(os, "mkfifo"),
-                        reason="mkfifo not available")
-    def test_fifo_source_refused_without_blocking(self, tmp_path):
-        """A FIFO stats 0 bytes (passing any by-name size gate) and
-        then blocks a plain reader forever — the helper must return
-        promptly with no output (the subprocess timeout is the
-        no-hang assertion)."""
-        fifo = tmp_path / "run.json"
-        os.mkfifo(fifo)
-        proc = _helper("get", str(fifo), "status")
-        assert proc.returncode == 0
-        assert proc.stdout == ""
-
-    def test_oversized_source_refused(self, tmp_path):
-        f = tmp_path / "run.json"
-        f.write_text('{"status": "running", "pad": "'
-                     + "x" * 1_100_000 + '"}')
-        proc = _helper("get", str(f), "status")
-        assert proc.returncode == 0
-        assert proc.stdout == ""
-
-    def test_nesting_bomb_within_budget_refused_silently(self, tmp_path):
-        """A ~400 KB file of 200k nested arrays sits well inside the
-        byte budget but blows the JSON parser's stack — that is
-        malformed input, and the helper's contract is silent refusal
-        (print nothing, exit 0), never an uncaught RecursionError
-        traceback with rc=1."""
-        f = tmp_path / "run.json"
-        f.write_text("[" * 200_000 + "]" * 200_000)
-        proc = _helper("get", str(f), "status")
-        assert proc.returncode == 0, proc.stderr
-        assert proc.stdout == ""
-
-    def test_oversized_stdin_refused(self):
-        payload = ('{"tool_input": {"file_path": "/a.py"}, "pad": "'
-                   + "x" * 1_100_000 + '"}')
-        proc = _helper("get", "-", "tool_input.file_path",
-                       stdin=payload)
-        assert proc.returncode == 0
-        assert proc.stdout == ""
-
-    def test_malformed_json_silent(self, tmp_path):
-        f = tmp_path / "p.json"
-        f.write_text("{not json")
-        proc = _helper("get", str(f), "output_dir")
-        assert proc.returncode == 0
-        assert proc.stdout == ""
-
-    def test_missing_file_silent(self, tmp_path):
-        proc = _helper("get", str(tmp_path / "absent.json"), "k")
-        assert proc.returncode == 0
-        assert proc.stdout == ""
-
-    def test_hostile_filename_is_data_not_code(self, tmp_path):
-        """The pre-refactor injection surface: a path containing a
-        quote must be handled as argv DATA (the file simply gets
-        opened), never spliced into python source."""
-        f = tmp_path / "run'; import os #.json"
-        f.write_text(json.dumps({"status": "running"}))
-        proc = _helper("get", str(f), "status")
-        assert proc.returncode == 0
-        assert proc.stdout.strip() == "running"
+    assert proc.returncode == 0
+    assert proc.stdout == b""
+    _assert_template_lines(proc.stderr, 1)
+    assert b"repository root unavailable" in proc.stderr
+    assert not marker.exists()
 
 
-class TestAppend:
-    def test_appends_line_0600(self, tmp_path):
-        manifest = tmp_path / "m"
-        proc = _helper("append", str(manifest), "/a/b.py")
-        assert proc.returncode == 0
-        assert manifest.read_text() == "/a/b.py\n"
-        assert (manifest.stat().st_mode & 0o777) == 0o600
-
-    def test_symlinked_manifest_refused(self, tmp_path):
-        victim = tmp_path / "victim"
-        victim.write_text("original\n")
-        manifest = tmp_path / "m"
-        manifest.symlink_to(victim)
-        proc = _helper("append", str(manifest), "/a/b.py")
-        assert proc.returncode == 0
-        assert victim.read_text() == "original\n"
-
-    def test_dangling_symlink_not_created_through(self, tmp_path):
-        victim = tmp_path / "never-created"
-        manifest = tmp_path / "m"
-        manifest.symlink_to(victim)
-        proc = _helper("append", str(manifest), "/a/b.py")
-        assert proc.returncode == 0
-        assert not victim.exists()
-
-
-class TestProcessShapePins:
-    def test_hook_has_no_inline_python(self):
-        """The EDR-noisy shapes must not regrow: no ``python3 -c``
-        blobs and no ``python3 -`` heredocs in the hook."""
-        code_lines = [
-            line for line in HOOK.read_text(encoding="utf-8").splitlines()
-            if not line.lstrip().startswith("#")
-        ]
-        code = "\n".join(code_lines)
-        assert "python3 -c" not in code
-        assert "python3 - " not in code
-        assert "<<'PY'" not in code and "<<PY" not in code
-
-    def test_hook_never_hands_a_disk_file_to_jq(self):
-        """jq parses the STDIN payload only. Every on-disk JSON parse
-        must go through the helper's fd-gated open — jq-on-a-path
-        follows a planted symlink and blocks on a planted FIFO in the
-        sandbox-writable run dir."""
-        code_lines = [
-            line for line in HOOK.read_text(encoding="utf-8").splitlines()
-            if not line.lstrip().startswith("#")
-        ]
-        for line in code_lines:
-            if "jq " not in line:
-                continue
-            assert ".raptor-run.json" not in line, line
-            assert "PROJECT_FILE" not in line, line
-
-    def test_helper_is_stdlib_only(self):
-        src = HELPER.read_text(encoding="utf-8")
-        for forbidden in ("import core", "from core", "RAPTOR_DIR"):
-            assert forbidden not in src, (
-                "helper must stay standalone — it runs outside any "
-                "RAPTOR process"
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
+def test_n7_real_and_directory_symlinked_hook_paths_run_module(
+    tmp_path,
+    monkeypatch,
+):
+    for through_symlink in (False, True):
+        case_root = tmp_path / f"case-{through_symlink}"
+        case_root.mkdir()
+        with _owned_hook_case(case_root, monkeypatch) as case:
+            selected = HOOK
+            if through_symlink:
+                plugin_link = case_root / "plugin-link"
+                plugin_link.symlink_to(
+                    REPO_ROOT / "plugins" / "coverage",
+                    target_is_directory=True,
+                )
+                selected = plugin_link / "libexec" / HOOK.name
+            proc = _invoke(
+                selected,
+                env=case["env"],
+                payload=json.dumps(
+                    {
+                        "tool_input": {"file_path": str(case["source"])},
+                    }
+                ).encode(),
             )
+            manifest = case["run_dir"] / track_read.MANIFEST_NAME
+
+        assert proc.returncode == 0
+        assert proc.stdout == b""
+        assert proc.stderr == b""
+        assert manifest.read_bytes() == (str(case["source"].resolve()) + "\n").encode()
 
 
-@pytest.mark.skipif(shutil.which("bash") is None, reason="bash required")
-class TestHookWithoutJq:
-    """End-to-end through the helper: PATH stripped of jq, so every
-    JSON parse takes the fallback path."""
+def test_n7_hostile_pythonpath_is_ignored(tmp_path):
+    evil = tmp_path / "evil"
+    module = evil / "core" / "coverage" / "track_read.py"
+    module.parent.mkdir(parents=True)
+    (evil / "core" / "__init__.py").write_text("", encoding="utf-8")
+    (evil / "core" / "coverage" / "__init__.py").write_text("", encoding="utf-8")
+    marker = tmp_path / "hijacked"
+    module.write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('bad')\n",
+        encoding="utf-8",
+    )
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(tmp_path),
+        "PYTHONPATH": str(evil),
+        "_RAPTOR_TRUSTED": "1",
+    }
 
-    def test_read_recorded_via_helper_fallback(self, tmp_path):
-        home = tmp_path / "home"
-        target = tmp_path / "target"
-        target.mkdir(parents=True)
-        (target / "a.py").write_text("x = 1\n")
+    proc = _invoke(HOOK, env=env, payload=b"{not json")
 
-        projects = home / ".raptor" / "projects"
-        projects.mkdir(parents=True)
-        project_dir = tmp_path / "proj-out"
-        run_dir = project_dir / "run1"
-        run_dir.mkdir(parents=True)
-        (run_dir / ".raptor-run.json").write_text(
-            json.dumps({"status": "running"}),
+    assert proc.returncode == 0
+    assert proc.stdout == b""
+    _assert_template_lines(proc.stderr, 1)
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        OSError("SECRET expected os error"),
+        ValueError("SECRET expected value error"),
+    ],
+    ids=["oserror", "valueerror"],
+)
+def test_t2_entry_expected_errors_emit_once_and_restore_logging(
+    monkeypatch,
+    capsys,
+    error,
+):
+    previous_disable = logging.root.manager.disable
+
+    def fail():
+        raise error
+
+    monkeypatch.setattr(track_read, "_run_hook", fail)
+    result = track_read._entry()
+    captured = capsys.readouterr()
+
+    assert result == 0
+    assert captured.out == (
+        "raptor-read-hook[hook_failed]: coverage helper failed safely\n"
+    )
+    assert captured.err == ""
+    assert "SECRET" not in captured.out
+    assert logging.root.manager.disable == previous_disable
+
+
+def test_ambiguous_diagnostic_is_specific(capsys):
+    track_read._diag("ambiguous")
+    captured = capsys.readouterr()
+    assert captured.out == (
+        "raptor-read-hook[ambiguous]: "
+        "multiple owned running runs are active\n"
+    )
+    assert captured.err == ""
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
+def test_t3_idle_owned_session_real_shim_is_silent(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    sessions_dir = home / ".local" / "share" / "raptor" / "sessions.d"
+    monkeypatch.setattr(sessions, "SESSIONS_DIR", sessions_dir)
+    with _owned_claude(tmp_path, strong=False) as (
+        process,
+        _executable,
+        token,
+        _claim,
+    ):
+        source = tmp_path / "source.py"
+        source.write_text("x = 1\n")
+        proc = _invoke(
+            HOOK,
+            env=_owner_env(home, process.pid, token),
+            payload=json.dumps({"tool_input": {"file_path": str(source)}}).encode(),
         )
-        (projects / "myproj").write_text(json.dumps({
-            "output_dir": str(project_dir),
-            "target": str(target),
-        }))
-        (projects / ".active").symlink_to("myproj")
 
-        # A bin dir holding everything the hook needs EXCEPT jq.
-        bindir = tmp_path / "bin"
-        bindir.mkdir()
-        for tool in ("dirname", "readlink", "stat", "realpath",
-                     "python3", "bash"):
-            path = shutil.which(tool)
-            if path is None:
-                pytest.skip(f"{tool} not on PATH")
-            (bindir / tool).symlink_to(path)
+    assert proc.returncode == 0
+    assert proc.stdout == b""
+    assert proc.stderr == b""
+    assert list(tmp_path.rglob(track_read.MANIFEST_NAME)) == []
 
-        env = dict(os.environ)
-        env["HOME"] = str(home)
-        env["PATH"] = str(bindir)
 
+def test_e31_pre_entry_python_failure_suppresses_child_text(tmp_path):
+    bindir = tmp_path / "bin"
+    _python_stub(
+        bindir,
+        "printf 'SECRET fake traceback\\n' >&2\nexit 1",
+    )
+    env = {
+        "PATH": f"{bindir}:/usr/bin:/bin",
+        "HOME": str(tmp_path),
+        "_RAPTOR_TRUSTED": "1",
+    }
+
+    proc = _invoke(HOOK, env=env)
+
+    assert proc.returncode == 0
+    assert proc.stdout == b""
+    _assert_template_lines(proc.stderr, 1)
+    assert b"coverage helper failed (rc=1)" in proc.stderr
+    assert b"SECRET" not in proc.stderr
+
+
+def test_e31_post_entry_core_import_failure_is_sanitized(tmp_path):
+    source = (REPO_ROOT / "core" / "coverage" / "track_read.py").read_text(
+        encoding="utf-8"
+    )
+    root, hook = _copy_shim_tree(tmp_path, source)
+    run_pkg = root / "core" / "run"
+    run_pkg.mkdir()
+    (run_pkg / "__init__.py").write_text("", encoding="utf-8")
+    (run_pkg / "host_events.py").write_text(
+        "raise ImportError('SECRET import path')\n",
+        encoding="utf-8",
+    )
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(tmp_path),
+        "_RAPTOR_TRUSTED": "1",
+    }
+
+    proc = _invoke(hook, env=env)
+
+    assert proc.returncode == 0
+    assert proc.stdout == b""
+    _assert_template_lines(proc.stderr, 1)
+    assert b"core_import_failed" in proc.stderr
+    assert b"SECRET" not in proc.stderr
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"{not json",
+        b"x" * (1024 * 1024 + 1),
+        b"",
+    ],
+    ids=["malformed", "oversize", "eof"],
+)
+def test_e31_malformed_oversize_and_eof_are_one_template_line(
+    tmp_path,
+    payload,
+):
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(tmp_path),
+        "_RAPTOR_TRUSTED": "1",
+    }
+
+    proc = _invoke(HOOK, env=env, payload=payload)
+
+    assert proc.returncode == 0
+    assert proc.stdout == b""
+    _assert_template_lines(proc.stderr, 1)
+
+
+def test_e31_devnull_stdin_is_one_template_line(tmp_path):
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(tmp_path),
+        "_RAPTOR_TRUSTED": "1",
+    }
+
+    proc = _invoke(HOOK, env=env, stdin=subprocess.DEVNULL)
+
+    assert proc.returncode == 0
+    assert proc.stdout == b""
+    _assert_template_lines(proc.stderr, 1)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "session_id": "SECRET-session\n",
+            "tool_input": {"file_path": "/owned/a.py"},
+        },
+        {
+            "tool_input": {
+                "file_path": "SECRET-/very/long/path\ninjected.py",
+            },
+        },
+    ],
+)
+def test_n5_shim_diagnostics_never_echo_payload_canaries(tmp_path, payload):
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(tmp_path),
+        "_RAPTOR_TRUSTED": "1",
+    }
+
+    proc = _invoke(HOOK, env=env, payload=json.dumps(payload).encode())
+
+    assert proc.returncode == 0
+    assert proc.stdout == b""
+    _assert_template_lines(proc.stderr, 1)
+    assert b"SECRET" not in proc.stderr
+    assert b"injected.py" not in proc.stderr
+
+
+def test_e31_closed_stdin_is_one_template_line(tmp_path):
+    wrapper = tmp_path / "close-stdin.py"
+    wrapper.write_text(
+        "import os, sys\n"
+        "os.close(0)\n"
+        "os.execve(sys.argv[1], [sys.argv[1], sys.argv[2]], os.environ)\n",
+        encoding="utf-8",
+    )
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(tmp_path),
+        "_RAPTOR_TRUSTED": "1",
+    }
+
+    proc = subprocess.run(
+        [sys.executable, str(wrapper), "/usr/bin/bash", str(HOOK)],
+        env=env,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert proc.returncode == 0
+    assert proc.stdout == b""
+    _assert_template_lines(proc.stderr, 1)
+
+
+def test_e31_unforeseen_child_failure_is_one_shell_line(tmp_path):
+    root, hook = _copy_shim_tree(
+        tmp_path,
+        "raise TypeError('SECRET unforeseen failure')\n",
+    )
+    assert root.is_dir()
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(tmp_path),
+        "_RAPTOR_TRUSTED": "1",
+    }
+
+    proc = _invoke(hook, env=env)
+
+    assert proc.returncode == 0
+    assert proc.stdout == b""
+    _assert_template_lines(proc.stderr, 1)
+    assert b"coverage helper failed (rc=1)" in proc.stderr
+    assert b"SECRET" not in proc.stderr
+
+
+def test_e31_unforeseen_after_emission_is_two_template_lines(tmp_path):
+    _root, hook = _copy_shim_tree(
+        tmp_path,
+        "import sys\n"
+        "sys.stdout.write('raptor-read-hook[io_refused]: "
+        "coverage evidence write was refused\\n')\n"
+        "sys.stdout.flush()\n"
+        "raise TypeError('SECRET after emission')\n",
+    )
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(tmp_path),
+        "_RAPTOR_TRUSTED": "1",
+    }
+
+    proc = _invoke(hook, env=env)
+
+    assert proc.returncode == 0
+    assert proc.stdout == b""
+    _assert_template_lines(proc.stderr, 2)
+    assert b"SECRET" not in proc.stderr
+
+
+def test_e31_entry_propagates_unforeseen_errors(monkeypatch):
+    def fail():
+        raise TypeError("unforeseen")
+
+    monkeypatch.setattr(track_read, "_run_hook", fail)
+    with pytest.raises(TypeError, match="unforeseen"):
+        track_read._entry()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
+def test_t7_tool_response_counts_toward_real_shim_payload_budget(
+    tmp_path,
+    monkeypatch,
+):
+    with _owned_hook_case(tmp_path, monkeypatch) as case:
+        in_budget = json.dumps(
+            {
+                "tool_input": {"file_path": str(case["source"])},
+                "tool_response": "x" * (900 * 1024),
+            }
+        ).encode()
+        assert 900 * 1024 < len(in_budget) < MAX_HOST_EVENT_BYTES
+        positive = _invoke(HOOK, env=case["env"], payload=in_budget)
+        manifest = case["run_dir"] / track_read.MANIFEST_NAME
+        assert manifest.read_text(encoding="utf-8") == (
+            str(case["source"].resolve()) + "\n"
+        )
+        manifest.unlink()
+
+        over_budget = json.dumps(
+            {
+                "tool_input": {"file_path": str(case["source"])},
+                "tool_response": "x" * MAX_HOST_EVENT_BYTES,
+            }
+        ).encode()
+        assert len(over_budget) > MAX_HOST_EVENT_BYTES
+        refused = _invoke(HOOK, env=case["env"], payload=over_budget)
+
+    assert positive.returncode == 0
+    assert positive.stdout == b""
+    assert positive.stderr == b""
+    assert refused.returncode == 0
+    assert refused.stdout == b""
+    _assert_template_lines(refused.stderr, 1)
+    assert b"raptor-read-hook[budget]" in refused.stderr
+    assert not manifest.exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
+@pytest.mark.parametrize("strong", [False, True], ids=["legacy", "strong"])
+def test_e32_head_hook_and_new_shim_write_identical_manifest_bytes(
+    tmp_path,
+    monkeypatch,
+    strong,
+):
+    with _owned_hook_case(tmp_path, monkeypatch, strong=strong) as case:
+        old_dir = tmp_path / "head" / "plugins" / "coverage" / "libexec"
+        old_dir.mkdir(parents=True)
+        for relative in (
+            "plugins/coverage/libexec/raptor-hook-read",
+            "plugins/coverage/libexec/raptor-hook-json",
+        ):
+            content = subprocess.check_output(
+                ["git", "show", f"{BASELINE_HEAD}:{relative}"],
+                cwd=REPO_ROOT,
+            )
+            destination = old_dir / Path(relative).name
+            destination.write_bytes(content)
+            destination.chmod(0o700)
         payload = json.dumps(
-            {"tool_input": {"file_path": str(target / "a.py")}},
+            {
+                "tool_input": {"file_path": str(case["source"])},
+            }
+        ).encode()
+
+        old = _invoke(
+            old_dir / "raptor-hook-read",
+            env=case["env"],
+            payload=payload,
         )
-        proc = subprocess.run(
-            ["bash", str(HOOK)],
-            input=payload, env=env, capture_output=True,
-            text=True, timeout=60, check=False,
-        )
-        assert proc.returncode == 0, proc.stderr
-        manifest = run_dir / ".reads-manifest"
-        assert manifest.is_file()
-        assert manifest.read_text().strip() == str(
-            (target / "a.py").resolve(),
-        )
+        manifest = case["run_dir"] / track_read.MANIFEST_NAME
+        old_bytes = manifest.read_bytes()
+        manifest.unlink()
+        new = _invoke(HOOK, env=case["env"], payload=payload)
+        new_bytes = manifest.read_bytes()
+
+    assert old.returncode == 0
+    assert new.returncode == 0
+    assert old_bytes == new_bytes == (str(case["source"].resolve()) + "\n").encode()
