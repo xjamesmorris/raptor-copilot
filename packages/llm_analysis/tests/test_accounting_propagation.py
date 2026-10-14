@@ -12,6 +12,7 @@ from unittest.mock import patch
 import pytest
 
 import packages.llm_analysis.agent as agent_module
+import raptor_agentic
 from core.llm.accounting import (
     AccountingSummary,
     CostObservation,
@@ -41,6 +42,10 @@ from packages.llm_analysis.orchestrator import (
     _merge_results,
     _should_fallback_to_cc,
     format_cost_summary,
+)
+from raptor_agentic import (
+    _accounting_console_lines,
+    _format_report_accounting,
 )
 
 
@@ -440,8 +445,23 @@ def test_cost_tracker_mixed_summary_and_honest_zero_rendering():
     assert "incomplete" in rendered
     assert "unresolved exposure: actual unknown" in rendered
     assert "Total cost: $0" not in rendered
+    assert _format_report_accounting(summary) == rendered
     assert _format_analysis_accounting(summary) == rendered
     assert json.loads(json.dumps(summary))["unknown_calls"] == 1
+    lines = _accounting_console_lines({
+        **summary,
+        "thinking_tokens": 12,
+        "cost_by_model": {"m1": 0.2, "m2": 0.3},
+    })
+    assert lines == [
+        f"   Accounting: {rendered} (12 thinking tokens)",
+        "     m1: $0.20",
+        "     m2: $0.30",
+    ]
+    assert _accounting_console_lines({
+        "total_cost": 0.0,
+        "thinking_tokens": 7,
+    }) == ["   Thinking tokens: 7"]
 
 
 @pytest.mark.parametrize(
@@ -522,15 +542,19 @@ def test_sequential_process_summary_uses_honest_formatter(
     assert "Total cost: $0" not in caplog.text
 
 
-def test_sequential_report_call_sites_use_shared_formatter():
+def test_report_call_sites_use_shared_formatter_without_zero_cost_literal():
     sources = (
         inspect.getsource(
             agent_module.AutonomousSecurityAgentV2.process_findings,
         ),
         inspect.getsource(agent_module.main),
+        inspect.getsource(raptor_agentic.main),
     )
     assert "_format_analysis_accounting" in sources[0]
     assert "_format_analysis_accounting" in sources[1]
+    assert "_accounting_console_lines" in sources[2]
+    assert "_format_report_accounting" in sources[2]
+    assert "print(sanitise_for_terminal(line))" in sources[2]
     for source in sources:
         assert "Total cost: $0" not in source
         assert "Cost: $" not in source

@@ -95,7 +95,17 @@ class TestCollectChildPassCosts:
     def test_headline_sums_child_costs(self):
         # The console and report cost blocks must aggregate the child
         # total, not print the orchestration figure alone.
-        src = (_RAPTOR_ROOT / "raptor_agentic.py").read_text(
-            encoding="utf-8")
-        assert 'f"   Cost: ${cost + child_total:.2f}"' in src
-        assert "if report_cost + child_total > 0:" in src
+        agentic = _import_agentic()
+        summary = {"total_cost": 2.0}
+        child_costs = [
+            ("understand pre-pass", 1.25),
+            ("validate post-pass", 1.75),
+        ]
+
+        rendered = agentic._format_report_accounting(summary, child_costs)
+        assert "Known child-pass USD $3.00" in rendered
+        assert "combined numeric spend $5.00" in rendered
+        assert any(
+            "combined numeric spend $5.00" in line
+            for line in agentic._accounting_console_lines(summary, child_costs)
+        )

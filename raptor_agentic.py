@@ -83,6 +83,61 @@ def _parent_death_preexec() -> Callable[[], None] | None:
     return set_pdeathsig()
 
 
+def _format_report_accounting(
+    cost_summary: dict,
+    child_costs: list[tuple[str, float]] | None = None,
+) -> str:
+    """Shared honest accounting text for console and Markdown reports."""
+    from packages.llm_analysis.orchestrator import format_cost_summary
+    rendered = format_cost_summary(cost_summary)
+    costs = child_costs or []
+    child_total = sum(spend for _label, spend in costs)
+    if child_total <= 0:
+        return rendered
+    details = ", ".join(
+        f"{label} ${spend:.2f}" for label, spend in costs
+    )
+    analysis_total = float(cost_summary.get("total_cost", 0.0) or 0.0)
+    child_text = (
+        f"Known child-pass USD ${child_total:.2f} ({details}); "
+        f"combined numeric spend ${analysis_total + child_total:.2f}"
+    )
+    return f"{rendered}; {child_text}" if rendered else child_text
+
+
+def _accounting_console_lines(
+    cost_summary: dict,
+    child_costs: list[tuple[str, float]] | None = None,
+) -> list[str]:
+    """Render the final workflow's accounting block."""
+    lines: list[str] = []
+    accounting_text = _format_report_accounting(
+        cost_summary, child_costs,
+    )
+    thinking = cost_summary.get("thinking_tokens", 0)
+    if accounting_text:
+        line = f"   Accounting: {accounting_text}"
+        if thinking > 0:
+            line += f" ({thinking:,} thinking tokens)"
+        lines.append(line)
+    elif thinking > 0:
+        lines.append(f"   Thinking tokens: {thinking:,}")
+    cost = cost_summary.get("total_cost", 0)
+    if cost > 0:
+        by_model = cost_summary.get("cost_by_model", {})
+        if len(by_model) > 1:
+            lines.extend(
+                f"     {model}: ${model_cost:.2f}"
+                for model, model_cost in by_model.items()
+            )
+    if child_costs:
+        lines.extend(
+            f"     {label}: ${spend:.2f}"
+            for label, spend in child_costs
+        )
+    return lines
+
+
 def _kill_process_tree(process: "subprocess.Popen") -> None:
     """SIGKILL the child's whole process group, then the child itself.
 
@@ -5352,28 +5407,10 @@ def main() -> int:
     # headline under-reported by their whole share when used).
     cost_summary = (orchestration_result or {}).get(
         "orchestration", {}).get("cost", {})
-    cost = cost_summary.get("total_cost", 0) or 0
     child_costs = _collect_child_pass_costs(
         prepass_result, postpass_result, audit_postpass)
-    child_total = sum(spend for _label, spend in child_costs)
-    if cost + child_total > 0:
-        thinking = cost_summary.get("thinking_tokens", 0)
-        cost_str = f"   Cost: ${cost + child_total:.2f}"
-        if thinking > 0 and not child_costs:
-            cost_str += f" ({thinking:,} thinking tokens)"
-        print(cost_str)
-        if child_costs:
-            line = f"     analysis: ${cost:.2f}"
-            if thinking > 0:
-                line += f" ({thinking:,} thinking tokens)"
-            print(line)
-            for label, spend in child_costs:
-                print(f"     {label}: ${spend:.2f}")
-        # Per-model breakdown if multiple models used
-        by_model = cost_summary.get("cost_by_model", {})
-        if len(by_model) > 1:
-            for model, mcost in by_model.items():
-                print(f"     {model}: ${mcost:.2f}")
+    for line in _accounting_console_lines(cost_summary, child_costs):
+        print(sanitise_for_terminal(line))
     if orchestration_result:
         # Fast-tier scorecard savings — surface concrete behaviour
         # of the prefilter (full ANALYSE calls skipped on findings
@@ -5528,18 +5565,13 @@ def main() -> int:
     if patches_count > 0:
         extra_summary["Patches generated"] = patches_count
     # Same aggregation as the console headline: pass-subprocess spend
-    # joins the report cost, with the split stated when present.
-    report_cost = (orch_phase.get("cost", {}).get("total_cost", 0) or 0)
-    if report_cost + child_total > 0:
-        if child_costs:
-            breakdown = " + ".join(
-                [f"${report_cost:.2f} analysis"]
-                + [f"${spend:.2f} {label}"
-                   for label, spend in child_costs])
-            extra_summary["Cost"] = (
-                f"${report_cost + child_total:.2f} ({breakdown})")
-        else:
-            extra_summary["Cost"] = f"${report_cost:.2f}"
+    # joins the route-aware report accounting, with the split stated.
+    cost_summary = orch_phase.get("cost", {})
+    accounting_text = _format_report_accounting(
+        cost_summary, child_costs,
+    )
+    if accounting_text:
+        extra_summary["Cost"] = accounting_text
     if aggregation:
         aggregate_model = aggregation.get("analysed_by")
         extra_summary["Aggregate synthesis"] = aggregate_model or "completed"
