@@ -27,6 +27,11 @@ When you add a capability, the mechanical part goes in Python and the
 judgement part goes in a skill or command file — never the other way
 round.
 
+Reviewers and automated agents evaluating the staged Copilot work should use
+the [Copilot integration patch map](copilot-patch-map.md) to distinguish
+direct integration changes, required security foundations, fake-only
+validation layers, and independent LLM improvements.
+
 ## Layering rules
 
 - **`core/`** is shared infrastructure. Dependencies point one way:
