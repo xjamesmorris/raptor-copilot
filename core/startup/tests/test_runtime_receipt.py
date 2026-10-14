@@ -1556,7 +1556,6 @@ def test_package_has_no_forbidden_runtime_imports_or_frozen_wiring() -> None:
     for relative in (
         "bin/raptor",
         "core/coverage/track_read.py",
-        "core/run/metadata.py",
         "core/run/pin.py",
         "core/startup/host.py",
         "libexec/raptor-lifecycle-hook",
@@ -1570,17 +1569,32 @@ def test_package_has_no_forbidden_runtime_imports_or_frozen_wiring() -> None:
     launch_source = (
         repository_root / "core/startup/runtime_receipt/launch.py"
     ).read_text(encoding="utf-8")
+    terminal_source = (
+        repository_root / "core/startup/runtime_receipt/terminal.py"
+    ).read_text(encoding="utf-8")
     host_source = (
         repository_root / "core/startup/tests/fixtures/runtime_receipt/owned_host.c"
     ).read_text(encoding="utf-8")
+    metadata_source = (repository_root / "core/run/metadata.py").read_text(
+        encoding="utf-8"
+    )
     assert ".launch" not in facade_source
+    assert ".terminal" not in facade_source
     assert "OwnedFakeRuntimeCapability" not in facade_source
+    assert "OwnedFakeTerminalCapability" not in facade_source
     assert "_launch_owned_runtime_fake" not in facade_source
+    assert "_apply_owned_fake_terminal_capability" not in facade_source
     assert "__all__: tuple[str, ...] = ()" in launch_source
-    assert "TERMINAL_ATTACH" not in launch_source
-    assert 'operation == "terminal"' not in launch_source
-    assert "COMMAND_TERMINAL_ATTACH" not in host_source
-    assert "TERMINAL_MAGIC" not in host_source
+    assert "TERMINAL_ATTACH = 106" in launch_source
+    assert 'operation == "terminal"' in launch_source
+    assert "COMMAND_TERMINAL_ATTACH UINT16_C(106)" in host_source
+    assert "TERMINAL_MAGIC UINT32_C(0x5254544d)" in host_source
+    assert "__all__: tuple[str, ...] = ()" in terminal_source
+    assert "core.run.metadata" not in terminal_source
+    assert "_query_owned_fake_terminal_permit" not in terminal_source
+    assert "_verify_owned_fake_terminal_permit" not in terminal_source
+    assert "_query_owned_fake_terminal_permit" not in metadata_source
+    assert "_verify_owned_fake_terminal_permit" not in metadata_source
 
 
 # Stage 3A.1 exact receipt-import policy.
@@ -1593,8 +1607,13 @@ _RECEIPT_REASONS_MODULE = f"{_RECEIPT_IMPORT_PREFIX}.reasons"
 _RECEIPT_SCHEMA_MODULE = f"{_RECEIPT_IMPORT_PREFIX}.schema"
 _RECEIPT_VERIFY_MODULE = f"{_RECEIPT_IMPORT_PREFIX}.verify"
 _RECEIPT_LAUNCH_MODULE = f"{_RECEIPT_IMPORT_PREFIX}.launch"
+_RECEIPT_TERMINAL_MODULE = f"{_RECEIPT_IMPORT_PREFIX}.terminal"
 _SESSIONS_PATH = "core/project/sessions.py"
+_METADATA_PATH = "core/run/metadata.py"
 _RUNTIME_FAKE_PATH = "core/testing/runtime_receipt_fake.py"
+_RUNTIME_TERMINAL_PATH = "core/testing/runtime_receipt_terminal.py"
+_LAUNCH_PATH = "core/startup/runtime_receipt/launch.py"
+_TERMINAL_PATH = "core/startup/runtime_receipt/terminal.py"
 _DYNAMIC_IMPORT_NAME = "<dynamic module>"
 _UNRESOLVED_RECEIPT_MODULE = f"{_RECEIPT_IMPORT_PREFIX}.<unresolved>"
 _UNKNOWN_BINDING = object()
@@ -1683,6 +1702,35 @@ _REVIEWED_STAGE_3A1_RUNTIME_IMPORTS = frozenset(
         (_RECEIPT_VERIFY_MODULE, "verify_receipt_static"),
     }
 )
+_REVIEWED_STAGE_3A2_METADATA_TYPE_IMPORTS: frozenset[tuple[str, str]] = frozenset()
+_REVIEWED_STAGE_3A2_METADATA_RUNTIME_IMPORTS = frozenset(
+    {
+        (_RECEIPT_IMPORT_PREFIX + ".canonical", "canonical_bytes"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "MAX_SNAPSHOT_BYTES"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "PlumbingDisposition"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "PlumbingFailure"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "PlumbingReason"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "ReceiptComparatorInput"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "ReceiptComparisonResult"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "ReceiptReference"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "ReceiptState"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "RuntimeReceiptSnapshot"),
+        (
+            _RECEIPT_PLUMBING_TYPES_MODULE,
+            "authority_invariant_failure",
+        ),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "compare_receipt_snapshot"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "parse_reference"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "reference_from_receipt"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "serialize_reference"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "serialize_snapshot"),
+        (_RECEIPT_PROFILE_MODULE, "DEFAULT_PROFILE_DIRECTORY"),
+        (_RECEIPT_PROFILE_MODULE, "load_profile_store"),
+        (_RECEIPT_REASONS_MODULE, "ReceiptRejection"),
+        (_RECEIPT_SCHEMA_MODULE, "RuntimeReceipt"),
+        (_RECEIPT_VERIFY_MODULE, "parse_receipt"),
+    }
+)
 _REVIEWED_RUNTIME_FAKE_TYPE_IMPORTS = frozenset(
     {(_RECEIPT_LAUNCH_MODULE, "OwnedFakeRuntimeCapability")}
 )
@@ -1692,8 +1740,31 @@ _REVIEWED_RUNTIME_FAKE_RUNTIME_IMPORTS = frozenset(
         (_RECEIPT_IMPORT_PREFIX + ".canonical", "receipt_sha256"),
         (_RECEIPT_IMPORT_PREFIX + ".canonical", "sha256_hex"),
         (_RECEIPT_LAUNCH_MODULE, "_issue_owned_fake_runtime_capability"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "PlumbingFailure"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "RuntimeReceiptSnapshot"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "reference_from_receipt"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "serialize_reference"),
+        (_RECEIPT_PLUMBING_TYPES_MODULE, "serialize_snapshot"),
         (_RECEIPT_PROFILE_MODULE, "DEFAULT_PROFILE_DIRECTORY"),
+        (_RECEIPT_PROFILE_MODULE, "load_profile_store"),
+        (_RECEIPT_REASONS_MODULE, "ReceiptRejection"),
         (_RECEIPT_SCHEMA_MODULE, "ArtifactName"),
+        (_RECEIPT_VERIFY_MODULE, "parse_receipt"),
+        (_RECEIPT_VERIFY_MODULE, "serialize_receipt"),
+    }
+)
+_REVIEWED_RUNTIME_TERMINAL_TYPE_IMPORTS = frozenset(
+    {
+        (_RECEIPT_TERMINAL_MODULE, "OwnedFakeTerminalCapability"),
+        (_RECEIPT_TERMINAL_MODULE, "OwnedFakeTerminalFailure"),
+    }
+)
+_REVIEWED_RUNTIME_TERMINAL_RUNTIME_IMPORTS = frozenset(
+    {
+        (
+            _RECEIPT_TERMINAL_MODULE,
+            "_issue_owned_fake_terminal_capability",
+        ),
     }
 )
 
@@ -1702,9 +1773,17 @@ _REVIEWED_RECEIPT_IMPORTS = {
         _REVIEWED_STAGE_3A1_TYPE_IMPORTS,
         _REVIEWED_STAGE_3A1_RUNTIME_IMPORTS,
     ),
+    _METADATA_PATH: (
+        _REVIEWED_STAGE_3A2_METADATA_TYPE_IMPORTS,
+        _REVIEWED_STAGE_3A2_METADATA_RUNTIME_IMPORTS,
+    ),
     _RUNTIME_FAKE_PATH: (
         _REVIEWED_RUNTIME_FAKE_TYPE_IMPORTS,
         _REVIEWED_RUNTIME_FAKE_RUNTIME_IMPORTS,
+    ),
+    _RUNTIME_TERMINAL_PATH: (
+        _REVIEWED_RUNTIME_TERMINAL_TYPE_IMPORTS,
+        _REVIEWED_RUNTIME_TERMINAL_RUNTIME_IMPORTS,
     ),
 }
 
@@ -3098,7 +3177,7 @@ def test_relative_receipt_import_in_another_production_file_is_forbidden() -> No
     )
 
 
-def test_stage3b_receipt_importers_are_exact() -> None:
+def test_receipt_importers_are_exact_through_terminal_k1() -> None:
     repository_root = Path(__file__).parents[3]
     production_sources = _production_python_sources(repository_root)
     violations = tuple(
@@ -3114,7 +3193,12 @@ def test_stage3b_receipt_importers_are_exact() -> None:
         relative
         for relative, source_text in production_sources.items()
         if _RECEIPT_IMPORT_PREFIX in source_text
-    } == {_SESSIONS_PATH, _RUNTIME_FAKE_PATH}
+    } == {
+        _SESSIONS_PATH,
+        _METADATA_PATH,
+        _RUNTIME_FAKE_PATH,
+        _RUNTIME_TERMINAL_PATH,
+    }
 
 
 def test_reviewed_sessions_receipt_imports_are_explicit_and_exact() -> None:
@@ -3143,11 +3227,131 @@ def test_reviewed_sessions_receipt_imports_are_explicit_and_exact() -> None:
         )
 
 
-def test_reviewed_sessions_bans_reflective_import_tokens() -> None:
+def test_reviewed_receipt_files_ban_reflective_import_tokens() -> None:
     repository_root = Path(__file__).parents[3]
-    source_text = (repository_root / _SESSIONS_PATH).read_text(encoding="utf-8")
-    for token in _REFLECTIVE_IMPORT_TOKENS:
-        assert token not in source_text, token
+    for relative in (
+        _SESSIONS_PATH,
+        _METADATA_PATH,
+        _LAUNCH_PATH,
+        _TERMINAL_PATH,
+        _RUNTIME_FAKE_PATH,
+        _RUNTIME_TERMINAL_PATH,
+    ):
+        source_text = (repository_root / relative).read_text(encoding="utf-8")
+        for token in _REFLECTIVE_IMPORT_TOKENS:
+            assert token not in source_text, (relative, token)
+
+
+def test_terminal_capability_has_exact_private_authority_surface() -> None:
+    repository_root = Path(__file__).parents[3]
+    terminal_source = (repository_root / _TERMINAL_PATH).read_text(encoding="utf-8")
+    helper_source = (repository_root / _RUNTIME_TERMINAL_PATH).read_text(
+        encoding="utf-8"
+    )
+    terminal_tree = ast.parse(terminal_source, filename=_TERMINAL_PATH)
+
+    launch_imports = {
+        alias.name
+        for node in terminal_tree.body
+        if isinstance(node, ast.ImportFrom)
+        and node.level == 1
+        and node.module == "launch"
+        for alias in node.names
+    }
+    assert launch_imports == {
+        "LaunchCancellation",
+        "LaunchFailure",
+        "LaunchPhase",
+        "LaunchReason",
+        "OwnedFakeLaunchHandle",
+        "_FrameType",
+        "_HandleRecord",
+        "_ProcessIdentity",
+        "_capture_process_identity",
+        "_child_waitable",
+        "_claim_operation",
+        "_control_channel_state",
+        "_frame_bytes",
+        "_identity_matches",
+        "_process_matches_primary",
+        "_receive_frame",
+        "_record_for_handle",
+        "_registry_matches",
+        "_release_operation",
+        "_witness_state",
+    }
+
+    forbidden_modules = (
+        "core.coverage",
+        "core.llm",
+        "core.project",
+        "core.run",
+        "packages",
+    )
+    for node in ast.walk(terminal_tree):
+        imported: tuple[str, ...] = ()
+        if isinstance(node, ast.Import):
+            imported = tuple(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            imported = (node.module,)
+        assert not any(
+            module == forbidden or module.startswith(forbidden + ".")
+            for module in imported
+            for forbidden in forbidden_modules
+        )
+        if isinstance(node, ast.ImportFrom) and node.module == "os":
+            assert not {alias.name for alias in node.names}.intersection(
+                {"environ", "putenv"}
+            )
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "os"
+        ):
+            assert node.attr not in {"environ", "putenv"}
+
+    forbidden_names = (
+        "DEFAULT_PROFILE_DIRECTORY",
+        "SESSIONS_DIR",
+        "cancel_run",
+        "complete_run",
+        "fail_run",
+        "interrupt_run",
+        "ledger_record_finish",
+        "ledger_record_start",
+        "set_process_project",
+    )
+    for relative, source in (
+        (_TERMINAL_PATH, terminal_source),
+        (_RUNTIME_TERMINAL_PATH, helper_source),
+    ):
+        tree = ast.parse(source, filename=relative)
+        names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+        assert not names.intersection(forbidden_names)
+        for token in (
+            "_apply_owned_fake_terminal_lifecycle",
+            "_bind_owned_fake_terminal_run",
+            "_cleanup_owned_fake_terminal_lifecycle",
+            "_query_owned_fake_terminal_permit",
+            "_rearm_owned_fake_terminal_capability",
+            "_verify_owned_fake_terminal_permit",
+        ):
+            assert token not in source
+
+    assert (
+        _receipt_import_policy_violations(
+            _RUNTIME_TERMINAL_PATH,
+            helper_source,
+        )
+        == ()
+    )
+    assert "__all__: tuple[str, ...] = ()" in terminal_source
+    assert "_issue_owned_fake_terminal_capability" not in (
+        repository_root / "core/startup/runtime_receipt/__init__.py"
+    ).read_text(encoding="utf-8")
+    assert "runtime_receipt_terminal" not in (
+        repository_root / "core/testing/__init__.py"
+    ).read_text(encoding="utf-8")
 
 
 def test_extra_production_receipt_importer_is_forbidden() -> None:
