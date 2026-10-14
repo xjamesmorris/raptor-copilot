@@ -28,6 +28,52 @@ workloads; a stale session resets and retries as fresh.
 
 See [dependencies](dependencies.md) for SDK installation.
 
+### Copilot CLI synthetic probe boundary
+
+`core.llm.copilot_probe` currently implements **Level A synthetic validation
+only**. The public operation is plan construction, which is non-spawning and
+contains only prompt length/hash metadata. Explicit execution accepts only an
+opaque capability issued for the repository-owned generic fake CLI, rechecks
+the generated script and config bytes plus their inode identities, and runs
+once through `run_untrusted_networked(..., no_degrade=True)`.
+The capability is a trusted in-process fixture boundary, not a claim that
+Python objects isolate malicious code already running as the same UID.
+
+This is not a provider, launcher, model-selection route, SDK integration, or
+claim that real Copilot CLI inference works. There is no reachable
+operator-installed executable branch, and `allow_live=True` is refused.
+`RAPTOR_COPILOT_TRANSPORT_DISABLED` is checked at the single execution
+chokepoint before the synthetic canary environment or sandbox is created.
+Tests force the switch on by default; a fixture clears it only after verifying
+the owned fake capability.
+
+The parser provenance is pinned to schema-derived Copilot CLI `1.0.84-4`
+facts. A `1.0.84-5` static receipt profile is a separate evidence object, not
+an upgrade of this parser provenance, and is neither added nor consumed here.
+
+The synthetic command fixes the caller's model, effort, context tier, and
+session ID; sends the prompt only through stdin; requests JSON output; and
+disables auto-update, custom instructions, ask-user, remote export, built-in
+MCP, and broad tool/path/URL permissions. It uses a private fake home and
+state/cache/log/usage paths and never inherits ambient Copilot loader/cache,
+model, or GitHub-token variables.
+
+`record_only` stores bounded stdout/stderr as mode-0600 private evidence with
+hashes, an owner, and an expiry. That artifact is explicitly classified as
+prompt-bearing and potentially secret-bearing; it is not copied to public
+logs or result representations. Exact, base64, URL-safe-base64, and percent
+encoded synthetic-canary matches quarantine the artifact and block
+admission. This scan detects those encodings only; it is not a proof that
+every possible transformation is absent. `candidate_admission` never admits
+truncated output and preserves `candidate_complete_unevidenced` as a blocked
+candidate outcome. Candidate completion content remains caller-sensitive and
+is excluded from result reprs.
+
+Real record-only probes are a separately authorized Level B activity with
+B1-B4 initially unknown. Production/admission on real streams remains Level C
+and requires those proofs plus provider/route integration that does not exist
+in this change.
+
 ### Claude Code transport
 
 When no other provider is configured but the `claude` CLI is on PATH,
