@@ -619,6 +619,41 @@ class TestProjectManager(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.mgr.remove_run("myapp", "scan-20260406")
 
+    def test_t28_adopt_receipt_run_refuses_before_move_or_pin_rewrite(self):
+        from core.json import save_json
+        from core.run.metadata import RUN_RUNTIME_RECEIPT_KEY
+
+        project = self.mgr.create("myapp", self.target_code)
+        source = Path(self.tmpdir.name) / "scan-receipt"
+        source.mkdir()
+        save_json(
+            source / ".raptor-run.json",
+            {
+                "version": 2,
+                "command": "scan",
+                "status": "running",
+                "target_path": self.target_code,
+                "project": None,
+                "project_source": "session",
+                RUN_RUNTIME_RECEIPT_KEY: {},
+            },
+            mode=0o600,
+        )
+        before = (source / ".raptor-run.json").read_bytes()
+        with patch(
+            "core.run.metadata.write_run_pin",
+            side_effect=AssertionError(
+                "receipt adoption must refuse before pin rewrite"
+            ),
+        ):
+            self.assertEqual(
+                self.mgr.add_directory("myapp", str(source)),
+                0,
+            )
+        self.assertTrue(source.is_dir())
+        self.assertEqual((source / ".raptor-run.json").read_bytes(), before)
+        self.assertFalse((project.output_path / source.name).exists())
+
 
 if __name__ == "__main__":
     unittest.main()

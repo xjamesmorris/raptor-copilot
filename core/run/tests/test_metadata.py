@@ -74,6 +74,77 @@ def _age_run_tree(d, seconds=7200.0):
 
 class TestRunLifecycle(unittest.TestCase):
 
+    def test_legacy_start_golden_bytes_without_receipt(self):
+        import os
+        from datetime import datetime, timezone
+        from unittest.mock import patch
+
+        from core.json import dumps_artifact
+        from core.project.sessions import SessionHostV2CredentialState
+
+        fixed = datetime(2026, 9, 12, 19, 0, tzinfo=timezone.utc)
+
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed if tz is None else fixed.astimezone(tz)
+
+        with TemporaryDirectory() as d, (
+            patch(
+                "core.project.sessions.session_host_v2_credential_state",
+                return_value=SessionHostV2CredentialState.ABSENT,
+            )
+        ), patch("core.run.metadata._get_session_pid", return_value=None), patch(
+            "core.run.metadata.datetime",
+            FixedDateTime,
+        ), patch(
+            "core.run.provenance.build_start_manifest",
+            return_value={"provenance": "golden"},
+        ), patch(
+            "core.run.tmp_reaper.reap_stale_tmp",
+            return_value=None,
+        ), patch(
+            "core.run.tmp_reaper.reap_stale_logs",
+            return_value=None,
+        ), patch(
+            "core.run.tmp_reaper.reap_stale_runs",
+            return_value=[],
+        ), patch(
+            "core.run.pin.resolve_pin_for_start",
+            return_value=(None, "none"),
+        ), patch(
+            "core.run.pin.freeze_run_pin",
+            return_value=None,
+        ), patch(
+            "core.sandbox.summary.set_active_run_dir",
+            return_value=None,
+        ), patch(
+            "core.run.metadata._setup_checklist_symlink",
+            return_value=None,
+        ):
+            os.environ.pop("CLAUDECODE", None)
+            out = Path(d) / "run"
+            start_run(out, "scan", extra={"legacy": True}, target="/target")
+            expected = {
+                "version": 2,
+                "command": "scan",
+                "timestamp": fixed.isoformat(),
+                "status": "running",
+                "manifest": {"provenance": "golden"},
+                "extra": {"legacy": True},
+                "target_path": "/target",
+                "project": None,
+                "project_source": "none",
+            }
+            self.assertEqual(
+                (out / RUN_METADATA_FILE).read_bytes(),
+                (dumps_artifact(expected, indent=2) + "\n").encode("utf-8"),
+            )
+            self.assertNotIn(
+                "session_runtime_receipt",
+                (out / RUN_METADATA_FILE).read_text(encoding="utf-8"),
+            )
+
     def test_start_creates_metadata(self):
         with TemporaryDirectory() as d:
             out = Path(d) / "scan-20260406"
@@ -896,6 +967,59 @@ class TestCleanupAbandonedDeadSession(unittest.TestCase):
             self._cleanup(project, alive_pids=set())
             self.assertEqual(self._status(unowned), "running")
 
+    def test_t33_receipt_sibling_with_planted_pid_is_skipped_unchanged(self):
+        from core.json import save_json
+        from core.run import metadata as md
+        from unittest.mock import patch
+
+        with TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            siblings = []
+            for name, extra, top_level in (
+                ("receipt-sibling", {}, True),
+                (
+                    "receipt-extra-sibling",
+                    {md.RUN_RUNTIME_RECEIPT_KEY: {}},
+                    False,
+                ),
+            ):
+                sibling = project / name
+                sibling.mkdir()
+                metadata = {
+                    "version": 2,
+                    "command": "codeql",
+                    "timestamp": "2020-01-01T00:00:00+00:00",
+                    "status": "running",
+                    "session_pid": 40_004,
+                    "extra": extra,
+                }
+                if top_level:
+                    metadata[md.RUN_RUNTIME_RECEIPT_KEY] = {}
+                save_json(
+                    sibling / RUN_METADATA_FILE,
+                    metadata,
+                    mode=0o600,
+                )
+                siblings.append(
+                    (sibling, (sibling / RUN_METADATA_FILE).read_bytes())
+                )
+            with patch(
+                "core.run.metadata.fail_run",
+                side_effect=AssertionError(
+                    "receipt siblings must not reach legacy fail_run"
+                ),
+            ):
+                md._cleanup_abandoned(
+                    project,
+                    "scan",
+                    self.CURRENT_SESSION,
+                )
+            for sibling, before in siblings:
+                self.assertEqual(
+                    (sibling / RUN_METADATA_FILE).read_bytes(),
+                    before,
+                )
+
 
 class TestCleanupAbandonedLiveWorker(unittest.TestCase):
     """Worker-liveness gate on the same-session-retry branch of
@@ -1378,6 +1502,42 @@ class TestSessionIdentityStamp(unittest.TestCase):
             self.assertEqual(meta["session_boot_id"], "boot-x")
             self.assertEqual(meta["session_pidns"], "42")
 
+    def test_start_run_records_verified_host_claim(self):
+        import os
+        from unittest import mock
+
+        from core.project import sessions
+        from core.run.metadata import RUN_METADATA_FILE, start_run
+        from core.startup.host import Frontend, SessionHostClaim
+
+        claim = SessionHostClaim(
+            frontend=Frontend.COPILOT,
+            uid=os.geteuid(),
+            executable=Path("/opt/raptor-test/copilot"),
+            executable_device=10,
+            executable_inode=20,
+        )
+        with TemporaryDirectory() as d, \
+                mock.patch(
+                    "core.run.metadata._get_session_pid",
+                    return_value=12345,
+                ), \
+                mock.patch.object(sessions, "proc_starttime",
+                                  lambda _pid: "1234"), \
+                mock.patch.object(sessions, "boot_id",
+                                  lambda: "boot-x"), \
+                mock.patch.object(sessions, "pidns_id",
+                                  lambda: "42"), \
+                mock.patch.object(sessions, "session_host_claim",
+                                  lambda _pid: claim):
+            out = Path(d) / "run"
+            start_run(out, "scan")
+            meta = load_json(out / RUN_METADATA_FILE)
+            self.assertEqual(meta["session_host"], "copilot")
+            self.assertEqual(meta["session_host_uid"], os.geteuid())
+            self.assertEqual(meta["session_host_exe_dev"], 10)
+            self.assertEqual(meta["session_host_exe_ino"], 20)
+
     def test_stamp_mismatch_reads_dead(self):
         """Live claude process at the pid, WRONG starttime — a recycled
         pid; the owner is dead (closes forever-contention)."""
@@ -1606,6 +1766,21 @@ class TestSessionIdentityStamp(unittest.TestCase):
             resume_run,
             start_run,
         )
+        from core.startup.host import Frontend, SessionHostClaim
+        old_claim = SessionHostClaim(
+            frontend=Frontend.CLAUDE,
+            uid=1000,
+            executable=Path("/opt/old/claude"),
+            executable_device=10,
+            executable_inode=20,
+        )
+        new_claim = SessionHostClaim(
+            frontend=Frontend.COPILOT,
+            uid=1000,
+            executable=Path("/opt/new/copilot"),
+            executable_device=30,
+            executable_inode=40,
+        )
         with TemporaryDirectory() as d:
             out = Path(d) / "run"
             with mock.patch("core.run.metadata._get_session_pid",
@@ -1614,18 +1789,29 @@ class TestSessionIdentityStamp(unittest.TestCase):
                                       lambda pid: "old-start"), \
                     mock.patch.object(sessions, "boot_id", lambda: "b"), \
                     mock.patch.object(sessions, "pidns_id", lambda: "1"):
-                start_run(out, "scan")
+                with mock.patch.object(
+                    sessions, "session_host_claim",
+                    lambda _pid: old_claim,
+                ):
+                    start_run(out, "scan")
             fail_run(out, "interrupted for test", record_timing=False)
             with mock.patch("core.run.metadata._get_session_pid",
                             return_value=22222), \
                     mock.patch.object(sessions, "proc_starttime",
                                       lambda pid: "new-start"), \
                     mock.patch.object(sessions, "boot_id", lambda: "b"), \
-                    mock.patch.object(sessions, "pidns_id", lambda: "1"):
+                    mock.patch.object(sessions, "pidns_id", lambda: "1"), \
+                    mock.patch.object(
+                        sessions, "session_host_claim",
+                        lambda _pid: new_claim,
+                    ):
                 resume_run(out)
             meta = load_json(out / RUN_METADATA_FILE)
             self.assertEqual(meta["session_pid"], 22222)
             self.assertEqual(meta["session_start"], "new-start")
+            self.assertEqual(meta["session_host"], "copilot")
+            self.assertEqual(meta["session_host_exe_dev"], 30)
+            self.assertEqual(meta["session_host_exe_ino"], 40)
 
     def test_cleanup_abandoned_sweeps_recycled_claude_pid(self):
         """The dead-session branch fires on a stamped mismatch even when
@@ -1661,6 +1847,97 @@ class TestSessionIdentityStamp(unittest.TestCase):
                 md._cleanup_abandoned(Path(d), "scan", 44444)
             meta = load_json(out / RUN_METADATA_FILE)
             self.assertEqual(meta["status"], "failed")
+
+    def test_malformed_host_metadata_is_not_live(self):
+        import os
+
+        from core.run.metadata import _session_alive_for_meta
+
+        meta = self._stamped_meta(os.getpid())
+        meta["session_host"] = "copilot"
+        with self.assertLogs(
+            "core.run.metadata", level="WARNING"
+        ) as captured:
+            self.assertFalse(_session_alive_for_meta(meta))
+        self.assertIn(
+            "malformed session host claim",
+            "\n".join(captured.output),
+        )
+
+    def test_strong_host_metadata_requires_registry_corroboration(self):
+        import os
+        from unittest import mock
+
+        from core.project import sessions
+        from core.run.metadata import _session_alive_for_meta
+        from core.startup.host import Frontend, SessionHostClaim
+
+        claim = SessionHostClaim(
+            frontend=Frontend.COPILOT,
+            uid=os.geteuid(),
+            executable=Path("/opt/raptor-test/copilot"),
+            executable_device=10,
+            executable_inode=20,
+        )
+        meta = {
+            **self._stamped_meta(
+                12345,
+                start="same-start",
+                boot="same-boot",
+                pidns="same-ns",
+            ),
+            **claim.metadata_fields(),
+        }
+        with TemporaryDirectory() as d, \
+                mock.patch.object(
+                    sessions, "SESSIONS_DIR", Path(d) / "sessions.d"
+                ), \
+                mock.patch.object(sessions, "_pid_running",
+                                  lambda pid: pid == 12345), \
+                mock.patch.object(sessions, "proc_starttime",
+                                  lambda _pid: "same-start"), \
+                mock.patch.object(sessions, "boot_id",
+                                  lambda: "same-boot"), \
+                mock.patch.object(sessions, "pidns_id",
+                                  lambda: "same-ns"), \
+                mock.patch.object(sessions, "_comm",
+                                  lambda _pid: "copilot"), \
+                mock.patch.object(sessions, "_process_uid",
+                                  lambda _pid: os.geteuid()), \
+                mock.patch.object(
+                    sessions,
+                    "_process_executable_identity",
+                    lambda _pid: (10, 20),
+                ):
+            self.assertFalse(_session_alive_for_meta(meta))
+            sessions.SESSIONS_DIR.mkdir(parents=True)
+            entry = {
+                "v": "2",
+                "project": "-",
+                "since": "2026-09-11T00:00:00+00:00",
+                "starttime": "same-start",
+                "boot_id": "same-boot",
+                "pidns": "same-ns",
+                "token": "ab" * 16,
+                **claim.session_fields(),
+            }
+            (sessions.SESSIONS_DIR / "12345").write_text(
+                "".join(f"{key}={value}\n"
+                        for key, value in entry.items()),
+                encoding="utf-8",
+            )
+            self.assertTrue(_session_alive_for_meta(meta))
+            without_namespace = dict(meta)
+            without_namespace.pop("session_pidns")
+            self.assertFalse(_session_alive_for_meta(without_namespace))
+            entry["token"] = ""
+            (sessions.SESSIONS_DIR / "12345").write_text(
+                "".join(f"{key}={value}\n"
+                        for key, value in entry.items()),
+                encoding="utf-8",
+            )
+            self.assertFalse(_session_alive_for_meta(meta))
+
 
 
 class TestMetadataReadBudget(unittest.TestCase):
@@ -2378,3 +2655,214 @@ class ChecklistInheritanceTargetMatchTest(_ProjectRunCase):
             self.assertTrue((run / "checklist.json").is_symlink())
             meta = load_json(run / RUN_METADATA_FILE)
             self.assertEqual(meta["status"], "running")
+
+class TestStrongHostMetadataConditions(unittest.TestCase):
+    """A4: strong metadata never reaches the foreign-stamp fail-open
+    path without a valid registry claim and token-shaped witness."""
+
+    PID = 42430
+
+    def setUp(self):
+        from unittest import mock
+
+        from core.project import sessions
+
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.sessions_dir = Path(self._tmp.name) / "sessions.d"
+        patcher = mock.patch.object(
+            sessions, "SESSIONS_DIR", self.sessions_dir
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _claim(*, inode: int = 20):
+        import os
+
+        from core.startup.host import Frontend, SessionHostClaim
+
+        return SessionHostClaim(
+            frontend=Frontend.COPILOT,
+            uid=os.geteuid(),
+            executable=Path("/owned/copilot"),
+            executable_device=10,
+            executable_inode=inode,
+        )
+
+    def _metadata(self, claim=None):
+        claim = claim or self._claim()
+        return {
+            "session_pid": self.PID,
+            "session_start": "same-start",
+            "session_boot_id": "same-boot",
+            "session_pidns": "same-ns",
+            **claim.metadata_fields(),
+        }
+
+    def _entry(self, claim=None):
+        claim = claim or self._claim()
+        return {
+            "v": "2",
+            "project": "-",
+            "since": "2026-09-11T00:00:00+00:00",
+            "starttime": "same-start",
+            "boot_id": "same-boot",
+            "pidns": "same-ns",
+            "token": "ab" * 16,
+            **claim.session_fields(),
+        }
+
+    def _write_entry(self, fields):
+        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        path = self.sessions_dir / str(self.PID)
+        path.write_text(
+            "".join(f"{key}={value}\n" for key, value in fields.items()),
+            encoding="utf-8",
+        )
+        return path
+
+    def test_a4_malformed_registry_refuses_liveness_before_foreign(self):
+        from unittest import mock
+
+        from core.project import sessions
+        from core.run.metadata import _session_alive_for_meta
+
+        entry = self._entry()
+        entry.pop("host_exe_ino")
+        self._write_entry(entry)
+        with mock.patch.object(
+            sessions, "_foreign_entry", return_value=True
+        ) as foreign, self.assertLogs(
+            "core.run.metadata", level="WARNING"
+        ):
+            self.assertFalse(_session_alive_for_meta(self._metadata()))
+        foreign.assert_not_called()
+
+    def test_a4_claim_mismatch_refuses_liveness_before_foreign(self):
+        from unittest import mock
+
+        from core.project import sessions
+        from core.run.metadata import _session_alive_for_meta
+
+        self._write_entry(self._entry(self._claim(inode=21)))
+        with mock.patch.object(
+            sessions, "_foreign_entry", return_value=True
+        ) as foreign:
+            self.assertFalse(_session_alive_for_meta(self._metadata()))
+        foreign.assert_not_called()
+
+    def test_a4_missing_token_refuses_liveness_before_foreign(self):
+        from unittest import mock
+
+        from core.project import sessions
+        from core.run.metadata import _session_alive_for_meta
+
+        entry = self._entry()
+        entry.pop("token")
+        self._write_entry(entry)
+        with mock.patch.object(
+            sessions, "_foreign_entry", return_value=True
+        ) as foreign:
+            self.assertFalse(_session_alive_for_meta(self._metadata()))
+        foreign.assert_not_called()
+
+    def test_a4_bad_token_refuses_liveness_before_foreign(self):
+        from unittest import mock
+
+        from core.project import sessions
+        from core.run.metadata import _session_alive_for_meta
+
+        entry = self._entry()
+        entry["token"] = "not-hex"
+        self._write_entry(entry)
+        with mock.patch.object(
+            sessions, "_foreign_entry", return_value=True
+        ) as foreign:
+            self.assertFalse(_session_alive_for_meta(self._metadata()))
+        foreign.assert_not_called()
+
+    def test_a4_malformed_registry_refuses_owner_before_foreign(self):
+        from unittest import mock
+
+        from core.project import sessions
+        from core.run.metadata import _metadata_owned_by_session
+
+        entry = self._entry()
+        entry.pop("host_exe_ino")
+        self._write_entry(entry)
+        with mock.patch.object(
+            sessions, "_foreign_entry", return_value=True
+        ) as foreign, self.assertLogs(
+            "core.project.sessions", level="WARNING"
+        ):
+            self.assertFalse(
+                _metadata_owned_by_session(self._metadata(), self.PID)
+            )
+        foreign.assert_not_called()
+
+    def test_supplemental_a4_host_metadata_needs_complete_stamp(self):
+        from unittest import mock
+
+        from core.project import sessions
+        from core.run.metadata import _session_alive_for_meta
+
+        for missing in ("session_start", "session_boot_id"):
+            with self.subTest(missing=missing):
+                meta = self._metadata()
+                meta.pop(missing)
+                with mock.patch.object(
+                    sessions, "_foreign_entry", return_value=True
+                ) as foreign, self.assertLogs(
+                    "core.run.metadata", level="WARNING"
+                ):
+                    self.assertFalse(_session_alive_for_meta(meta))
+                foreign.assert_not_called()
+
+    def test_supplemental_a4_current_registry_identity_failure_denies_owner(
+        self,
+    ):
+        from unittest import mock
+
+        from core.project import sessions
+        from core.run.metadata import _metadata_owned_by_session
+
+        self._write_entry(self._entry())
+        with mock.patch.object(
+            sessions, "_identity_matches", return_value=False
+        ) as identity, mock.patch.object(
+            sessions, "_foreign_entry", return_value=True
+        ) as foreign:
+            self.assertFalse(
+                _metadata_owned_by_session(self._metadata(), self.PID)
+            )
+        identity.assert_called_once()
+        foreign.assert_not_called()
+
+    def test_supplemental_a4_strong_meta_rejects_legacy_and_other_claims(
+        self,
+    ):
+        from unittest import mock
+
+        from core.project import sessions
+        from core.run.metadata import _metadata_owned_by_session
+
+        legacy = self._entry()
+        for key in tuple(legacy):
+            if key == "host" or key.startswith("host_"):
+                legacy.pop(key)
+        different = self._entry(self._claim(inode=21))
+        for label, entry in (("legacy", legacy), ("different", different)):
+            with self.subTest(entry=label):
+                self._write_entry(entry)
+                with mock.patch.object(
+                    sessions, "_identity_matches", return_value=True
+                ), mock.patch.object(
+                    sessions, "_foreign_entry", return_value=True
+                ) as foreign:
+                    self.assertFalse(
+                        _metadata_owned_by_session(
+                            self._metadata(), self.PID
+                        )
+                    )
+                foreign.assert_not_called()

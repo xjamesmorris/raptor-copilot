@@ -16,6 +16,7 @@ from core.json import load_json, save_json
 from core.run.metadata import (
     RUN_METADATA_FILE, STATUS_RUNNING, STATUS_COMPLETED, STATUS_FAILED,
 )
+from core.startup.host import Frontend, SessionHostClaim
 
 REPO_ROOT = Path(__file__).resolve().parents[3]  # core/run/tests/ → raptor/
 HOOK_SCRIPT = REPO_ROOT / "libexec" / "raptor-lifecycle-hook"
@@ -472,6 +473,190 @@ class TestSessionEndHook(unittest.TestCase):
                 sys.argv = ["hook", "session-end"]
                 _hook_mod.main()
             self.assertEqual(_status(run), STATUS_RUNNING)
+
+    def test_stale_same_pid_host_record_cannot_finalize_run(self):
+        """PID equality alone cannot let a recycled/mutated host act."""
+        from core.project import sessions
+
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            sessions_dir = repo / "sessions.d"
+            claim = SessionHostClaim(
+                frontend=Frontend.COPILOT,
+                uid=os.geteuid(),
+                executable=repo / "copilot",
+                executable_device=10,
+                executable_inode=20,
+            )
+            with (
+                patch.object(sessions, "SESSIONS_DIR", sessions_dir),
+                patch.object(
+                    sessions,
+                    "_pid_running",
+                    lambda pid: pid == SESSION_PID,
+                ),
+                patch.object(
+                    sessions,
+                    "proc_starttime",
+                    lambda _pid: "new-start",
+                ),
+                patch.object(sessions, "boot_id", lambda: "same-boot"),
+                patch.object(sessions, "pidns_id", lambda: "same-ns"),
+                patch.object(sessions, "_comm", lambda _pid: "copilot"),
+                patch.object(
+                    sessions,
+                    "_process_uid",
+                    lambda _pid: os.geteuid(),
+                ),
+                patch.object(
+                    sessions,
+                    "_process_executable_identity",
+                    lambda _pid: (10, 20),
+                ),
+            ):
+                sessions_dir.mkdir(parents=True)
+                fields = {
+                    "v": "2",
+                    "project": "-",
+                    "since": "2026-09-11T00:00:00+00:00",
+                    "starttime": "new-start",
+                    "boot_id": "same-boot",
+                    "pidns": "same-ns",
+                    "token": "ab" * 16,
+                    **claim.session_fields(),
+                }
+                (sessions_dir / str(SESSION_PID)).write_text(
+                    "".join(
+                        f"{key}={value}\n" for key, value in fields.items()
+                    ),
+                    encoding="utf-8",
+                )
+                run = _make_running_run(
+                    repo / "out",
+                    "scan-001",
+                    "scan",
+                    tool_pid=1,
+                )
+                meta = load_json(run / RUN_METADATA_FILE)
+                meta.update(
+                    {
+                        "session_start": "old-start",
+                        "session_boot_id": "same-boot",
+                        "session_pidns": "same-ns",
+                        **claim.metadata_fields(),
+                    }
+                )
+                save_json(run / RUN_METADATA_FILE, meta)
+                with (
+                    patch.object(_hook_mod, "REPO_ROOT", repo),
+                    patch(
+                        "core.run.metadata._get_session_pid",
+                        return_value=SESSION_PID,
+                    ),
+                    patch("core.run.metadata._pid_alive", return_value=False),
+                ):
+                    sys.argv = ["hook", "session-end"]
+                    _hook_mod.main()
+                self.assertEqual(_status(run), STATUS_RUNNING)
+
+                meta["session_start"] = "new-start"
+                session_id = "aaaaaaaa-1111-2222-3333-444444444444"
+                meta["session_id"] = session_id
+                save_json(run / RUN_METADATA_FILE, meta)
+                with (
+                    patch.object(_hook_mod, "REPO_ROOT", repo),
+                    patch(
+                        "core.run.metadata._get_session_pid",
+                        return_value=SESSION_PID,
+                    ),
+                    patch("core.run.metadata._pid_alive", return_value=False),
+                    _stdin(
+                        json.dumps(
+                            {
+                                "session_id": session_id,
+                                "hook_event_name": "SessionEnd",
+                            }
+                        )
+                    ),
+                ):
+                    sys.argv = ["hook", "session-end"]
+                    _hook_mod.main()
+                self.assertEqual(_status(run), STATUS_FAILED)
+
+    def test_legacy_run_record_is_not_promoted_to_copilot_authority(self):
+        """Host-less metadata keeps Claude-only legacy strength."""
+        from core.project import sessions
+
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            sessions_dir = repo / "sessions.d"
+            claim = SessionHostClaim(
+                frontend=Frontend.COPILOT,
+                uid=os.geteuid(),
+                executable=repo / "copilot",
+                executable_device=10,
+                executable_inode=20,
+            )
+            with (
+                patch.object(sessions, "SESSIONS_DIR", sessions_dir),
+                patch.object(
+                    sessions,
+                    "_pid_running",
+                    lambda pid: pid == SESSION_PID,
+                ),
+                patch.object(
+                    sessions,
+                    "proc_starttime",
+                    lambda _pid: "same-start",
+                ),
+                patch.object(sessions, "boot_id", lambda: "same-boot"),
+                patch.object(sessions, "pidns_id", lambda: "same-ns"),
+                patch.object(sessions, "_comm", lambda _pid: "copilot"),
+                patch.object(
+                    sessions,
+                    "_process_uid",
+                    lambda _pid: os.geteuid(),
+                ),
+                patch.object(
+                    sessions,
+                    "_process_executable_identity",
+                    lambda _pid: (10, 20),
+                ),
+            ):
+                sessions_dir.mkdir(parents=True)
+                fields = {
+                    "v": "2",
+                    "project": "-",
+                    "since": "2026-09-11T00:00:00+00:00",
+                    "starttime": "same-start",
+                    "boot_id": "same-boot",
+                    "pidns": "same-ns",
+                    "token": "ab" * 16,
+                    **claim.session_fields(),
+                }
+                (sessions_dir / str(SESSION_PID)).write_text(
+                    "".join(
+                        f"{key}={value}\n" for key, value in fields.items()
+                    ),
+                    encoding="utf-8",
+                )
+                run = _make_running_run(
+                    repo / "out",
+                    "scan-legacy",
+                    "scan",
+                    tool_pid=1,
+                )
+                with (
+                    patch.object(_hook_mod, "REPO_ROOT", repo),
+                    patch(
+                        "core.run.metadata._get_session_pid",
+                        return_value=SESSION_PID,
+                    ),
+                    patch("core.run.metadata._pid_alive", return_value=False),
+                ):
+                    sys.argv = ["hook", "session-end"]
+                    _hook_mod.main()
+                self.assertEqual(_status(run), STATUS_RUNNING)
 
 
 class TestLLMOverride(unittest.TestCase):

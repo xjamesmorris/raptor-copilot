@@ -148,6 +148,13 @@ class LiveConflictScanTest(RunContentionBase):
         (d / RUN_METADATA_FILE).write_text("{not json", encoding="utf-8")
         self.assertIsNone(self._scan())
 
+    def test_malformed_host_claim_is_not_contention_authority(self):
+        sibling = self._write_sibling()
+        meta = load_json(sibling / RUN_METADATA_FILE)
+        meta["session_host"] = "copilot"  # partial strong claim
+        save_json(sibling / RUN_METADATA_FILE, meta)
+        self.assertIsNone(self._scan())
+
 
 class StartRunGateTest(RunContentionBase):
 
@@ -211,6 +218,68 @@ class StartRunGateTest(RunContentionBase):
         start_run(out, "agentic")  # must not raise
         meta = load_json(out / RUN_METADATA_FILE)
         self.assertEqual(meta["status"], "running")
+
+    def test_a11_reentrant_start_preserves_complete_host_owner_stamp(self):
+        from datetime import datetime, timezone
+
+        from core.startup.host import RUN_HOST_KEYS
+
+        out = self.project_out / "agentic_reentrant_host"
+        out.mkdir(parents=True)
+        prior_owner = {
+            "session_pid": OTHER_SESSION,
+            "tool_pid": 33333,
+            "session_start": "prior-start",
+            "session_boot_id": "prior-boot",
+            "session_pidns": "prior-ns",
+            "session_host_v": "1",
+            "session_host": "copilot",
+            "session_host_uid": 1000,
+            "session_host_exe": "/owned/copilot",
+            "session_host_exe_dev": 10,
+            "session_host_exe_ino": 20,
+        }
+        save_json(out / RUN_METADATA_FILE, {
+            "version": 2,
+            "command": "agentic",
+            "status": "running",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "project": "myapp",
+            "project_source": "session",
+            **prior_owner,
+        })
+        current_owner = {
+            "session_start": "current-start",
+            "session_boot_id": "current-boot",
+            "session_pidns": "current-ns",
+            "session_host_v": "1",
+            "session_host": "claude",
+            "session_host_uid": 2000,
+            "session_host_exe": "/owned/claude",
+            "session_host_exe_dev": 30,
+            "session_host_exe_ino": 40,
+        }
+        with patch(
+            "core.run.metadata._session_alive_for_meta",
+            return_value=True,
+        ), patch(
+            "core.run.metadata._session_stamp",
+            return_value=current_owner,
+        ), patch(
+            "core.run.pin.resolve_pin_for_start",
+            return_value=("myapp", "session"),
+        ):
+            start_run(out, "agentic")
+        meta = load_json(out / RUN_METADATA_FILE)
+        for key in (
+            "session_pid",
+            "tool_pid",
+            "session_start",
+            "session_boot_id",
+            "session_pidns",
+            *RUN_HOST_KEYS,
+        ):
+            self.assertEqual(meta[key], prior_owner[key], key)
 
     def test_wait_queues_until_holder_finishes(self):
         sibling = self._write_sibling()
