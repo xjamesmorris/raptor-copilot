@@ -4450,6 +4450,20 @@ def _ensure_receipt_transition_allowed(
         return
     _reject_reserved_mapping(strict.value.get("extra"), operation=operation)
     if not _metadata_allows_legacy_attribution(strict.value):
+        try:
+            from core.startup.runtime_receipt.terminal import (
+                _query_owned_fake_terminal_permit,
+            )
+
+            permitted = _query_owned_fake_terminal_permit(
+                path,
+                strict.value,
+                operation,
+            )
+        except Exception:  # noqa: BLE001 — private permit must fail closed
+            permitted = False
+        if permitted:
+            return
         raise _receipt_error(
             RunReceiptReason.TERMINAL_TRANSITION_FORBIDDEN,
             operation=operation,
@@ -5649,10 +5663,23 @@ def _update_status(output_dir: Path, status: str,
             raise ValueError(msg)  # noqa: TRY004
         _reject_reserved_mapping(metadata.get("extra"), operation="status")
         if not _metadata_allows_legacy_attribution(metadata):
-            raise _receipt_error(
-                RunReceiptReason.TERMINAL_TRANSITION_FORBIDDEN,
-                operation="status",
-            )
+            try:
+                from core.startup.runtime_receipt.terminal import (
+                    _verify_owned_fake_terminal_permit,
+                )
+
+                permitted = _verify_owned_fake_terminal_permit(
+                    path,
+                    metadata,
+                    status,
+                )
+            except Exception:  # noqa: BLE001 — private permit must fail closed
+                permitted = False
+            if not permitted:
+                raise _receipt_error(
+                    RunReceiptReason.TERMINAL_TRANSITION_FORBIDDEN,
+                    operation="status",
+                )
         current = metadata.get("status")
         incoming_marks = _heuristic_marks(extra)
         if current in _TERMINAL_STATUSES and incoming_marks:

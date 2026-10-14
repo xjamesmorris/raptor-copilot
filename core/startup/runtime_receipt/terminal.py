@@ -8,11 +8,14 @@ from __future__ import annotations
 
 import array
 import contextlib
+import contextvars
 import errno
 import fcntl
 import hashlib
 import hmac
+import json
 import os
+import re
 import select
 import secrets
 import socket
@@ -21,9 +24,11 @@ import struct
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 from types import MappingProxyType
-from typing import Literal, Mapping, NoReturn, Sequence
+from typing import Any, Literal, Mapping, NoReturn, Sequence
 
 from core.json.utils import dumps_canonical
 
@@ -64,6 +69,28 @@ _UCRED = struct.Struct("=iii")
 _INT = struct.Struct("=i")
 _ANCILLARY_BYTES = socket.CMSG_SPACE(_UCRED.size) + socket.CMSG_SPACE(_INT.size * 2)
 _POLL_QUANTUM_SECONDS = 0.05
+_TERMINAL_RUN_COMMAND = "owned-fake-terminal-proof"
+_TERMINAL_RESUME_NOTE = "owned-fake terminal proof resume"
+_TERMINAL_READ_MANIFEST = (
+    b"core/run/metadata.py\ncore/startup/runtime_receipt/terminal.py\n"
+)
+_TERMINAL_RUN_NAME_RE = re.compile(r"^terminal-k2-[0-9a-f]{32}$", re.ASCII)
+_TERMINAL_RUN_FILES = frozenset(
+    {
+        ".raptor-run.json",
+        ".raptor-run.json.lock",
+        ".reads-manifest",
+        "coverage-read.json",
+        "sandbox-summary.json",
+        "sandbox-triage.json",
+    }
+)
+_TERMINAL_STATUS_BY_EVENT = {
+    1: "completed",
+    2: "failed",
+    3: "interrupted",
+    4: "cancelled",
+}
 _SOCKET_EOF_ERRNOS = frozenset(
     {
         errno.ECONNABORTED,
@@ -82,6 +109,9 @@ class TerminalDisposition(str, Enum):
     TIMED_OUT = "timed_out"
     WAIT_CANCELLED = "wait_cancelled"
     STATE_CONFLICT = "state_conflict"
+    TRANSITION_FAILED = "transition_failed"
+    POSTCONDITION_FAILED = "postcondition_failed"
+    CLEANUP_FAILED = "cleanup_failed"
 
 
 class TerminalReason(str, Enum):
@@ -107,6 +137,19 @@ class TerminalReason(str, Enum):
     TERMINAL_EVENT_EOF = "terminal_event_eof"
     DEADLINE_EXCEEDED = "deadline_exceeded"
     WAIT_CANCELLED = "wait_cancelled"
+    RUN_ROOT_MISMATCH = "run_root_mismatch"
+    RUN_NOT_OWNED_TEMPORARY = "run_not_owned_temporary"
+    RUN_IDENTITY_CHANGED = "run_identity_changed"
+    METADATA_CHANGED = "metadata_changed"
+    STATUS_NOT_RUNNING = "status_not_running"
+    COMMAND_MISMATCH = "command_mismatch"
+    SNAPSHOT_MISMATCH = "snapshot_mismatch"
+    PROJECT_PIN_CHANGED = "project_pin_changed"
+    TERMINAL_TRANSITION_FORBIDDEN = "terminal_transition_forbidden"
+    TERMINAL_STATUS_CONFLICT = "terminal_status_conflict"
+    READ_MANIFEST_CONVERSION_FAILED = "read_manifest_conversion_failed"
+    RUN_CLEANUP_FAILED = "run_cleanup_failed"
+    LAUNCH_CLOSE_FAILED = "launch_close_failed"
 
 
 class TerminalPhase(str, Enum):
@@ -119,7 +162,10 @@ class TerminalPhase(str, Enum):
     WORK_STARTED = "work_started"
     WORK_DRAINED = "work_drained"
     READY = "ready"
+    METADATA_APPLIED = "metadata_applied"
+    EFFECTS_VERIFIED = "effects_verified"
     ACKED = "acked"
+    CLEANED = "cleaned"
     REFUSED = "refused"
 
 
@@ -163,6 +209,62 @@ class _ClaimState(str, Enum):
     CLAIMED = "claimed"
     APPLIED = "applied"
     REFUSED = "refused"
+
+
+@dataclass(frozen=True, slots=True)
+class _FilesystemIdentity:
+    device: int
+    inode: int
+    uid: int
+    mode: int
+    nlink: int
+    size: int
+
+
+@dataclass(frozen=True, slots=True)
+class _RunBinding:
+    runs_root: Path = field(repr=False)
+    runs_root_identity: _FilesystemIdentity
+    run_dir: Path = field(repr=False)
+    run_dir_identity: _FilesystemIdentity
+    metadata_identity: _FilesystemIdentity
+    metadata_raw_sha256: str
+    command: str
+    project_source: str
+    receipt_snapshot_sha256: str
+    lineage_sha256: str | None
+    segment: int
+    read_manifest_sha256: str
+
+
+@dataclass(slots=True)
+class _MetadataPermit:
+    capability_id: str
+    claim_nonce: str
+    issuer_pid: int
+    module_generation: str
+    thread_id: int
+    operation: str
+    expected_status: str
+    run_dir: Path = field(repr=False)
+    metadata_raw_sha256: str
+    receipt_snapshot_sha256: str
+    segment: int
+    outer_verified: bool = False
+    commit_verified: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _LifecycleApplied:
+    terminal_status: str
+    segment: int
+    before_metadata_sha256: str
+    after_metadata_sha256: str
+    read_record_sha256: str
+    metadata_identity: _FilesystemIdentity
+    read_manifest_identity: _FilesystemIdentity
+    read_record_identity: _FilesystemIdentity
+    effects: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,12 +335,82 @@ class OwnedFakeTerminalResult:
 
 
 @dataclass(frozen=True, slots=True, init=False, repr=False)
+class OwnedFakeTerminalLifecycleResult:
+    state: Literal["applied"]
+    event_kind: str
+    sequence_mode: str
+    terminal_status: str
+    segment: int
+    work_count: int
+    duplicate_count: int
+    event_digest_sha256: str
+    before_metadata_sha256: str
+    after_metadata_sha256: str
+    read_record_sha256: str
+    effects: tuple[str, ...]
+    trace: tuple[str, ...]
+    authoritative: Literal[False] = field(default=False, init=False)
+    _capability_id: str = field(repr=False)
+    _result_mac: str = field(repr=False)
+
+    def __init__(self) -> None:
+        raise TypeError("OwnedFakeTerminalLifecycleResult cannot be constructed")
+
+    def __repr__(self) -> str:
+        return (
+            "OwnedFakeTerminalLifecycleResult("
+            f"state={self.state!r}, event_kind={self.event_kind!r}, "
+            f"terminal_status={self.terminal_status!r}, segment={self.segment!r}, "
+            "authoritative=False)"
+        )
+
+    def __bool__(self) -> bool:
+        raise TypeError("owned fake terminal lifecycle results are not truth values")
+
+    def __reduce__(self) -> NoReturn:
+        raise TypeError("OwnedFakeTerminalLifecycleResult cannot be pickled")
+
+    def __init_subclass__(cls) -> None:
+        raise TypeError("OwnedFakeTerminalLifecycleResult cannot be subclassed")
+
+
+@dataclass(frozen=True, slots=True, init=False, repr=False)
+class OwnedFakeTerminalCleanupResult:
+    state: Literal["cleaned"]
+    run_removed: bool
+    receipt_removed: bool
+    trace: tuple[str, ...]
+    authoritative: Literal[False] = field(default=False, init=False)
+
+    def __init__(self) -> None:
+        raise TypeError("OwnedFakeTerminalCleanupResult cannot be constructed")
+
+    def __repr__(self) -> str:
+        return (
+            "OwnedFakeTerminalCleanupResult("
+            f"state={self.state!r}, run_removed={self.run_removed!r}, "
+            f"receipt_removed={self.receipt_removed!r}, authoritative=False)"
+        )
+
+    def __bool__(self) -> bool:
+        raise TypeError("owned fake terminal cleanup results are not truth values")
+
+    def __reduce__(self) -> NoReturn:
+        raise TypeError("OwnedFakeTerminalCleanupResult cannot be pickled")
+
+    def __init_subclass__(cls) -> None:
+        raise TypeError("OwnedFakeTerminalCleanupResult cannot be subclassed")
+
+
+@dataclass(frozen=True, slots=True, init=False, repr=False)
 class OwnedFakeTerminalFailure:
     disposition: TerminalDisposition
     reason_codes: tuple[TerminalReason, ...]
     phase: TerminalPhase
     diagnostics: Mapping[str, str]
     trace: tuple[str, ...]
+    completed_effects: tuple[str, ...]
+    terminal_status: str | None
     authoritative: Literal[False] = field(default=False, init=False)
 
     def __repr__(self) -> str:
@@ -270,6 +442,7 @@ class _TerminalRecord:
     handle: OwnedFakeLaunchHandle
     handle_id: str
     handle_mac: str
+    launch_record: _HandleRecord = field(repr=False)
     launch_record_id: int
     launch_capability_id: str
     launch_factory_nonce: str
@@ -292,7 +465,20 @@ class _TerminalRecord:
     state: _ClaimState = _ClaimState.ISSUED
     phase: TerminalPhase = TerminalPhase.ISSUED
     trace: list[str] = field(default_factory=lambda: [TerminalPhase.ISSUED.value])
-    cached: OwnedFakeTerminalResult | OwnedFakeTerminalFailure | None = None
+    run_binding: _RunBinding | None = None
+    active_permit: _MetadataPermit | None = None
+    lifecycle_applied: _LifecycleApplied | None = None
+    lifecycle_result: OwnedFakeTerminalLifecycleResult | None = None
+    rearmed: bool = False
+    cleanup_in_progress: bool = False
+    run_removed: bool = False
+    cleanup_cached: OwnedFakeTerminalCleanupResult | None = None
+    cached: (
+        OwnedFakeTerminalResult
+        | OwnedFakeTerminalLifecycleResult
+        | OwnedFakeTerminalFailure
+        | None
+    ) = None
 
 
 class _PacketError(Exception):
@@ -306,6 +492,10 @@ _MODULE_GENERATION = secrets.token_hex(16)
 _STATE_LOCK = threading.RLock()
 _CAPABILITIES: dict[str, _TerminalRecord] = {}
 _HANDLE_CAPABILITIES: dict[str, str] = {}
+_REARMING_HANDLES: set[str] = set()
+_ACTIVE_PERMIT: contextvars.ContextVar[_MetadataPermit | None] = contextvars.ContextVar(
+    "owned_fake_terminal_metadata_permit", default=None
+)
 
 
 def _bounded_diagnostics(values: Mapping[str, object] | None) -> Mapping[str, str]:
@@ -338,6 +528,8 @@ def _failure(
     phase: TerminalPhase,
     diagnostics: Mapping[str, object] | None = None,
     trace: Sequence[str] = (),
+    completed_effects: Sequence[str] = (),
+    terminal_status: str | None = None,
 ) -> OwnedFakeTerminalFailure:
     value = object.__new__(OwnedFakeTerminalFailure)
     object.__setattr__(value, "disposition", disposition)
@@ -345,6 +537,8 @@ def _failure(
     object.__setattr__(value, "phase", phase)
     object.__setattr__(value, "diagnostics", _bounded_diagnostics(diagnostics))
     object.__setattr__(value, "trace", tuple(trace))
+    object.__setattr__(value, "completed_effects", tuple(completed_effects))
+    object.__setattr__(value, "terminal_status", terminal_status)
     object.__setattr__(value, "authoritative", False)
     return value
 
@@ -376,6 +570,78 @@ def _new_result(
         "event_digest_sha256",
         hashlib.sha256(ready_frame).hexdigest(),
     )
+    object.__setattr__(value, "trace", tuple(record.trace))
+    object.__setattr__(value, "authoritative", False)
+    return value
+
+
+def _result_mac(record: _TerminalRecord, applied: _LifecycleApplied) -> str:
+    value = {
+        "schema": "raptor.owned_fake_terminal_lifecycle_result/v1",
+        "capability_id": record.capability_id,
+        "event": record.event.value,
+        "status": applied.terminal_status,
+        "segment": applied.segment,
+        "before": applied.before_metadata_sha256,
+        "after": applied.after_metadata_sha256,
+        "read": applied.read_record_sha256,
+        "effects": applied.effects,
+    }
+    return hmac.new(
+        _ISSUER_KEY,
+        dumps_canonical(value).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _new_lifecycle_result(
+    record: _TerminalRecord,
+    *,
+    duplicate_count: int,
+    ready_frame: bytes,
+    applied: _LifecycleApplied,
+) -> OwnedFakeTerminalLifecycleResult:
+    value = object.__new__(OwnedFakeTerminalLifecycleResult)
+    object.__setattr__(value, "state", "applied")
+    object.__setattr__(value, "event_kind", record.event.name.lower())
+    object.__setattr__(value, "sequence_mode", record.sequence.name.lower())
+    object.__setattr__(value, "terminal_status", applied.terminal_status)
+    object.__setattr__(value, "segment", applied.segment)
+    object.__setattr__(value, "work_count", record.work_count)
+    object.__setattr__(value, "duplicate_count", duplicate_count)
+    object.__setattr__(
+        value,
+        "event_digest_sha256",
+        hashlib.sha256(ready_frame).hexdigest(),
+    )
+    object.__setattr__(
+        value,
+        "before_metadata_sha256",
+        applied.before_metadata_sha256,
+    )
+    object.__setattr__(
+        value,
+        "after_metadata_sha256",
+        applied.after_metadata_sha256,
+    )
+    object.__setattr__(value, "read_record_sha256", applied.read_record_sha256)
+    object.__setattr__(value, "effects", applied.effects)
+    object.__setattr__(value, "trace", tuple(record.trace))
+    object.__setattr__(value, "_capability_id", record.capability_id)
+    object.__setattr__(value, "_result_mac", _result_mac(record, applied))
+    object.__setattr__(value, "authoritative", False)
+    return value
+
+
+def _new_cleanup_result(
+    record: _TerminalRecord,
+    *,
+    receipt_removed: bool,
+) -> OwnedFakeTerminalCleanupResult:
+    value = object.__new__(OwnedFakeTerminalCleanupResult)
+    object.__setattr__(value, "state", "cleaned")
+    object.__setattr__(value, "run_removed", True)
+    object.__setattr__(value, "receipt_removed", receipt_removed)
     object.__setattr__(value, "trace", tuple(record.trace))
     object.__setattr__(value, "authoritative", False)
     return value
@@ -447,6 +713,283 @@ def _receipt_digests(record: _HandleRecord) -> tuple[str, str]:
     )
 
 
+def _filesystem_identity(path: Path, *, directory: bool) -> _FilesystemIdentity:
+    value = path.lstat()
+    expected_type = stat.S_ISDIR if directory else stat.S_ISREG
+    if (
+        path.is_symlink()
+        or not expected_type(value.st_mode)
+        or value.st_uid != os.geteuid()
+        or (not directory and value.st_nlink != 1)
+        or stat.S_IMODE(value.st_mode) & 0o022
+    ):
+        raise ValueError("owned fake terminal filesystem identity is invalid")
+    if directory and stat.S_IMODE(value.st_mode) != 0o700:
+        raise ValueError("owned fake terminal directory mode is invalid")
+    return _FilesystemIdentity(
+        device=value.st_dev,
+        inode=value.st_ino,
+        uid=value.st_uid,
+        mode=stat.S_IMODE(value.st_mode),
+        nlink=value.st_nlink,
+        size=value.st_size,
+    )
+
+
+def _identity_unchanged(
+    path: Path,
+    expected: _FilesystemIdentity,
+    *,
+    directory: bool,
+) -> bool:
+    try:
+        value = path.lstat()
+    except OSError:
+        return False
+    return (
+        not path.is_symlink()
+        and value.st_dev == expected.device
+        and value.st_ino == expected.inode
+        and value.st_uid == expected.uid
+        and stat.S_IMODE(value.st_mode) == expected.mode
+        and value.st_nlink == expected.nlink
+        and (stat.S_ISDIR(value.st_mode) if directory else stat.S_ISREG(value.st_mode))
+    )
+
+
+def _same_directory_identity(
+    left: _FilesystemIdentity,
+    right: _FilesystemIdentity,
+) -> bool:
+    return (
+        left.device,
+        left.inode,
+        left.uid,
+        left.mode,
+    ) == (
+        right.device,
+        right.inode,
+        right.uid,
+        right.mode,
+    )
+
+
+def _read_bound_file(
+    path: Path,
+    *,
+    maximum: int,
+) -> tuple[bytes, _FilesystemIdentity]:
+    flags = os.O_RDONLY
+    for name in ("O_NONBLOCK", "O_NOFOLLOW", "O_CLOEXEC"):
+        value = getattr(os, name, None)
+        if type(value) is not int:
+            raise ValueError("required file primitive is unavailable")
+        flags |= value
+    fd = os.open(path, flags)
+    try:
+        before = os.fstat(fd)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) & 0o022
+            or before.st_size > maximum
+        ):
+            raise ValueError("owned fake terminal file policy failed")
+        chunks: list[bytes] = []
+        remaining = maximum + 1
+        while remaining:
+            chunk = os.read(fd, min(65_536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        after = os.fstat(fd)
+        current = path.lstat()
+    finally:
+        os.close(fd)
+    if (
+        len(raw) > maximum
+        or len(raw) != before.st_size
+        or (
+            before.st_dev,
+            before.st_ino,
+            before.st_uid,
+            before.st_gid,
+            before.st_mode,
+            before.st_nlink,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        != (
+            after.st_dev,
+            after.st_ino,
+            after.st_uid,
+            after.st_gid,
+            after.st_mode,
+            after.st_nlink,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        or (current.st_dev, current.st_ino) != (after.st_dev, after.st_ino)
+    ):
+        raise ValueError("owned fake terminal file identity changed")
+    return raw, _FilesystemIdentity(
+        device=after.st_dev,
+        inode=after.st_ino,
+        uid=after.st_uid,
+        mode=stat.S_IMODE(after.st_mode),
+        nlink=after.st_nlink,
+        size=after.st_size,
+    )
+
+
+def _run_segment(parsed: Any) -> int:
+    lineage = parsed.lineage
+    if lineage is None:
+        return 1
+    if not lineage.entries:
+        raise ValueError("owned fake terminal lineage is empty")
+    return int(lineage.entries[-1].segment)
+
+
+def _load_run_binding(
+    launch_record: _HandleRecord,
+    run_dir: Path,
+) -> _RunBinding:
+    from core.run.metadata import (
+        MAX_RUN_METADATA_BYTES,
+        RUN_METADATA_FILE,
+        RUN_RUNTIME_RECEIPT_KEY,
+        STATUS_RUNNING,
+        _parse_receipt_metadata,
+        _strict_load_run_metadata,
+    )
+    from .plumbing_types import serialize_snapshot
+
+    runs_root = launch_record.capability.bundle_root / "runs"
+    if run_dir.parent != runs_root or not _TERMINAL_RUN_NAME_RE.fullmatch(run_dir.name):
+        raise ValueError("owned fake terminal run is outside its root")
+    runs_identity = _filesystem_identity(runs_root, directory=True)
+    run_identity = _filesystem_identity(run_dir, directory=True)
+    strict = _strict_load_run_metadata(
+        run_dir / RUN_METADATA_FILE,
+        operation="terminal_bind",
+        missing_ok=False,
+    )
+    if strict is None:
+        raise ValueError("owned fake terminal metadata is missing")
+    parsed = _parse_receipt_metadata(strict, operation="terminal_bind")
+    if parsed.snapshot is None:
+        raise ValueError("owned fake terminal receipt snapshot is missing")
+    metadata = strict.value
+    if (
+        metadata.get("status") != STATUS_RUNNING
+        or metadata.get("command") != _TERMINAL_RUN_COMMAND
+        or metadata.get("project") is not None
+        or metadata.get("project_source") not in {"session", "argv"}
+        or any(
+            key in metadata
+            for key in (
+                "session_pid",
+                "tool_pid",
+                "session_start",
+                "session_boot_id",
+                "session_pidns",
+            )
+        )
+        or any(str(key).startswith("session_host") for key in metadata)
+        or RUN_RUNTIME_RECEIPT_KEY not in metadata
+    ):
+        raise ValueError("owned fake terminal run metadata is not eligible")
+    current = launch_record.current_receipt
+    if not isinstance(current, VerifiedReceiptIssued) or not hmac.compare_digest(
+        parsed.snapshot.canonical,
+        serialize_snapshot(current.snapshot),
+    ):
+        raise ValueError("owned fake terminal receipt snapshot changed")
+    metadata_raw, metadata_identity = _read_bound_file(
+        run_dir / RUN_METADATA_FILE,
+        maximum=MAX_RUN_METADATA_BYTES,
+    )
+    if not hmac.compare_digest(metadata_raw, strict.raw):
+        raise ValueError("owned fake terminal metadata changed")
+    manifest_raw, _manifest_identity = _read_bound_file(
+        run_dir / ".reads-manifest",
+        maximum=len(_TERMINAL_READ_MANIFEST),
+    )
+    if not hmac.compare_digest(manifest_raw, _TERMINAL_READ_MANIFEST):
+        raise ValueError("owned fake terminal read manifest changed")
+    lineage_sha256 = (
+        None
+        if parsed.lineage is None
+        else hashlib.sha256(parsed.lineage.canonical).hexdigest()
+    )
+    return _RunBinding(
+        runs_root=runs_root,
+        runs_root_identity=runs_identity,
+        run_dir=run_dir,
+        run_dir_identity=run_identity,
+        metadata_identity=metadata_identity,
+        metadata_raw_sha256=hashlib.sha256(metadata_raw).hexdigest(),
+        command=_TERMINAL_RUN_COMMAND,
+        project_source=str(metadata["project_source"]),
+        receipt_snapshot_sha256=hashlib.sha256(parsed.snapshot.canonical).hexdigest(),
+        lineage_sha256=lineage_sha256,
+        segment=_run_segment(parsed),
+        read_manifest_sha256=hashlib.sha256(manifest_raw).hexdigest(),
+    )
+
+
+def _directory_binding_value(
+    identity: _FilesystemIdentity,
+    *,
+    name: str | None = None,
+) -> dict[str, object]:
+    value: dict[str, object] = {
+        "device": identity.device,
+        "inode": identity.inode,
+        "uid": identity.uid,
+        "mode": identity.mode,
+    }
+    if name is not None:
+        value["name"] = name
+    return value
+
+
+def _metadata_binding_value(binding: _RunBinding) -> dict[str, object]:
+    value: dict[str, object] = {
+        "device": binding.metadata_identity.device,
+        "inode": binding.metadata_identity.inode,
+        "uid": binding.metadata_identity.uid,
+        "mode": binding.metadata_identity.mode,
+        "nlink": binding.metadata_identity.nlink,
+        "size": binding.metadata_identity.size,
+        "sha256": binding.metadata_raw_sha256,
+        "command": binding.command,
+        "project_source": binding.project_source,
+    }
+    value["receipt_snapshot_sha256"] = binding.receipt_snapshot_sha256
+    value["lineage_sha256"] = binding.lineage_sha256
+    value["segment"] = binding.segment
+    return value
+
+
+def _run_binding_value(binding: _RunBinding) -> dict[str, object]:
+    return {
+        "root": _directory_binding_value(binding.runs_root_identity),
+        "run": _directory_binding_value(
+            binding.run_dir_identity,
+            name=binding.run_dir.name,
+        ),
+        "metadata": _metadata_binding_value(binding),
+        "read_manifest_sha256": binding.read_manifest_sha256,
+    }
+
+
 def _binding_bytes(
     record: _HandleRecord,
     *,
@@ -457,6 +1000,7 @@ def _binding_bytes(
     event_nonce: bytes,
     parent_socket_identity: _SocketIdentity,
     child_socket_identity: _SocketIdentity,
+    run_binding: _RunBinding | None = None,
 ) -> bytes:
     current = record.current_receipt
     if not isinstance(current, VerifiedReceiptIssued):
@@ -547,6 +1091,7 @@ def _binding_bytes(
             "work_count": work_count,
             "nonce": event_nonce.hex(),
         },
+        "run": None if run_binding is None else _run_binding_value(run_binding),
     }
     return dumps_canonical(value).encode("utf-8")
 
@@ -575,14 +1120,17 @@ def _after_fork_child() -> None:
     global _HANDLE_CAPABILITIES
     global _ISSUER_KEY
     global _MODULE_GENERATION
+    global _REARMING_HANDLES
     global _STATE_LOCK
 
     records = tuple(_CAPABILITIES.values())
     _CAPABILITIES = {}
     _HANDLE_CAPABILITIES = {}
+    _REARMING_HANDLES = set()
     _ISSUER_KEY = secrets.token_bytes(32)
     _MODULE_GENERATION = secrets.token_hex(16)
     _STATE_LOCK = threading.RLock()
+    _ACTIVE_PERMIT.set(None)
     for record in records:
         _close_sockets(record)
 
@@ -599,12 +1147,13 @@ def _launch_failure_reason(failure: LaunchFailure) -> TerminalReason:
     return TerminalReason.LAUNCH_NOT_SUPERVISED
 
 
-def _issue_owned_fake_terminal_capability(
+def _issue_owned_fake_terminal_capability_impl(
     handle: object,
     *,
     event_code: int,
     sequence_code: int,
     work_count: int,
+    rearm_record: _TerminalRecord | None,
 ) -> OwnedFakeTerminalCapability | OwnedFakeTerminalFailure:
     if (
         type(event_code) is not int
@@ -661,6 +1210,17 @@ def _issue_owned_fake_terminal_capability(
             return _failure(
                 TerminalDisposition.INVALID_REQUEST,
                 TerminalReason.INVALID_CAPABILITY,
+                phase=TerminalPhase.NEW,
+            )
+        if found.handle_id in _REARMING_HANDLES and (
+            rearm_record is None
+            or rearm_record.handle_id != found.handle_id
+            or rearm_record.state is not _ClaimState.APPLIED
+            or not rearm_record.rearmed
+        ):
+            return _failure(
+                TerminalDisposition.STATE_CONFLICT,
+                TerminalReason.CAPABILITY_REUSED,
                 phase=TerminalPhase.NEW,
             )
         if found.handle_id in _HANDLE_CAPABILITIES:
@@ -772,6 +1332,7 @@ def _issue_owned_fake_terminal_capability(
                 handle=handle,
                 handle_id=handle._handle_id,
                 handle_mac=handle._handle_mac,
+                launch_record=launch_record,
                 launch_record_id=id(launch_record),
                 launch_capability_id=launch_record.capability.capability_id,
                 launch_factory_nonce=launch_record.capability.factory_nonce,
@@ -814,6 +1375,154 @@ def _issue_owned_fake_terminal_capability(
                         with contextlib.suppress(OSError):
                             pending_channel.close()
             _release_operation(launch_record)
+
+
+def _issue_owned_fake_terminal_capability(
+    handle: object,
+    *,
+    event_code: int,
+    sequence_code: int,
+    work_count: int,
+) -> OwnedFakeTerminalCapability | OwnedFakeTerminalFailure:
+    return _issue_owned_fake_terminal_capability_impl(
+        handle,
+        event_code=event_code,
+        sequence_code=sequence_code,
+        work_count=work_count,
+        rearm_record=None,
+    )
+
+
+def _owned_fake_terminal_runs_root(
+    handle: object,
+) -> Path | OwnedFakeTerminalFailure:
+    with _STATE_LOCK:
+        found = _record_for_handle(handle)
+        if (
+            isinstance(found, LaunchFailure)
+            or type(handle) is not OwnedFakeLaunchHandle
+        ):
+            return _failure(
+                TerminalDisposition.INVALID_REQUEST,
+                TerminalReason.INVALID_CAPABILITY,
+                phase=TerminalPhase.NEW,
+            )
+        if (
+            found.close_result is not None
+            or found.failure_result is not None
+            or found.operation is not None
+            or found.phase is not LaunchPhase.SUPERVISED
+            or found.verified_result is None
+            or not isinstance(found.current_receipt, VerifiedReceiptIssued)
+        ):
+            return _failure(
+                TerminalDisposition.STATE_CONFLICT,
+                TerminalReason.LAUNCH_NOT_SUPERVISED,
+                phase=TerminalPhase.NEW,
+            )
+        if not _registry_matches(found.capability):
+            return _failure(
+                TerminalDisposition.BINDING_FAILED,
+                TerminalReason.REGISTRY_ROOT_MISMATCH,
+                phase=TerminalPhase.NEW,
+            )
+        runs_root = found.capability.bundle_root / "runs"
+        try:
+            _filesystem_identity(runs_root, directory=True)
+            entries = tuple(runs_root.iterdir())
+        except OSError:
+            return _failure(
+                TerminalDisposition.BINDING_FAILED,
+                TerminalReason.RUN_ROOT_MISMATCH,
+                phase=TerminalPhase.NEW,
+            )
+        if entries:
+            return _failure(
+                TerminalDisposition.STATE_CONFLICT,
+                TerminalReason.RUN_NOT_OWNED_TEMPORARY,
+                phase=TerminalPhase.NEW,
+            )
+        return runs_root
+
+
+def _bind_owned_fake_terminal_run(
+    capability: object,
+) -> OwnedFakeTerminalCapability | OwnedFakeTerminalFailure:
+    with _STATE_LOCK:
+        found = _record_for_capability(capability)
+        if isinstance(found, OwnedFakeTerminalFailure):
+            return found
+        record = found
+        if record.state is not _ClaimState.ISSUED or record.run_binding is not None:
+            return _failure(
+                TerminalDisposition.STATE_CONFLICT,
+                TerminalReason.CAPABILITY_REUSED,
+                phase=record.phase,
+                trace=record.trace,
+            )
+        launch_record = _record_for_handle(record.handle)
+        if isinstance(launch_record, LaunchFailure):
+            return _failure(
+                TerminalDisposition.BINDING_FAILED,
+                TerminalReason.INVALID_CAPABILITY,
+                phase=record.phase,
+                trace=record.trace,
+            )
+        runs_root = launch_record.capability.bundle_root / "runs"
+        try:
+            entries = tuple(runs_root.iterdir())
+            if len(entries) != 1 or not entries[0].is_dir():
+                raise ValueError("owned fake terminal run root is not singular")
+            binding = _load_run_binding(launch_record, entries[0])
+            parent_socket = record.parent_socket
+            child_socket = record.child_socket
+            if parent_socket is None or child_socket is None:
+                raise ValueError("owned fake terminal sockets are unavailable")
+            binding_bytes = _binding_bytes(
+                launch_record,
+                handle=record.handle,
+                event=record.event,
+                sequence=record.sequence,
+                work_count=record.work_count,
+                event_nonce=record.event_nonce,
+                parent_socket_identity=_socket_identity(
+                    parent_socket,
+                    require_passcred=True,
+                ),
+                child_socket_identity=_socket_identity(
+                    child_socket,
+                    require_passcred=False,
+                ),
+                run_binding=binding,
+            )
+        except (OSError, TypeError, UnicodeError, ValueError):
+            record.state = _ClaimState.REFUSED
+            record.phase = TerminalPhase.REFUSED
+            record.trace.append(TerminalPhase.REFUSED.value)
+            failure = _failure(
+                TerminalDisposition.BINDING_FAILED,
+                TerminalReason.RUN_NOT_OWNED_TEMPORARY,
+                phase=record.phase,
+                trace=record.trace,
+            )
+            record.cached = failure
+            _close_sockets(record)
+            return failure
+        record.run_binding = binding
+        record.binding_bytes = binding_bytes
+        record.capability_mac = _capability_mac(
+            record.capability_id,
+            binding_bytes,
+        )
+        bound_capability = record.capability_object
+        assert isinstance(bound_capability, OwnedFakeTerminalCapability)
+        assert bound_capability is capability
+        object.__setattr__(
+            bound_capability,
+            "_capability_mac",
+            record.capability_mac,
+        )
+        return bound_capability
 
 
 def _record_for_capability(
@@ -883,6 +1592,7 @@ def _initial_binding_matches(
                 require_passcred=True,
             ),
             child_socket_identity=child_identity,
+            run_binding=record.run_binding,
         )
     except (OSError, UnicodeError, ValueError):
         return False
@@ -984,6 +1694,168 @@ def _validate_live_binding(
     ):
         return TerminalReason.PROCESS_BINDING_CHANGED
     return None
+
+
+def _metadata_segment_value(metadata: Mapping[str, object]) -> int | None:
+    lineage = metadata.get("session_runtime_receipt_lineage")
+    if lineage is None:
+        return 1
+    if not isinstance(lineage, dict):
+        return None
+    entries = lineage.get("entries")
+    if not isinstance(entries, list) or not entries:
+        return None
+    final = entries[-1]
+    if not isinstance(final, dict):
+        return None
+    segment = final.get("segment")
+    if type(segment) is not int or segment < 2:
+        return None
+    return segment
+
+
+def _metadata_snapshot_sha256(metadata: Mapping[str, object]) -> str | None:
+    snapshot = metadata.get("session_runtime_receipt")
+    if not isinstance(snapshot, dict):
+        return None
+    try:
+        raw = dumps_canonical(snapshot).encode("utf-8")
+    except (TypeError, UnicodeError, ValueError, RecursionError):
+        return None
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _permit_record(
+    permit: object,
+) -> tuple[_MetadataPermit, _TerminalRecord] | None:
+    if type(permit) is not _MetadataPermit:
+        return None
+    if (
+        permit.issuer_pid != os.getpid()
+        or permit.module_generation != _MODULE_GENERATION
+        or permit.thread_id != threading.get_ident()
+        or not permit.claim_nonce
+    ):
+        return None
+    record = _CAPABILITIES.get(permit.capability_id)
+    if (
+        record is None
+        or record.state is not _ClaimState.CLAIMED
+        or record.active_permit is not permit
+        or record.run_binding is None
+    ):
+        return None
+    return permit, record
+
+
+def _permit_metadata_matches(
+    permit: _MetadataPermit,
+    record: _TerminalRecord,
+    path: Path,
+    metadata: Mapping[str, object],
+) -> bool:
+    binding = record.run_binding
+    if binding is None or Path(path) != binding.run_dir / ".raptor-run.json":
+        return False
+    if not isinstance(metadata, dict):
+        return False
+    try:
+        raw, identity = _read_bound_file(path, maximum=1_048_576)
+        parsed = json.loads(raw)
+    except (OSError, TypeError, UnicodeError, ValueError, RecursionError):
+        return False
+    if (
+        not isinstance(parsed, dict)
+        or parsed != metadata
+        or not hmac.compare_digest(
+            hashlib.sha256(raw).hexdigest(),
+            permit.metadata_raw_sha256,
+        )
+        or identity != binding.metadata_identity
+        or metadata.get("status") != "running"
+        or metadata.get("command") != binding.command
+        or metadata.get("project") is not None
+        or metadata.get("project_source") != binding.project_source
+        or _metadata_segment_value(metadata) != permit.segment
+        or _metadata_snapshot_sha256(metadata) != permit.receipt_snapshot_sha256
+    ):
+        return False
+    return _validate_live_binding(record, record.launch_record) is None
+
+
+def _query_owned_fake_terminal_permit(
+    path: Path,
+    metadata: Mapping[str, object],
+    operation: str,
+) -> bool:
+    permit = _ACTIVE_PERMIT.get()
+    found = _permit_record(permit)
+    if found is None:
+        return False
+    active, record = found
+    if (
+        operation != active.operation
+        or active.outer_verified
+        or active.commit_verified
+        or not _permit_metadata_matches(active, record, Path(path), metadata)
+    ):
+        return False
+    active.outer_verified = True
+    return True
+
+
+def _metadata_lock_entry_valid(
+    path: Path | str,
+    *,
+    dir_fd: int | None = None,
+) -> bool:
+    from core.run.metadata import _metadata_lock_fd_valid
+
+    flags = os.O_RDONLY
+    for name in ("O_NONBLOCK", "O_NOFOLLOW", "O_CLOEXEC"):
+        value = getattr(os, name, None)
+        if type(value) is not int:
+            return False
+        flags |= value
+    fd = -1
+    try:
+        fd = os.open(path, flags, dir_fd=dir_fd)
+        held = os.fstat(fd)
+        current = os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
+        return (
+            current.st_dev == held.st_dev
+            and current.st_ino == held.st_ino
+            and _metadata_lock_fd_valid(fd, held)
+        )
+    except OSError:
+        return False
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _verify_owned_fake_terminal_permit(
+    path: Path,
+    metadata: Mapping[str, object],
+    status: str,
+) -> bool:
+    permit = _ACTIVE_PERMIT.get()
+    found = _permit_record(permit)
+    if found is None:
+        return False
+    active, record = found
+    if (
+        not active.outer_verified
+        or active.commit_verified
+        or status != active.expected_status
+        or not _permit_metadata_matches(active, record, Path(path), metadata)
+    ):
+        return False
+    lock_path = Path(path).with_suffix(Path(path).suffix + ".lock")
+    if not _metadata_lock_entry_valid(lock_path):
+        return False
+    active.commit_verified = True
+    return True
 
 
 def _set_phase(record: _TerminalRecord, phase: TerminalPhase) -> None:
@@ -1485,13 +2357,387 @@ def _failure_for_reason(
     )
 
 
+def _terminal_lifecycle_hook(stage: str, capability_id: str) -> None:
+    """Deterministic test seam around the fake-only lifecycle effect."""
+
+
+def _bound_run_reason(record: _TerminalRecord) -> TerminalReason | None:
+    binding = record.run_binding
+    if binding is None:
+        return TerminalReason.RUN_NOT_OWNED_TEMPORARY
+    if (
+        binding.run_dir.parent != binding.runs_root
+        or not _TERMINAL_RUN_NAME_RE.fullmatch(binding.run_dir.name)
+        or not _identity_unchanged(
+            binding.runs_root,
+            binding.runs_root_identity,
+            directory=True,
+        )
+    ):
+        return TerminalReason.RUN_ROOT_MISMATCH
+    if not _identity_unchanged(
+        binding.run_dir,
+        binding.run_dir_identity,
+        directory=True,
+    ):
+        return TerminalReason.RUN_IDENTITY_CHANGED
+    metadata_path = binding.run_dir / ".raptor-run.json"
+    try:
+        raw, identity = _read_bound_file(metadata_path, maximum=1_048_576)
+        metadata = json.loads(raw)
+    except (OSError, TypeError, UnicodeError, ValueError, RecursionError):
+        return TerminalReason.METADATA_CHANGED
+    if not isinstance(metadata, dict):
+        return TerminalReason.METADATA_CHANGED
+    if metadata.get("status") != "running":
+        return TerminalReason.STATUS_NOT_RUNNING
+    if metadata.get("command") != binding.command:
+        return TerminalReason.COMMAND_MISMATCH
+    if (
+        metadata.get("project") is not None
+        or metadata.get("project_source") != binding.project_source
+    ):
+        return TerminalReason.PROJECT_PIN_CHANGED
+    if (
+        _metadata_snapshot_sha256(metadata) != binding.receipt_snapshot_sha256
+        or _metadata_segment_value(metadata) != binding.segment
+    ):
+        return TerminalReason.SNAPSHOT_MISMATCH
+    if identity != binding.metadata_identity or not hmac.compare_digest(
+        hashlib.sha256(raw).hexdigest(),
+        binding.metadata_raw_sha256,
+    ):
+        return TerminalReason.METADATA_CHANGED
+    try:
+        current = _load_run_binding(record.launch_record, binding.run_dir)
+    except (OSError, TypeError, UnicodeError, ValueError):
+        return TerminalReason.METADATA_CHANGED
+    if current != binding:
+        return TerminalReason.METADATA_CHANGED
+    return None
+
+
+def _capture_bound_receipt(record: _TerminalRecord):
+    from core.project.sessions import (
+        SessionRuntimeReceiptCapture,
+        capture_current_session_runtime_receipt,
+    )
+    from core.startup.runtime_receipt.profile import ProfileStore
+    from .plumbing_types import serialize_snapshot
+
+    capture = capture_current_session_runtime_receipt(
+        profiles=ProfileStore((record.launch_record.capability.profile,)),
+        now=datetime.now(timezone.utc),
+    )
+    binding = record.run_binding
+    current = record.launch_record.current_receipt
+    if (
+        type(capture) is not SessionRuntimeReceiptCapture
+        or binding is None
+        or not isinstance(current, VerifiedReceiptIssued)
+        or capture.reference != current.reference
+        or not hmac.compare_digest(
+            hashlib.sha256(serialize_snapshot(capture.snapshot)).hexdigest(),
+            binding.receipt_snapshot_sha256,
+        )
+    ):
+        return None
+    return capture
+
+
+def _invoke_lifecycle_wrapper(record: _TerminalRecord) -> None:
+    from core.run.metadata import (
+        cancel_run,
+        complete_run,
+        fail_run,
+        interrupt_run,
+    )
+
+    binding = record.run_binding
+    if binding is None:
+        raise ValueError("owned fake terminal run is not bound")
+    run_dir = binding.run_dir
+    if record.event is _TerminalEvent.COMPLETE:
+        complete_run(
+            run_dir,
+            extra=None,
+            expected_command=_TERMINAL_RUN_COMMAND,
+        )
+    elif record.event is _TerminalEvent.FAIL:
+        fail_run(
+            run_dir,
+            error="owned_fake_terminal_failure",
+            extra={},
+            expected_command=_TERMINAL_RUN_COMMAND,
+        )
+    elif record.event is _TerminalEvent.CANCEL:
+        cancel_run(
+            run_dir,
+            extra={"cancel_reason": "owned_fake_terminal_cancel"},
+            expected_command=_TERMINAL_RUN_COMMAND,
+        )
+    else:
+        interrupt_run(
+            run_dir,
+            reason="owned_fake_terminal_interrupt",
+            expected_command=_TERMINAL_RUN_COMMAND,
+        )
+
+
+def _effect_names(event: _TerminalEvent) -> tuple[str, ...]:
+    common = (
+        "sandbox_summary",
+        "sandbox_triage",
+        "metadata_status",
+        "read_manifest_conversion",
+    )
+    if event is _TerminalEvent.COMPLETE:
+        return (
+            "complete_run",
+            *common,
+            "standard_provenance",
+            "journal_merge",
+            "finding_stamp",
+            "coverage_snapshot",
+        )
+    if event is _TerminalEvent.FAIL:
+        return ("fail_run", *common)
+    if event is _TerminalEvent.CANCEL:
+        return ("cancel_run", *common)
+    return ("interrupt_run", *common, "journal_merge")
+
+
+def _canonical_read_record(
+    run_dir: Path,
+) -> tuple[str, _FilesystemIdentity] | None:
+    try:
+        raw, identity = _read_bound_file(
+            run_dir / "coverage-read.json",
+            maximum=1_048_576,
+        )
+        value = json.loads(raw)
+    except (OSError, TypeError, UnicodeError, ValueError, RecursionError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    files = value.get("files_examined")
+    if (
+        value.get("tool") != "read"
+        or not isinstance(files, list)
+        or any(type(item) is not str for item in files)
+    ):
+        return None
+    canonical = dumps_canonical(
+        {
+            "tool": "read",
+            "files_examined": files,
+        }
+    ).encode("utf-8")
+    expected = tuple(
+        line.decode("utf-8") for line in _TERMINAL_READ_MANIFEST.splitlines()
+    )
+    if tuple(files) != tuple(sorted(expected)):
+        return None
+    return hashlib.sha256(canonical).hexdigest(), identity
+
+
+def _post_lifecycle_applied(
+    record: _TerminalRecord,
+) -> _LifecycleApplied | TerminalReason:
+    from core.run.metadata import (
+        MAX_RUN_METADATA_BYTES,
+        RUN_METADATA_FILE,
+        _parse_receipt_metadata,
+        _strict_load_run_metadata,
+    )
+
+    binding = record.run_binding
+    if binding is None:
+        return TerminalReason.RUN_NOT_OWNED_TEMPORARY
+    try:
+        strict = _strict_load_run_metadata(
+            binding.run_dir / RUN_METADATA_FILE,
+            operation="terminal_postcondition",
+            missing_ok=False,
+        )
+        if strict is None:
+            return TerminalReason.METADATA_CHANGED
+        parsed = _parse_receipt_metadata(
+            strict,
+            operation="terminal_postcondition",
+        )
+        raw, metadata_identity = _read_bound_file(
+            binding.run_dir / RUN_METADATA_FILE,
+            maximum=MAX_RUN_METADATA_BYTES,
+        )
+        manifest_raw, manifest_identity = _read_bound_file(
+            binding.run_dir / ".reads-manifest",
+            maximum=len(_TERMINAL_READ_MANIFEST),
+        )
+    except (OSError, TypeError, UnicodeError, ValueError):
+        return TerminalReason.METADATA_CHANGED
+    metadata = strict.value
+    expected_status = _TERMINAL_STATUS_BY_EVENT[record.event.value]
+    if metadata.get("status") != expected_status:
+        return TerminalReason.TERMINAL_STATUS_CONFLICT
+    if (
+        metadata.get("command") != binding.command
+        or metadata.get("project") is not None
+        or metadata.get("project_source") != binding.project_source
+    ):
+        return TerminalReason.PROJECT_PIN_CHANGED
+    if (
+        parsed.snapshot is None
+        or hashlib.sha256(parsed.snapshot.canonical).hexdigest()
+        != binding.receipt_snapshot_sha256
+        or _run_segment(parsed) != binding.segment
+    ):
+        return TerminalReason.SNAPSHOT_MISMATCH
+    if any(
+        key in metadata
+        for key in (
+            "session_pid",
+            "tool_pid",
+            "session_start",
+            "session_boot_id",
+            "session_pidns",
+        )
+    ) or any(str(key).startswith("session_host") for key in metadata):
+        return TerminalReason.PROJECT_PIN_CHANGED
+    if not hmac.compare_digest(manifest_raw, _TERMINAL_READ_MANIFEST):
+        return TerminalReason.READ_MANIFEST_CONVERSION_FAILED
+    read_record = _canonical_read_record(binding.run_dir)
+    if read_record is None:
+        return TerminalReason.READ_MANIFEST_CONVERSION_FAILED
+    read_digest, read_identity = read_record
+    if (binding.runs_root / "coverage.json").exists() or (
+        binding.runs_root / "checklist.json"
+    ).exists():
+        return TerminalReason.PROJECT_PIN_CHANGED
+    if (
+        record.launch_record.capability.registry_root
+        / f"{record.launch_record.child_pid}.run"
+    ).exists():
+        return TerminalReason.TERMINAL_TRANSITION_FORBIDDEN
+    return _LifecycleApplied(
+        terminal_status=expected_status,
+        segment=binding.segment,
+        before_metadata_sha256=binding.metadata_raw_sha256,
+        after_metadata_sha256=hashlib.sha256(raw).hexdigest(),
+        read_record_sha256=read_digest,
+        metadata_identity=metadata_identity,
+        read_manifest_identity=manifest_identity,
+        read_record_identity=read_identity,
+        effects=_effect_names(record.event),
+    )
+
+
+def _apply_bound_lifecycle(
+    record: _TerminalRecord,
+) -> _LifecycleApplied | OwnedFakeTerminalFailure:
+    from core.project.sessions import (
+        _SessionReceiptAbort,
+        session_runtime_receipt_fence,
+    )
+
+    capture = _capture_bound_receipt(record)
+    if capture is None:
+        return _failure_for_reason(record, TerminalReason.RECEIPT_CHANGED)
+    try:
+        with session_runtime_receipt_fence(capture):
+            binding_reason = _validate_live_binding(
+                record,
+                record.launch_record,
+            )
+            if binding_reason is not None:
+                return _failure_for_reason(record, binding_reason)
+            run_reason = _bound_run_reason(record)
+            if run_reason is not None:
+                return _failure_for_reason(record, run_reason)
+            binding = record.run_binding
+            assert binding is not None
+            permit = _MetadataPermit(
+                capability_id=record.capability_id,
+                claim_nonce=secrets.token_hex(16),
+                issuer_pid=os.getpid(),
+                module_generation=_MODULE_GENERATION,
+                thread_id=threading.get_ident(),
+                operation=record.event.name.lower(),
+                expected_status=_TERMINAL_STATUS_BY_EVENT[record.event.value],
+                run_dir=binding.run_dir,
+                metadata_raw_sha256=binding.metadata_raw_sha256,
+                receipt_snapshot_sha256=binding.receipt_snapshot_sha256,
+                segment=binding.segment,
+            )
+            record.active_permit = permit
+            token = _ACTIVE_PERMIT.set(permit)
+            try:
+                _terminal_lifecycle_hook("before_wrapper", record.capability_id)
+                _invoke_lifecycle_wrapper(record)
+            finally:
+                _ACTIVE_PERMIT.reset(token)
+                record.active_permit = None
+            if not permit.outer_verified or not permit.commit_verified:
+                return _failure_for_reason(
+                    record,
+                    TerminalReason.TERMINAL_TRANSITION_FORBIDDEN,
+                )
+    except _SessionReceiptAbort:
+        return _failure_for_reason(record, TerminalReason.RECEIPT_CHANGED)
+    except (OSError, TypeError, ValueError):
+        binding = record.run_binding
+        terminal_status = None
+        completed_effects: tuple[str, ...] = ()
+        if binding is not None:
+            try:
+                raw, _identity = _read_bound_file(
+                    binding.run_dir / ".raptor-run.json",
+                    maximum=1_048_576,
+                )
+                value = json.loads(raw)
+                if isinstance(value, dict):
+                    terminal_status = str(value.get("status"))
+                    if terminal_status == _TERMINAL_STATUS_BY_EVENT[record.event.value]:
+                        completed_effects = ("metadata_status",)
+            except (OSError, TypeError, UnicodeError, ValueError):
+                pass
+        return _failure(
+            TerminalDisposition.TRANSITION_FAILED,
+            TerminalReason.TERMINAL_TRANSITION_FORBIDDEN,
+            phase=record.phase,
+            trace=record.trace,
+            completed_effects=completed_effects,
+            terminal_status=terminal_status,
+        )
+    _set_phase(record, TerminalPhase.METADATA_APPLIED)
+    postcondition = _post_lifecycle_applied(record)
+    if isinstance(postcondition, TerminalReason):
+        return _failure(
+            TerminalDisposition.POSTCONDITION_FAILED,
+            postcondition,
+            phase=record.phase,
+            trace=record.trace,
+            completed_effects=("metadata_status",),
+            terminal_status=_TERMINAL_STATUS_BY_EVENT[record.event.value],
+        )
+    record.lifecycle_applied = postcondition
+    _set_phase(record, TerminalPhase.EFFECTS_VERIFIED)
+    _terminal_lifecycle_hook("after_effects", record.capability_id)
+    return postcondition
+
+
 def _run_terminal_protocol(
     record: _TerminalRecord,
     launch_record: _HandleRecord,
     *,
     deadline: MonotonicDeadline,
     cancellation: LaunchCancellation,
-) -> OwnedFakeTerminalResult | OwnedFakeTerminalFailure:
+    lifecycle: bool,
+) -> (
+    OwnedFakeTerminalResult
+    | OwnedFakeTerminalLifecycleResult
+    | OwnedFakeTerminalFailure
+):
     try:
         attach_reason = _send_terminal_attach(
             record,
@@ -1633,6 +2879,13 @@ def _run_terminal_protocol(
         duplicate_count = 1
     _set_phase(record, TerminalPhase.READY)
 
+    lifecycle_applied: _LifecycleApplied | None = None
+    if lifecycle:
+        transition = _apply_bound_lifecycle(record)
+        if isinstance(transition, OwnedFakeTerminalFailure):
+            return transition
+        lifecycle_applied = transition
+
     reason = _send_frame(
         record,
         launch_record,
@@ -1654,8 +2907,26 @@ def _run_terminal_protocol(
         cancellation=cancellation,
     )
     if isinstance(acked, TerminalReason):
+        if lifecycle_applied is not None:
+            return _failure(
+                TerminalDisposition.POSTCONDITION_FAILED,
+                acked,
+                phase=record.phase,
+                trace=record.trace,
+                completed_effects=lifecycle_applied.effects,
+                terminal_status=lifecycle_applied.terminal_status,
+            )
         return _failure_for_reason(record, acked)
     _set_phase(record, TerminalPhase.ACKED)
+    if lifecycle_applied is not None:
+        result = _new_lifecycle_result(
+            record,
+            duplicate_count=duplicate_count,
+            ready_frame=ready,
+            applied=lifecycle_applied,
+        )
+        record.lifecycle_result = result
+        return result
     return _new_result(
         record,
         duplicate_count=duplicate_count,
@@ -1663,12 +2934,17 @@ def _run_terminal_protocol(
     )
 
 
-def _apply_owned_fake_terminal_capability(
+def _apply_terminal_capability(
     capability: object,
     *,
     deadline: MonotonicDeadline,
     cancellation: LaunchCancellation,
-) -> OwnedFakeTerminalResult | OwnedFakeTerminalFailure:
+    lifecycle: bool,
+) -> (
+    OwnedFakeTerminalResult
+    | OwnedFakeTerminalLifecycleResult
+    | OwnedFakeTerminalFailure
+):
     if (
         type(deadline) is not MonotonicDeadline
         or type(cancellation) is not LaunchCancellation
@@ -1687,6 +2963,13 @@ def _apply_owned_fake_terminal_capability(
             return found
         record = found
         if record.state in {_ClaimState.APPLIED, _ClaimState.REFUSED}:
+            if record.rearmed:
+                return _failure(
+                    TerminalDisposition.BINDING_FAILED,
+                    TerminalReason.METADATA_CHANGED,
+                    phase=record.phase,
+                    trace=record.trace,
+                )
             assert record.cached is not None
             return record.cached
         if record.state is _ClaimState.CLAIMED:
@@ -1696,6 +2979,19 @@ def _apply_owned_fake_terminal_capability(
                 phase=record.phase,
                 trace=record.trace,
             )
+        if lifecycle != (record.run_binding is not None):
+            failure = _failure(
+                TerminalDisposition.INVALID_REQUEST,
+                TerminalReason.INVALID_CAPABILITY,
+                phase=record.phase,
+                trace=record.trace,
+            )
+            record.state = _ClaimState.REFUSED
+            record.phase = TerminalPhase.REFUSED
+            record.trace.append(TerminalPhase.REFUSED.value)
+            record.cached = failure
+            _close_sockets(record)
+            return failure
         claimed = _claim_operation(record.handle, "terminal")
         if isinstance(claimed, LaunchFailure):
             failure = _failure(
@@ -1730,7 +3026,12 @@ def _apply_owned_fake_terminal_capability(
 
     assert record is not None
     assert launch_record is not None
-    outcome: OwnedFakeTerminalResult | OwnedFakeTerminalFailure | None = None
+    outcome: (
+        OwnedFakeTerminalResult
+        | OwnedFakeTerminalLifecycleResult
+        | OwnedFakeTerminalFailure
+        | None
+    ) = None
     raised: BaseException | None = None
     try:
         _terminal_phase_hook(TerminalPhase.CLAIMED, record.capability_id)
@@ -1756,6 +3057,7 @@ def _apply_owned_fake_terminal_capability(
                 launch_record,
                 deadline=deadline,
                 cancellation=cancellation,
+                lifecycle=lifecycle,
             )
     except (OSError, UnicodeError, ValueError) as exc:
         del exc
@@ -1785,7 +3087,10 @@ def _apply_owned_fake_terminal_capability(
     if not sockets_closed:
         outcome = _failure_for_reason(record, TerminalReason.TERMINAL_EVENT_EOF)
     with _STATE_LOCK:
-        if isinstance(outcome, OwnedFakeTerminalResult):
+        if isinstance(
+            outcome,
+            (OwnedFakeTerminalResult, OwnedFakeTerminalLifecycleResult),
+        ):
             record.state = _ClaimState.APPLIED
         else:
             record.state = _ClaimState.REFUSED
@@ -1801,6 +3106,423 @@ def _apply_owned_fake_terminal_capability(
                 )
         record.cached = outcome
     return outcome
+
+
+def _apply_owned_fake_terminal_capability(
+    capability: object,
+    *,
+    deadline: MonotonicDeadline,
+    cancellation: LaunchCancellation,
+) -> OwnedFakeTerminalResult | OwnedFakeTerminalFailure:
+    outcome = _apply_terminal_capability(
+        capability,
+        deadline=deadline,
+        cancellation=cancellation,
+        lifecycle=False,
+    )
+    if isinstance(outcome, OwnedFakeTerminalLifecycleResult):
+        raise AssertionError("unbound terminal application returned lifecycle state")
+    return outcome
+
+
+def _apply_owned_fake_terminal_lifecycle(
+    capability: object,
+    *,
+    deadline: MonotonicDeadline,
+    cancellation: LaunchCancellation,
+) -> OwnedFakeTerminalLifecycleResult | OwnedFakeTerminalFailure:
+    outcome = _apply_terminal_capability(
+        capability,
+        deadline=deadline,
+        cancellation=cancellation,
+        lifecycle=True,
+    )
+    if isinstance(outcome, OwnedFakeTerminalResult):
+        raise AssertionError("bound terminal application omitted lifecycle state")
+    return outcome
+
+
+def _lifecycle_record_for_result(
+    result: object,
+) -> _TerminalRecord | OwnedFakeTerminalFailure:
+    if type(result) is not OwnedFakeTerminalLifecycleResult:
+        return _failure(
+            TerminalDisposition.INVALID_REQUEST,
+            TerminalReason.INVALID_CAPABILITY,
+            phase=TerminalPhase.NEW,
+        )
+    record = _CAPABILITIES.get(result._capability_id)
+    if (
+        record is None
+        or record.lifecycle_result is not result
+        or record.cached is not result
+        or record.lifecycle_applied is None
+        or record.state is not _ClaimState.APPLIED
+        or not hmac.compare_digest(
+            result._result_mac,
+            _result_mac(record, record.lifecycle_applied),
+        )
+    ):
+        return _failure(
+            TerminalDisposition.INVALID_REQUEST,
+            TerminalReason.INVALID_CAPABILITY,
+            phase=TerminalPhase.NEW,
+        )
+    return record
+
+
+def _terminal_metadata_matches_result(record: _TerminalRecord) -> bool:
+    binding = record.run_binding
+    applied = record.lifecycle_applied
+    if binding is None or applied is None:
+        return False
+    try:
+        raw, _identity = _read_bound_file(
+            binding.run_dir / ".raptor-run.json",
+            maximum=1_048_576,
+        )
+        metadata = json.loads(raw)
+    except (OSError, TypeError, UnicodeError, ValueError, RecursionError):
+        return False
+    return (
+        isinstance(metadata, dict)
+        and hmac.compare_digest(
+            hashlib.sha256(raw).hexdigest(),
+            applied.after_metadata_sha256,
+        )
+        and metadata.get("status") == applied.terminal_status
+        and metadata.get("command") == binding.command
+        and metadata.get("project") is None
+        and metadata.get("project_source") == binding.project_source
+        and _metadata_snapshot_sha256(metadata) == binding.receipt_snapshot_sha256
+        and _metadata_segment_value(metadata) == binding.segment
+    )
+
+
+def _owned_fake_terminal_resume_directory(
+    result: object,
+) -> Path | OwnedFakeTerminalFailure:
+    with _STATE_LOCK:
+        found = _lifecycle_record_for_result(result)
+        if isinstance(found, OwnedFakeTerminalFailure):
+            return found
+        if (
+            found.event is _TerminalEvent.COMPLETE
+            or found.rearmed
+            or found.cleanup_in_progress
+            or found.cleanup_cached is not None
+            or not _terminal_metadata_matches_result(found)
+        ):
+            return _failure(
+                TerminalDisposition.STATE_CONFLICT,
+                (
+                    TerminalReason.TERMINAL_STATUS_CONFLICT
+                    if found.event is _TerminalEvent.COMPLETE
+                    else TerminalReason.METADATA_CHANGED
+                ),
+                phase=found.phase,
+                trace=found.trace,
+            )
+        assert found.run_binding is not None
+        return found.run_binding.run_dir
+
+
+def _rearm_owned_fake_terminal_capability(
+    result: object,
+    *,
+    event_code: int,
+    sequence_code: int,
+    work_count: int,
+) -> OwnedFakeTerminalCapability | OwnedFakeTerminalFailure:
+    with _STATE_LOCK:
+        found = _lifecycle_record_for_result(result)
+        if isinstance(found, OwnedFakeTerminalFailure):
+            return found
+        record = found
+        old_binding = record.run_binding
+        if (
+            old_binding is None
+            or record.event is _TerminalEvent.COMPLETE
+            or record.rearmed
+            or record.cleanup_in_progress
+            or record.cleanup_cached is not None
+        ):
+            return _failure(
+                TerminalDisposition.STATE_CONFLICT,
+                TerminalReason.CAPABILITY_REUSED,
+                phase=record.phase,
+                trace=record.trace,
+            )
+        try:
+            current_binding = _load_run_binding(
+                record.launch_record,
+                old_binding.run_dir,
+            )
+        except (OSError, TypeError, UnicodeError, ValueError):
+            return _failure(
+                TerminalDisposition.BINDING_FAILED,
+                TerminalReason.METADATA_CHANGED,
+                phase=record.phase,
+                trace=record.trace,
+            )
+        if (
+            not _same_directory_identity(
+                current_binding.runs_root_identity,
+                old_binding.runs_root_identity,
+            )
+            or not _same_directory_identity(
+                current_binding.run_dir_identity,
+                old_binding.run_dir_identity,
+            )
+            or current_binding.segment != old_binding.segment + 1
+            or current_binding.lineage_sha256 is None
+            or current_binding.receipt_snapshot_sha256
+            != old_binding.receipt_snapshot_sha256
+        ):
+            return _failure(
+                TerminalDisposition.BINDING_FAILED,
+                TerminalReason.SNAPSHOT_MISMATCH,
+                phase=record.phase,
+                trace=record.trace,
+            )
+        if _HANDLE_CAPABILITIES.get(record.handle_id) != record.capability_id:
+            return _failure(
+                TerminalDisposition.STATE_CONFLICT,
+                TerminalReason.CAPABILITY_REUSED,
+                phase=record.phase,
+                trace=record.trace,
+            )
+        del _HANDLE_CAPABILITIES[record.handle_id]
+        _REARMING_HANDLES.add(record.handle_id)
+        record.rearmed = True
+    try:
+        replacement = _issue_owned_fake_terminal_capability_impl(
+            record.handle,
+            event_code=event_code,
+            sequence_code=sequence_code,
+            work_count=work_count,
+            rearm_record=record,
+        )
+        if isinstance(replacement, OwnedFakeTerminalFailure):
+            with _STATE_LOCK:
+                record.rearmed = False
+                _HANDLE_CAPABILITIES[record.handle_id] = record.capability_id
+            return replacement
+        bound = _bind_owned_fake_terminal_run(replacement)
+        if isinstance(bound, OwnedFakeTerminalFailure):
+            with _STATE_LOCK:
+                new_record = _CAPABILITIES.get(replacement._capability_id)
+                if new_record is not None:
+                    _HANDLE_CAPABILITIES.pop(new_record.handle_id, None)
+                record.rearmed = False
+                _HANDLE_CAPABILITIES[record.handle_id] = record.capability_id
+            return bound
+        new_record = _CAPABILITIES[bound._capability_id]
+        if new_record.run_binding != current_binding:
+            return _failure(
+                TerminalDisposition.BINDING_FAILED,
+                TerminalReason.METADATA_CHANGED,
+                phase=new_record.phase,
+                trace=new_record.trace,
+            )
+        return bound
+    finally:
+        with _STATE_LOCK:
+            _REARMING_HANDLES.discard(record.handle_id)
+
+
+def _run_cleanup_entry_valid(run_fd: int, name: str) -> bool:
+    try:
+        value = os.stat(name, dir_fd=run_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    if (
+        not stat.S_ISREG(value.st_mode)
+        or value.st_uid != os.geteuid()
+        or value.st_nlink != 1
+        or stat.S_IMODE(value.st_mode) & 0o022
+    ):
+        return False
+    if name == ".raptor-run.json.lock":
+        return _metadata_lock_entry_valid(name, dir_fd=run_fd)
+    return True
+
+
+def _remove_bound_run(record: _TerminalRecord) -> bool:
+    binding = record.run_binding
+    applied = record.lifecycle_applied
+    if binding is None or applied is None:
+        return False
+    if (
+        not _identity_unchanged(
+            binding.runs_root,
+            binding.runs_root_identity,
+            directory=True,
+        )
+        or not _identity_unchanged(
+            binding.run_dir,
+            binding.run_dir_identity,
+            directory=True,
+        )
+        or not _terminal_metadata_matches_result(record)
+    ):
+        return False
+    read_record = _canonical_read_record(binding.run_dir)
+    if (
+        read_record is None
+        or read_record[0] != applied.read_record_sha256
+        or read_record[1] != applied.read_record_identity
+    ):
+        return False
+    try:
+        _metadata_raw, metadata_identity = _read_bound_file(
+            binding.run_dir / ".raptor-run.json",
+            maximum=1_048_576,
+        )
+        _manifest_raw, manifest_identity = _read_bound_file(
+            binding.run_dir / ".reads-manifest",
+            maximum=len(_TERMINAL_READ_MANIFEST),
+        )
+    except (OSError, ValueError):
+        return False
+    if (
+        metadata_identity != applied.metadata_identity
+        or manifest_identity != applied.read_manifest_identity
+    ):
+        return False
+    try:
+        names = {entry.name for entry in os.scandir(binding.run_dir)}
+    except OSError:
+        return False
+    if not {
+        ".raptor-run.json",
+        ".raptor-run.json.lock",
+        ".reads-manifest",
+        "coverage-read.json",
+    }.issubset(names) or not names.issubset(_TERMINAL_RUN_FILES):
+        return False
+    try:
+        run_fd = os.open(
+            binding.run_dir,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        root_fd = os.open(
+            binding.runs_root,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+    except OSError:
+        for fd in (
+            locals().get("run_fd", -1),
+            locals().get("root_fd", -1),
+        ):
+            if isinstance(fd, int) and fd >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+        return False
+    try:
+        held = os.fstat(run_fd)
+        root = os.fstat(root_fd)
+        if (
+            (held.st_dev, held.st_ino)
+            != (
+                binding.run_dir_identity.device,
+                binding.run_dir_identity.inode,
+            )
+            or (root.st_dev, root.st_ino)
+            != (
+                binding.runs_root_identity.device,
+                binding.runs_root_identity.inode,
+            )
+            or any(not _run_cleanup_entry_valid(run_fd, name) for name in names)
+        ):
+            return False
+        for name in sorted(names):
+            os.unlink(name, dir_fd=run_fd)
+        os.rmdir(binding.run_dir.name, dir_fd=root_fd)
+    except OSError:
+        return False
+    finally:
+        os.close(run_fd)
+        os.close(root_fd)
+    return True
+
+
+def _cleanup_owned_fake_terminal_lifecycle(
+    result: object,
+    *,
+    deadline: MonotonicDeadline,
+) -> OwnedFakeTerminalCleanupResult | OwnedFakeTerminalFailure:
+    if type(deadline) is not MonotonicDeadline:
+        return _failure(
+            TerminalDisposition.INVALID_REQUEST,
+            TerminalReason.INVALID_CAPABILITY,
+            phase=TerminalPhase.NEW,
+        )
+    with _STATE_LOCK:
+        found = _lifecycle_record_for_result(result)
+        if isinstance(found, OwnedFakeTerminalFailure):
+            return found
+        record = found
+        applied = record.lifecycle_applied
+        assert applied is not None
+        if record.rearmed:
+            return _failure(
+                TerminalDisposition.STATE_CONFLICT,
+                TerminalReason.CAPABILITY_REUSED,
+                phase=record.phase,
+                trace=record.trace,
+            )
+        if record.cleanup_cached is not None:
+            return record.cleanup_cached
+        if record.cleanup_in_progress:
+            return _failure(
+                TerminalDisposition.STATE_CONFLICT,
+                TerminalReason.LAUNCH_OPERATION_BUSY,
+                phase=record.phase,
+                trace=record.trace,
+            )
+        record.cleanup_in_progress = True
+    try:
+        if not record.run_removed:
+            if not _remove_bound_run(record):
+                return _failure(
+                    TerminalDisposition.CLEANUP_FAILED,
+                    TerminalReason.RUN_CLEANUP_FAILED,
+                    phase=record.phase,
+                    trace=record.trace,
+                    completed_effects=applied.effects,
+                    terminal_status=applied.terminal_status,
+                )
+            record.run_removed = True
+        from core.startup.runtime_receipt.launch import (
+            LaunchClosed,
+            _close_owned_runtime_fake,
+        )
+
+        closed = _close_owned_runtime_fake(
+            record.handle,
+            deadline=deadline,
+        )
+        if type(closed) is not LaunchClosed:
+            return _failure(
+                TerminalDisposition.CLEANUP_FAILED,
+                TerminalReason.LAUNCH_CLOSE_FAILED,
+                phase=record.phase,
+                trace=record.trace,
+                completed_effects=applied.effects,
+                terminal_status=applied.terminal_status,
+            )
+        _set_phase(record, TerminalPhase.CLEANED)
+        cleaned = _new_cleanup_result(
+            record,
+            receipt_removed=closed.receipt_removed,
+        )
+        with _STATE_LOCK:
+            record.cleanup_cached = cleaned
+        return cleaned
+    finally:
+        with _STATE_LOCK:
+            record.cleanup_in_progress = False
 
 
 __all__: tuple[str, ...] = ()

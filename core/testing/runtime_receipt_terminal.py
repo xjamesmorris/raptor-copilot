@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import secrets
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from core.startup.runtime_receipt.terminal import (
         OwnedFakeTerminalCapability,
+        OwnedFakeTerminalCleanupResult,
         OwnedFakeTerminalFailure,
+        OwnedFakeTerminalLifecycleResult,
     )
 
 
@@ -60,6 +64,55 @@ class FakeTerminalPlan:
             raise ValueError("only background drain carries pending work")
 
 
+@dataclass(frozen=True, slots=True, init=False, repr=False)
+class FakeTerminalLifecycle:
+    _capability: OwnedFakeTerminalCapability
+    _run_dir: Path
+
+    def __init__(self) -> None:
+        raise TypeError("FakeTerminalLifecycle cannot be constructed")
+
+    @property
+    def run_dir(self) -> Path:
+        return self._run_dir
+
+    def __repr__(self) -> str:
+        return "FakeTerminalLifecycle(<redacted>)"
+
+    def __bool__(self) -> bool:
+        raise TypeError("fake terminal lifecycles are not truth values")
+
+    def __reduce__(self):
+        raise TypeError("FakeTerminalLifecycle cannot be pickled")
+
+    def __init_subclass__(cls) -> None:
+        raise TypeError("FakeTerminalLifecycle cannot be subclassed")
+
+
+def _new_lifecycle(
+    capability: OwnedFakeTerminalCapability,
+    run_dir: Path,
+) -> FakeTerminalLifecycle:
+    value = object.__new__(FakeTerminalLifecycle)
+    object.__setattr__(value, "_capability", capability)
+    object.__setattr__(value, "_run_dir", Path(run_dir))
+    return value
+
+
+def _remove_unbound_run(run_dir: Path) -> None:
+    allowed = {
+        ".raptor-run.json",
+        ".raptor-run.json.lock",
+        ".reads-manifest",
+    }
+    entries = {entry.name for entry in run_dir.iterdir()}
+    if not entries.issubset(allowed):
+        raise RuntimeError("owned fake terminal setup left unexpected files")
+    for name in sorted(entries):
+        (run_dir / name).unlink()
+    run_dir.rmdir()
+
+
 def make_owned_fake_terminal_capability(
     handle: object,
     *,
@@ -81,9 +134,121 @@ def make_owned_fake_terminal_capability(
     )
 
 
+def make_owned_fake_terminal_lifecycle(
+    handle: object,
+    *,
+    plan: FakeTerminalPlan,
+) -> FakeTerminalLifecycle | OwnedFakeTerminalFailure:
+    """Create one fixed receipt-backed run and bind a terminal capability."""
+
+    from core.run.metadata import start_run
+    from core.startup.runtime_receipt.terminal import (
+        OwnedFakeTerminalFailure,
+        _TERMINAL_READ_MANIFEST,
+        _TERMINAL_RUN_COMMAND,
+        _bind_owned_fake_terminal_run,
+        _owned_fake_terminal_runs_root,
+    )
+
+    if type(plan) is not FakeTerminalPlan:
+        raise TypeError("plan must be FakeTerminalPlan")
+    runs_root = _owned_fake_terminal_runs_root(handle)
+    if isinstance(runs_root, OwnedFakeTerminalFailure):
+        return runs_root
+    run_dir = runs_root / f"terminal-k2-{secrets.token_hex(16)}"
+    try:
+        start_run(run_dir, _TERMINAL_RUN_COMMAND)
+        manifest = run_dir / ".reads-manifest"
+        manifest.write_bytes(_TERMINAL_READ_MANIFEST)
+        manifest.chmod(0o600)
+        capability = make_owned_fake_terminal_capability(handle, plan=plan)
+        if isinstance(capability, OwnedFakeTerminalFailure):
+            _remove_unbound_run(run_dir)
+            return capability
+        bound = _bind_owned_fake_terminal_run(capability)
+        if isinstance(bound, OwnedFakeTerminalFailure):
+            _remove_unbound_run(run_dir)
+            return bound
+    except BaseException:
+        if run_dir.exists():
+            _remove_unbound_run(run_dir)
+        raise
+    return _new_lifecycle(bound, run_dir)
+
+
+def apply_owned_fake_terminal_lifecycle(
+    lifecycle: object,
+    *,
+    deadline: Any,
+    cancellation: Any,
+) -> OwnedFakeTerminalLifecycleResult | OwnedFakeTerminalFailure:
+    from core.startup.runtime_receipt.terminal import (
+        _apply_owned_fake_terminal_lifecycle,
+    )
+
+    capability = (
+        lifecycle._capability if type(lifecycle) is FakeTerminalLifecycle else lifecycle
+    )
+    return _apply_owned_fake_terminal_lifecycle(
+        capability,
+        deadline=deadline,
+        cancellation=cancellation,
+    )
+
+
+def resume_owned_fake_terminal_lifecycle(
+    result: object,
+    *,
+    plan: FakeTerminalPlan,
+) -> FakeTerminalLifecycle | OwnedFakeTerminalFailure:
+    from core.run.metadata import resume_run
+    from core.startup.runtime_receipt.terminal import (
+        OwnedFakeTerminalFailure,
+        _TERMINAL_RESUME_NOTE,
+        _owned_fake_terminal_resume_directory,
+        _rearm_owned_fake_terminal_capability,
+    )
+
+    if type(plan) is not FakeTerminalPlan:
+        raise TypeError("plan must be FakeTerminalPlan")
+    run_dir = _owned_fake_terminal_resume_directory(result)
+    if isinstance(run_dir, OwnedFakeTerminalFailure):
+        return run_dir
+    resume_run(run_dir, note=_TERMINAL_RESUME_NOTE)
+    capability = _rearm_owned_fake_terminal_capability(
+        result,
+        event_code=plan.event.value,
+        sequence_code=plan.sequence.value,
+        work_count=plan.work_count,
+    )
+    if isinstance(capability, OwnedFakeTerminalFailure):
+        return capability
+    return _new_lifecycle(capability, run_dir)
+
+
+def cleanup_owned_fake_terminal_lifecycle(
+    result: object,
+    *,
+    deadline: Any,
+) -> OwnedFakeTerminalCleanupResult | OwnedFakeTerminalFailure:
+    from core.startup.runtime_receipt.terminal import (
+        _cleanup_owned_fake_terminal_lifecycle,
+    )
+
+    return _cleanup_owned_fake_terminal_lifecycle(
+        result,
+        deadline=deadline,
+    )
+
+
 __all__ = [
     "FakeTerminalEvent",
+    "FakeTerminalLifecycle",
     "FakeTerminalPlan",
     "FakeTerminalSequence",
+    "apply_owned_fake_terminal_lifecycle",
+    "cleanup_owned_fake_terminal_lifecycle",
     "make_owned_fake_terminal_capability",
+    "make_owned_fake_terminal_lifecycle",
+    "resume_owned_fake_terminal_lifecycle",
 ]
