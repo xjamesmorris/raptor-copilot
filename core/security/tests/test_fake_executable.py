@@ -19,7 +19,7 @@ def _owned(tmp_path: Path, *, workspace_name: str = "owned-fake"):
     )
     workspace.configure_cli(
         "owned-cli",
-        FakeCLIBehavior(secret_env_names=("COPILOT_GITHUB_TOKEN",)),
+        FakeCLIBehavior(secret_env_names=("FAKE_SECRET_TOKEN",)),
     )
     return workspace, workspace.owned_executable("owned-cli")
 
@@ -146,7 +146,7 @@ def _issuer_kwargs(workspace) -> dict[str, object]:
         "bin_identity": workspace._bin_identity,
         "config_identity": workspace._config_identity,
         "log_identity": workspace._log_identity,
-        "secret_env_names": ("COPILOT_GITHUB_TOKEN",),
+        "secret_env_names": ("FAKE_SECRET_TOKEN",),
     }
 
 

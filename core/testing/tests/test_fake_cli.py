@@ -463,11 +463,11 @@ def test_secret_env_observation_is_keyed_and_never_records_raw_value(
     workspace = make_hermetic_cli(tmp_path)
     workspace.configure_cli(
         "secret-cli",
-        FakeCLIBehavior(secret_env_names=("COPILOT_GITHUB_TOKEN",)),
+        FakeCLIBehavior(secret_env_names=("FAKE_SECRET_TOKEN",)),
     )
     canary = "synthetic-secret-canary"
     env = workspace.child_env()
-    env["COPILOT_GITHUB_TOKEN"] = canary
+    env["FAKE_SECRET_TOKEN"] = canary
 
     result = subprocess.run(
         workspace.command("secret-cli"),
@@ -481,10 +481,10 @@ def test_secret_env_observation_is_keyed_and_never_records_raw_value(
 
     assert result.returncode == 0
     (invocation,) = workspace.invocations("secret-cli")
-    assert "COPILOT_GITHUB_TOKEN" not in invocation.env
+    assert "FAKE_SECRET_TOKEN" not in invocation.env
     assert len(invocation.secret_env) == 1
     observation = invocation.secret_env[0]
-    assert observation.name == "COPILOT_GITHUB_TOKEN"
+    assert observation.name == "FAKE_SECRET_TOKEN"
     assert observation.present is True
     assert observation.length == len(canary)
     assert observation.hmac_sha256 == (workspace.secret_observation_hmac(canary))
