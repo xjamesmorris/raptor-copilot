@@ -41,7 +41,8 @@ Python objects isolate malicious code already running as the same UID.
 
 This is not a provider, launcher, model-selection route, SDK integration, or
 claim that real Copilot CLI inference works. There is no reachable
-operator-installed executable branch, and `allow_live=True` is refused.
+operator-installed executable branch in this probe/provider path, and
+`allow_live=True` is refused.
 `RAPTOR_COPILOT_TRANSPORT_DISABLED` is checked at the single execution
 chokepoint before the synthetic canary environment or sandbox is created.
 Tests force the switch on by default; a fixture clears it only after verifying
@@ -68,6 +69,12 @@ every possible transformation is absent. `candidate_admission` never admits
 truncated output and preserves `candidate_complete_unevidenced` as a blocked
 candidate outcome. Candidate completion content remains caller-sensitive and
 is excluded from result reprs.
+
+Interactive frontend launch is a separate boundary:
+`raptor --frontend copilot` can use a verified native Linux Copilot executable
+to host RAPTOR's decision layer. That does not register Copilot under
+`core.llm`, route analysis-dispatch prompts through this probe, or change any
+candidate-admission rule described here.
 
 Real record-only probes are a separately authorized Level B activity with
 B1-B4 initially unknown. Production/admission on real streams remains Level C

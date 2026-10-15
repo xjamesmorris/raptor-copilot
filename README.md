@@ -40,7 +40,11 @@
 
 ## What is RAPTOR?
 
-RAPTOR is an autonomous security research framework built on top of Claude Code (but not tied to it -- you can plug in your own analysis layer too). It chains together static analysis, binary analysis, LLM-powered vulnerability validation, exploit generation, and patch writing into a single workflow you can run against a codebase or binary.
+RAPTOR is an autonomous security research framework driven interactively by
+Claude Code (the default) or GitHub Copilot CLI (native Linux). You can also
+plug in a separate analysis layer. It chains together static analysis, binary
+analysis, LLM-powered vulnerability validation, exploit generation, and patch
+writing into a single workflow you can run against a codebase or binary.
 
 It is not polished software. It was built in free time, held together with enthusiasm and duct tape, and it works well enough that we can't stop using it. If you want to make it better, open a PR.
 
@@ -58,11 +62,16 @@ the code.
 
 ## Prerequisites
 
-- **Claude Code** with an active subscription (Max, Pro, Team, or Enterprise) or an Anthropic API key. This is the orchestration layer for the interactive `raptor` shell -- optional if you only need the standalone CLIs, see [Running fully standalone](#running-fully-standalone-no-claude-code) below.
+- One interactive frontend (optional if you only need the standalone CLIs):
+  - **Claude Code** with an active subscription (Max, Pro, Team, or Enterprise) or an Anthropic API key; or
+  - **GitHub Copilot CLI** with a signed-in account. Copilot frontend launch currently requires its native Linux executable.
 - **Python 3.12+** and **Node.js 18+**.
 - **Semgrep** (`pip install semgrep`) for static analysis. CodeQL is optional but recommended.
 
-For the analysis dispatch layer (the LLM that analyses individual findings), Claude Code itself handles everything by default -- no extra API keys needed. If you want multi-model analysis (e.g. Claude + GPT + Gemini) or a fully local setup, you will need to configure the other provider(s). See [Using a different LLM](#using-a-different-llm) below.
+The interactive frontend and analysis dispatch layer are separate. Claude Code
+can provide both by default. Copilot CLI currently provides only the interactive
+frontend, so Copilot-only installations must configure an analysis provider for
+LLM-backed analysis. See [Using a different LLM](#using-a-different-llm).
 
 ## Quick Start
 
@@ -79,7 +88,7 @@ uv sync --locked
 # Compatibility path during the uv migration
 # pip install -r requirements.txt
 
-# Install Claude Code (if you don't already have it)
+# Install your chosen interactive frontend (Claude shown here)
 npm install -g @anthropic-ai/claude-code
 
 # Install Semgrep (required for scanning)
@@ -90,15 +99,33 @@ pip install semgrep
 # the repo. (Alternatively, symlink bin/raptor into a directory already on PATH.)
 export PATH="$PATH:$PWD/bin"
 
-# Launch RAPTOR
+# Launch RAPTOR with Claude Code (default)
 raptor
+
+# Or launch RAPTOR with GitHub Copilot CLI
+raptor --frontend copilot
 ```
 
-The `raptor` launcher is the recommended way to start a session, and it works from any directory -- it resolves the RAPTOR installation, remembers the directory you launched from (so commands like `/scan` default to it), runs the pre-flight trust and project checks, loads the coverage-tracking plugin, and sanitises the environment before handing off to Claude Code. It also takes an optional target path and flags like `--project`, `--continue`, and `--model` -- see `raptor --help`.
+Copilot users should also read
+[README-Copilot.md](README-Copilot.md) for model routing, subagent
+configuration, and troubleshooting.
 
-Running plain `claude` from inside the repo directory also works -- Claude Code picks up RAPTOR's configuration from the checkout -- but you skip everything the launcher does above: no pre-flight checks, no coverage tracking, and commands that default to "the directory you ran this from" can't see it.
+The `raptor` launcher is the recommended way to start a session, and it works
+from any directory -- it resolves the RAPTOR installation, remembers the
+directory you launched from (so commands like `/scan` default to it), runs the
+pre-flight trust and project checks, loads the coverage-tracking plugin, and
+sanitises the environment before handing off to the selected frontend. It also
+takes an optional target path and flags like `--project`, `--continue`, and
+`--model` -- see `raptor --help`.
 
-**Important:** RAPTOR loads its configuration from the repo directory. If you run `claude` from any other directory, you get plain Claude Code, not RAPTOR. The `raptor` launcher avoids this failure mode entirely.
+Running plain `claude` or `copilot` from inside the repo directory also loads
+RAPTOR's compatible instructions, commands, skills, and agents, but skips
+launcher pre-flight checks, strong session/project binding, and automatic
+coverage-plugin loading.
+
+**Important:** RAPTOR loads its decision assets from the repo directory. If you
+run a frontend directly from another directory, you get a plain frontend
+session, not RAPTOR. The `raptor` launcher avoids this failure mode entirely.
 
 ### Option 2: Run in a container (recommended)
 
@@ -390,7 +417,14 @@ Not currently enforced: `mypy` is pinned in `pyproject.toml` but does not block 
 
 RAPTOR has two separate model layers, and it is worth knowing how both work before you change anything.
 
-The **orchestration layer** is Claude Code -- but only for the interactive `raptor` shell (this conversational, slash-command layer). The CLAUDE.md, skills, and commands all run as Claude Code instructions there. To change which Claude model orchestrates that layer, use Claude Code's `--model` flag or the `/model` command inside a session. If you don't want this layer at all, see [Running fully standalone](#running-fully-standalone-no-claude-code) below.
+The **orchestration layer** is the selected interactive frontend: Claude Code
+by default, or GitHub Copilot CLI on native Linux with
+`raptor --frontend copilot`. `CLAUDE.md`, skills, commands, and agents drive
+that layer in either frontend. Use `raptor --model <model>` or `/model` inside
+the session to select a frontend model. Copilot frontend support does not
+register Copilot as an analysis-dispatch provider. Copilot child agents may
+also use a separately configured model; see
+[README-Copilot.md](README-Copilot.md).
 
 The **analysis dispatch layer** is the LLM that analyses individual vulnerability findings. This is separate from the orchestration layer and can be any supported provider. Configure it in `~/.config/raptor/models.json`:
 
@@ -462,7 +496,10 @@ Ollama works well for analysis; reliability for exploit/patch code generation tr
 
 ### Running fully standalone (no Claude Code)
 
-`bin/raptor` -- the interactive shell with the banner and slash commands, i.e. this conversational layer -- execs straight into the Claude Code CLI and always needs its own login. The actual mechanics underneath it don't: `python3 raptor.py <mode>` is a plain Python CLI with no Claude Code dependency at all.
+`bin/raptor` -- the interactive shell with the banner and slash commands --
+execs into the selected frontend and needs that frontend's login. The actual
+mechanics underneath it do not: `python3 raptor.py <mode>` is a plain Python
+CLI with no interactive-frontend dependency.
 
 ```bash
 # No `claude` process involved at any point
@@ -483,7 +520,10 @@ libexec/raptor-project-manager status
 libexec/raptor-project-manager findings
 ```
 
-Point `models.json` / `OLLAMA_HOST` at a local Ollama instance (see above) and this whole path never talks to Anthropic -- useful for airgapped boxes or local-only hardware. You lose the conversational slash-command layer (this chat); the scan/analysis/exploit pipeline itself is unaffected.
+Point `models.json` / `OLLAMA_HOST` at a local Ollama instance (see above) and
+this whole path can stay local -- useful for airgapped boxes or local-only
+hardware. You lose the conversational slash-command layer; the
+scan/analysis/exploit pipeline itself is unaffected.
 
 ### Fast-tier short-circuit + the model scorecard
 

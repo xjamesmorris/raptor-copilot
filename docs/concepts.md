@@ -24,14 +24,15 @@ does the mechanical work: running Semgrep and CodeQL, managing subprocesses,
 parsing SARIF, deduplicating findings, dispatching LLM API calls, tracking
 costs, writing output files.  It does not make judgement calls.
 
-The **Claude Code decision layer** (`.claude/`, `tiers/`, `CLAUDE.md`) makes
+The **interactive decision layer** (`.claude/`, `tiers/`, `CLAUDE.md`) makes
 the calls: which findings to prioritise, how to interpret results, what the
-attack scenario is, whether the exploit is realistic.  Implemented as Claude
-Code skills, commands, and agents that load progressively -- the context window
-only carries the expertise the current step needs.
+attack scenario is, whether the exploit is realistic. It runs in Claude Code
+by default or GitHub Copilot CLI on native Linux. Skills, commands, and agents
+load progressively so the context window only carries the expertise the
+current step needs.
 
 ```
-Claude Code session
+Claude Code or Copilot CLI session
 ├── CLAUDE.md              bootstrap, routing, security rules (always loaded)
 ├── .claude/commands/      slash commands (/agentic, /scan, /validate, ...)
 ├── .claude/skills/        methodology detail (loaded on demand)
@@ -48,7 +49,7 @@ Python layer
 
 The split means you can run the Python layer from a CI pipeline
 (`python3 raptor.py scan --repo ...`) and get structured SARIF output without
-Claude Code, or run it interactively with the full agentic workflow.  See
+an interactive frontend, or run it interactively with the full agentic workflow. See
 [Python CLI](python-cli.md).
 
 
@@ -57,9 +58,9 @@ Claude Code, or run it interactively with the full agentic workflow.  See
 RAPTOR uses LLMs in two distinct roles -- it is worth knowing both before
 changing the configuration.
 
-The **orchestration model** is always Claude Code.  The skills, commands, and
-decision logic all execute inside a Claude Code session.  Change it with Claude
-Code's `--model` flag or the `/model` command.
+The **orchestration model** runs in the selected interactive frontend. Claude
+Code is the default; use `raptor --frontend copilot` for GitHub Copilot CLI on
+native Linux. Change the frontend model with `raptor --model` or `/model`.
 
 The **analysis dispatch model** is the LLM that analyses individual
 vulnerability findings (Stages A--F).  This is a separate call path and can be
@@ -67,9 +68,10 @@ any [supported provider](llm.md): Anthropic, OpenAI, Gemini, Mistral, Bedrock,
 Ollama, or Claude Code itself as a fallback.  Configure it in
 `~/.config/raptor/models.json` or via environment variables.
 
-When no external provider is configured, Claude Code handles both roles.  When
-an external provider is configured, it takes priority for analysis dispatch and
-Claude Code becomes the fallback.
+When no external provider is configured and Claude Code is available, Claude
+Code can handle analysis dispatch. Copilot frontend selection does not create a
+Copilot dispatch provider; configure another supported provider when running a
+Copilot-only installation.
 
 
 ## Cost model

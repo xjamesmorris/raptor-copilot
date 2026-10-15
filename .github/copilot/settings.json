@@ -1,0 +1,5 @@
+{
+  "model": "gpt-6-astra",
+  "effortLevel": "max",
+  "contextTier": "long_context"
+}

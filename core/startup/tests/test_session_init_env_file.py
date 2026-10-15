@@ -93,6 +93,37 @@ def test_benign_path_roundtrips_and_extends_path(
     assert proc.stdout == f"/usr/bin:{root / 'bin'}"
 
 
+def test_frontend_metadata_roundtrips(
+    session_init,
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "raptor"
+    (root / "bin").mkdir(parents=True)
+    env_file = tmp_path / "env"
+    monkeypatch.setenv("CLAUDE_ENV_FILE", str(env_file))
+    monkeypatch.setenv("RAPTOR_FRONTEND", "copilot")
+    monkeypatch.setenv("RAPTOR_FRONTEND_MODEL", "gpt-5.6-sol")
+    monkeypatch.setattr(session_init, "REPO_ROOT", root)
+
+    session_init.write_env_file()
+
+    proc = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"source {str(env_file)!r} && "
+            'printf "%s|%s" "$RAPTOR_FRONTEND" "$RAPTOR_FRONTEND_MODEL"',
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "copilot|gpt-5.6-sol"
+
+
 def test_import_does_not_leak_test_module(session_init):
     # exec_module registers nothing in sys.modules by default; keep it so.
     assert "raptor_session_init_under_test" not in sys.modules

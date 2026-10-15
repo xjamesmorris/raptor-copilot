@@ -12,35 +12,34 @@ _ASSETS = Path(__file__).resolve().parent / "assets"
 
 # The banner's version line carries a ``__VERSION__`` placeholder rather than a
 # hardcoded number, so the displayed version is always the live one injected
-# here — never a stale stamp. Matches the box layout the release uses.
-# The version token is one non-whitespace char then the box fill —
-# the naive ``\S+[^║]*`` overlapped two unbounded repeats on
-# non-whitespace chars (quadratic on a crafted logo line). The one
-# dropped corner is a version token itself containing the box glyph.
-_VERSION_LINE = re.compile(r"(║\s+Based on Claude Code - )\S[^║]*║")
+# here — never a stale stamp. Match the complete bounded box line so the
+# version can be replaced without ambiguous token parsing.
+_VERSION_LINE = re.compile(
+    r"^║[ \t]+Based on [^║]+║[ \t]*$",
+    re.MULTILINE,
+)
 
 
 def read_logo(version: str = "") -> str:
-    """Read the ASCII logo, injecting ``version`` into the banner line.
+    """Read the ASCII logo, injecting ``version`` into its attribution line.
 
     ``version`` is the value to display (typically
     ``RaptorConfig.effective_version()``); a leading ``v`` is added to match
-    the banner convention. The line is re-padded so the box border stays
-    aligned regardless of the version string's length. When ``version`` is
-    empty the asset is returned verbatim (placeholder left as-is)."""
+    the banner convention. The ``Based on Claude Code`` attribution remains
+    unchanged; the selected interactive frontend is reported separately in
+    the frontend status line."""
     path = _ASSETS / "raptor-offset"
     if not path.exists():
         return ""
     text = path.read_text(encoding="utf-8").rstrip()
-    if version:
-        label = "v" + version.lstrip("v")
+    version_label = "v" + version.lstrip("v") if version else "__VERSION__"
 
-        def _stamp(m: "re.Match[str]") -> str:
-            content = m.group(1) + label
-            pad = max(1, 76 - len(content))
-            return content + " " * pad + "║"
+    def _stamp(_match: "re.Match[str]") -> str:
+        content = f"║             Based on Claude Code - {version_label}"
+        pad = max(1, 76 - len(content))
+        return content + " " * pad + "║"
 
-        text = _VERSION_LINE.sub(_stamp, text, count=1)
+    text = _VERSION_LINE.sub(_stamp, text, count=1)
     return text
 
 
@@ -67,6 +66,7 @@ def format_banner(
     project_line: str | None = None,
     lang_line: str | None = None,
     tool_updates: set[str] | None = None,
+    frontend_status: str | None = None,
 ) -> str:
     """Format the startup banner from gathered data.
 
@@ -82,6 +82,7 @@ def format_banner(
         project_line: One-line project status, or None.
         lang_line: Pre-formatted language support line, or None.
         tool_updates: Tool names that have a newer version on PyPI.
+        frontend_status: Selected frontend and model description, or None.
 
     Returns:
         Formatted banner string.
@@ -106,6 +107,9 @@ def format_banner(
     # Language support
     if lang_line:
         lines.append(lang_line)
+
+    if frontend_status:
+        lines.append(f"frontend: {frontend_status}")
 
     # LLM
     lines.extend(llm_lines)

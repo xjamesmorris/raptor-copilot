@@ -174,6 +174,27 @@ def test_check_llm_keeps_no_external_when_seam_empty(
     assert lines == ["   llm: no external LLM configured"]
 
 
+def test_claude_presence_is_labelled_as_analysis_cli_not_authentication(
+    isolated_home, monkeypatch,
+) -> None:
+    monkeypatch.setenv("RAPTOR_FRONTEND", "copilot")
+    monkeypatch.setattr(
+        startup_init, "_resolve_primary_transport", lambda: None,
+    )
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: "/usr/bin/claude" if name == "claude" else None,
+    )
+
+    lines, warnings = startup_init.check_llm()
+
+    assert lines == [
+        "   llm: no external LLM configured",
+        "        claude code ✓ (analysis CLI installed; auth not checked)",
+    ]
+    assert warnings == []
+
+
 def test_check_llm_parses_commented_models_json(
     isolated_home, monkeypatch,
 ) -> None:

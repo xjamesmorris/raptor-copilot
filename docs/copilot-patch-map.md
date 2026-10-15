@@ -4,9 +4,11 @@ This document helps reviewers and automated agents distinguish patches that
 directly implement the guarded Copilot CLI work from reusable infrastructure
 and independent LLM improvements.
 
-The current implementation remains **offline and deny-by-default**. It does
-not execute an operator-installed Copilot CLI, submit prompts, use GitHub
-credentials, register a Copilot LLM provider, or claim live compatibility.
+The original fourteen-patch series remained **offline and deny-by-default**.
+The current tree additionally enables an explicitly selected, native Linux
+Copilot CLI as the interactive decision frontend after verifying its live
+process contract. It still does not register a Copilot LLM provider or admit
+the synthetic receipt/probe path to production authority.
 
 ## Summary
 
@@ -78,6 +80,26 @@ Together these patches:
 - prevent project, lifecycle, pin and coverage escalation;
 - expose explicit `--frontend copilot` selection;
 - refuse before privileged effects because live verification is incomplete.
+
+## Current interactive frontend activation
+
+The post-series launcher activation is deliberately narrower than provider or
+runtime-receipt admission:
+
+- only `raptor --frontend copilot` opts in;
+- the selected executable must be a directly identifiable native Linux ELF;
+- session authority retains the token, pid starttime, boot ID, pid namespace,
+  uid, and exact executable device/inode checks;
+- Copilot's observed `MainThread` process name is treated as
+  non-authoritative, never as a replacement for executable identity;
+- launch passes `--no-auto-update` so the captured executable identity cannot
+  hand off to a different cached binary;
+- initial RAPTOR dispatch uses Copilot's interactive `-i` contract;
+- the existing commands, skills, agents, and coverage plugin use Copilot's
+  documented Claude-compatibility surfaces.
+
+This activation does not make `core.llm.copilot_probe` a real provider, grant
+receipt-backed runs project authority, or enable live candidate admission.
 
 ## Fake-only validation layers
 

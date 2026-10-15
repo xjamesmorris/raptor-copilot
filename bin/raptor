@@ -387,8 +387,8 @@ Arguments:
 Options:
   -c, --continue     Resume last RAPTOR session
   --frontend HOST    Interactive frontend: claude (default) or copilot
-                     (Copilot selection is recognized but launch is disabled)
-  -m, --model MODEL  Choose model (opus, sonnet, haiku)
+                     (Copilot requires a native Linux executable)
+  -m, --model MODEL  Choose the frontend model
   -p, --project NAME Set the active project
   -v, --verbose      Verbose output
   --trust-repo       Trust target repo's config (skip safety checks)
@@ -541,8 +541,8 @@ export _RAPTOR_TRUSTED=1
 
 # Strip the frontend selector before applying the legacy local-route
 # fallback. This keeps local-capable commands working when Claude is
-# unavailable while ensuring an explicit Copilot selection reaches the
-# deny-before-effects gate instead of being mistaken for a Claude launch.
+# unavailable while ensuring an explicit Copilot selection reaches frontend
+# preparation instead of being mistaken for a Claude launch.
 FRONTEND="claude"
 _route_args=()
 while [[ $# -gt 0 ]]; do
@@ -597,7 +597,16 @@ fi
 # operator argument only — no RAPTOR_HOST/COPILOT_* environment value
 # participates in host authority.
 STARTUP_ARGS=("--caller-dir" "$RAPTOR_CALLER_DIR")
-FRONTEND_ARGS=("-n" "RAPTOR")
+FRONTEND_ARGS=()
+FRONTEND_MODEL=""
+CONTINUE_SESSION=0
+if [[ "$FRONTEND" == "copilot" ]]; then
+    # Pin the executable whose device/inode was captured in the strong host
+    # claim instead of allowing an auto-update handoff during launch.
+    FRONTEND_ARGS+=("--no-auto-update")
+else
+    FRONTEND_ARGS+=("-n" "RAPTOR")
+fi
 INITIAL_PROMPT="/raptor"
 TARGET=""
 TRUST_REPO_ARG=""
@@ -622,16 +631,22 @@ while [[ $# -gt 0 ]]; do
             ;;
         -c|--continue)
             FRONTEND_ARGS+=("--continue")
+            CONTINUE_SESSION=1
             INITIAL_PROMPT=""
             shift
             ;;
         -m|--model)
             [[ $# -ge 2 ]] || { echo "raptor: $1 requires a value" >&2; exit 1; }
             FRONTEND_ARGS+=("--model" "$2")
+            FRONTEND_MODEL="$2"
             shift 2
             ;;
         -v|--verbose)
-            FRONTEND_ARGS+=("--verbose")
+            if [[ "$FRONTEND" == "copilot" ]]; then
+                FRONTEND_ARGS+=("--log-level" "debug")
+            else
+                FRONTEND_ARGS+=("--verbose")
+            fi
             shift
             ;;
         --trust-repo)
@@ -655,6 +670,16 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+if [[ "$FRONTEND" == "copilot" && "$CONTINUE_SESSION" -eq 0 ]]; then
+    FRONTEND_ARGS+=("--name" "RAPTOR")
+fi
+unset CONTINUE_SESSION
+export RAPTOR_FRONTEND="$FRONTEND"
+if [[ -n "$FRONTEND_MODEL" ]]; then
+    export RAPTOR_FRONTEND_MODEL="$FRONTEND_MODEL"
+else
+    unset RAPTOR_FRONTEND_MODEL
+fi
 
 # Build initial prompt: /raptor [target]. Strip control bytes from
 # the operator-supplied TARGET first - an embedded newline would
@@ -701,8 +726,8 @@ unset _target_clean
 # Resolve and gate the selected frontend only after the complete launcher
 # hardening and dangerous-environment strip, but before target trust checks,
 # project activation, or session-registry mutation. The helper reports
-# installed presence separately from launch support; Copilot is deliberately
-# installed-but-gated until its live host contract is verified.
+# installed presence separately from launch support and admits Copilot only
+# when it can mint a direct native Linux process-identity claim.
 # RAPTOR_FRONTEND_GATE_BEGIN
 set +e
 _frontend_out="$(
@@ -727,12 +752,6 @@ unset _frontend_out _frontend_rc _key _value
 if [ -z "$FRONTEND_EXECUTABLE" ]; then
     echo "raptor: frontend preparation returned no executable" >&2
     exit 1
-fi
-# The only launch-enabled frontend is Claude. Even a malformed helper response
-# must not fall through into Claude argv/prompt preparation.
-if [ "$FRONTEND" != "claude" ]; then
-    echo "raptor: frontend '$FRONTEND' is not launch-enabled" >&2
-    exit 78
 fi
 # RAPTOR_FRONTEND_GATE_END
 
@@ -989,7 +1008,7 @@ if _rp mkdir -p -m 700 "$_sessions_dir" 2>/dev/null; then
                 read -r _fcomm < "/proc/$_fpid/comm" || _fcomm=""
             fi
             case "$_fhost:$_fcomm" in
-                claude:claude|claude:claude-*|copilot:copilot|copilot:copilot-*) ;;
+                claude:claude|claude:claude-*|copilot:copilot|copilot:copilot-*|copilot:MainThread|copilot:mainthread) ;;
                 *) _fclaim_ok=0 ;;
             esac
             if [ "$_flive_start" != "$_fstart" ] \
@@ -1046,8 +1065,8 @@ else
 fi
 unset _sessions_dir _startup_out _seed_proj _seed_by _host_claim
 
-# Load the Claude coverage plugin if available. Copilot remains gated above;
-# its candidate event profile is offline and effect-disabled.
+# Load the cross-frontend coverage plugin if available. Copilot accepts the
+# legacy plugin layout and PascalCase PostToolUse(Read) hook contract.
 PLUGIN_ARGS=()
 if [ -d "$RAPTOR_DIR/plugins/coverage" ]; then
     PLUGIN_ARGS+=(--plugin-dir "$RAPTOR_DIR/plugins/coverage")
@@ -1070,9 +1089,15 @@ fi
 
 # RAPTOR_FRONTEND_EXEC_BEGIN
 if [[ -n "$INITIAL_PROMPT" ]]; then
-    exec env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS \
-        "$FRONTEND_EXECUTABLE" "${PLUGIN_ARGS[@]}" \
-        "${FRONTEND_ARGS[@]}" "$INITIAL_PROMPT"
+    if [[ "$FRONTEND" == "copilot" ]]; then
+        exec env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS \
+            "$FRONTEND_EXECUTABLE" "${PLUGIN_ARGS[@]}" \
+            "${FRONTEND_ARGS[@]}" -i "$INITIAL_PROMPT"
+    else
+        exec env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS \
+            "$FRONTEND_EXECUTABLE" "${PLUGIN_ARGS[@]}" \
+            "${FRONTEND_ARGS[@]}" "$INITIAL_PROMPT"
+    fi
 else
     exec env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS \
         "$FRONTEND_EXECUTABLE" "${PLUGIN_ARGS[@]}" \

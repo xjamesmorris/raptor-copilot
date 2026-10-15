@@ -19,6 +19,8 @@ out/
 .env*
 .claude/*.local.json
 .claude/raptor.env
+# Copilot's runtime settings locks are not configuration.
+.github/copilot/settings*.json.lock
 # Per-dispatch runtime state (webfetch anchor files + fetch logs)
 .claude/run/
 

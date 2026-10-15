@@ -12,7 +12,8 @@ and a usable headless LLM provider are deliberately separate facts:
   process's uid and executable inode. It supplements (never replaces) the
   session token, starttime, boot-id, and pid-namespace checks.
 
-Copilot launch remains gated until its live host contract is verified. There
+Copilot launch is admitted only when the selected executable supports the
+same direct Linux process-identity claim used by the session registry. There
 is intentionally no environment-variable or payload escape hatch.
 """
 
@@ -213,8 +214,9 @@ def prepare_frontend(
 ) -> FrontendPreparation:
     """Resolve one frontend without inferring provider usability.
 
-    Copilot is intentionally reported as installed-but-gated when present.
-    No environment variable can change that decision.
+    Copilot requires a directly identifiable native Linux executable. A
+    shebang wrapper or unsupported platform remains installed-but-gated
+    instead of falling back to the legacy Claude-only identity path.
     """
     frontend = parse_frontend(value)
     found = shutil.which(frontend.value, path=search_path)
@@ -238,7 +240,8 @@ def prepare_frontend(
             session_claim=None,
             reason=str(exc),
         )
-    if frontend is Frontend.COPILOT:
+    supports_direct_claim = _supports_direct_process_claim(executable)
+    if frontend is Frontend.COPILOT and not supports_direct_claim:
         return FrontendPreparation(
             frontend=frontend,
             executable=executable,
@@ -246,13 +249,13 @@ def prepare_frontend(
             provider_usable=None,
             session_claim=None,
             reason=(
-                "Copilot frontend is installed, but its live host contract "
-                "has not been verified"
+                "its live host contract is not verified because a directly "
+                "identifiable native Linux executable is required"
             ),
         )
     claim = (
         build_session_host_claim(frontend, executable)
-        if _supports_direct_process_claim(executable)
+        if supports_direct_claim
         else None
     )
     return FrontendPreparation(
@@ -408,10 +411,17 @@ def process_executable_identity(pid: int) -> tuple[int, int] | None:
 
 
 def frontend_matches_comm(frontend: Frontend, comm: str | None) -> bool:
-    """Strong claims accept only the selected host's process-name family."""
+    """Accept the selected host's observed process-name shape.
+
+    Copilot CLI's native Linux runtime names its main thread ``MainThread``.
+    That value is non-authoritative; the caller must still verify the exact
+    executable device/inode and uid before accepting the process.
+    """
     if comm is None:
         return False
     name = comm.strip().lower()
+    if frontend is Frontend.COPILOT and name == "mainthread":
+        return True
     prefix = frontend.value
     return name == prefix or name.startswith(prefix + "-")
 
@@ -482,10 +492,10 @@ def _main(argv: list[str]) -> int:
     if preparation.launch_state is FrontendLaunchState.GATED:
         print(
             "raptor: Copilot frontend is installed at "
-            f"{preparation.executable}, but launch is disabled because its "
-            "live host contract is not verified; refusing before target "
-            "trust checks, project activation, session state, plugin loading, "
-            "or frontend execution.",
+            f"{preparation.executable}, but launch is disabled: "
+            f"{preparation.reason or 'its live host contract is not verified'}; "
+            "refusing before target trust checks, project activation, session "
+            "state, plugin loading, or frontend execution.",
             file=sys.stderr,
         )
         return 78

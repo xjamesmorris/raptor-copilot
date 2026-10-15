@@ -182,6 +182,27 @@ def test_frontend_preparation_keeps_presence_launch_and_provider_separate(
     assert launcher_lines(claude).startswith("launch_executable=")
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
+def test_native_copilot_preparation_is_ready_with_strong_claim(tmp_path):
+    source = Path("/bin/true")
+    if not source.is_file():
+        pytest.skip("/bin/true unavailable")
+    executable = tmp_path / "copilot"
+    executable.write_bytes(source.read_bytes())
+    executable.chmod(0o755)
+
+    preparation = prepare_frontend("copilot", search_path=str(tmp_path))
+
+    assert preparation.frontend is Frontend.COPILOT
+    assert preparation.launch_state is FrontendLaunchState.READY
+    assert preparation.launchable is True
+    assert preparation.provider_usable is None
+    assert preparation.session_claim is not None
+    assert preparation.session_claim.frontend is Frontend.COPILOT
+    assert preparation.session_claim.executable == executable
+    assert "host=copilot" in launcher_lines(preparation)
+
+
 def test_missing_and_unknown_frontends_are_distinct(tmp_path):
     missing = prepare_frontend("copilot", search_path=str(tmp_path))
     assert missing.launch_state is FrontendLaunchState.MISSING
@@ -410,6 +431,58 @@ def test_supplemental_a7_rejects_proc_uid_comm_and_exe_gaps():
         )
 
 
+def test_copilot_mainthread_comm_still_requires_exact_executable_identity():
+    claim = SessionHostClaim(
+        frontend=Frontend.COPILOT,
+        uid=os.geteuid(),
+        executable=Path("/owned/copilot"),
+        executable_device=10,
+        executable_inode=20,
+    )
+    common = {
+        "pid_running": lambda _pid: True,
+        "comm_reader": lambda _pid: "MainThread",
+        "uid_reader": lambda _pid: claim.uid,
+    }
+    with patch("core.startup.host.os.geteuid", return_value=claim.uid):
+        assert (
+            host_process_matches(
+                123,
+                claim,
+                **common,
+                executable_identity_reader=lambda _pid: (10, 20),
+            )
+            is True
+        )
+        assert (
+            host_process_matches(
+                123,
+                claim,
+                **common,
+                executable_identity_reader=lambda _pid: (10, 21),
+            )
+            is False
+        )
+
+    claude_claim = SessionHostClaim(
+        frontend=Frontend.CLAUDE,
+        uid=claim.uid,
+        executable=Path("/owned/claude"),
+        executable_device=10,
+        executable_inode=20,
+    )
+    with patch("core.startup.host.os.geteuid", return_value=claim.uid):
+        assert (
+            host_process_matches(
+                123,
+                claude_claim,
+                **common,
+                executable_identity_reader=lambda _pid: (10, 20),
+            )
+            is False
+        )
+
+
 def test_a7_launcher_lines_refuses_nonready_preparation(tmp_path):
     preparation = FrontendPreparation(
         frontend=Frontend.COPILOT,
@@ -453,7 +526,9 @@ def test_a6_mapped_executable_identity_ignores_replaced_disk_path(tmp_path):
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="bash launcher")
-def test_explicit_copilot_is_gated_before_exec_or_session_mutation(tmp_path):
+def test_explicit_shebang_copilot_is_gated_before_exec_or_session_mutation(
+    tmp_path,
+):
     workspace = make_hermetic_cli(tmp_path)
     workspace.configure_cli(
         "copilot",
@@ -563,8 +638,7 @@ def test_launcher_gate_and_exec_sections_are_marker_bounded_and_ordered():
     helper = 'python3 -m core.startup.host "$FRONTEND"'
     shell_guard = 'if [ "$FRONTEND" != "claude" ]; then'
     assert helper in gate
-    assert shell_guard in gate
-    assert gate.index(helper) < gate.index(shell_guard)
+    assert shell_guard not in gate
     assert "raptor-cc-trust-check" not in gate
     assert "raptor-startup-check" not in gate
     assert "PLUGIN_ARGS" not in gate
@@ -583,6 +657,7 @@ def test_launcher_gate_and_exec_sections_are_marker_bounded_and_ordered():
     assert gate_start < trust_start < project_start < plugin_start < exec_start
 
     assert '"$FRONTEND_EXECUTABLE" "${PLUGIN_ARGS[@]}"' in frontend_exec
+    assert '"${FRONTEND_ARGS[@]}" -i "$INITIAL_PROMPT"' in frontend_exec
     assert '"${FRONTEND_ARGS[@]}" "$INITIAL_PROMPT"' in frontend_exec
     test_source = Path(__file__).read_text(encoding="utf-8")
     assert "BASELINE_" + "HEAD" not in test_source
@@ -849,15 +924,16 @@ def test_path_hardening_precedes_copilot_resolution(tmp_path):
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
-def test_native_frontend_launcher_seeds_strong_claim(tmp_path):
+@pytest.mark.parametrize("frontend", ("claude", "copilot"))
+def test_native_frontend_launcher_seeds_strong_claim(tmp_path, frontend):
     source = Path("/bin/true")
     if not source.is_file():
         pytest.skip("/bin/true unavailable")
     host_bin = tmp_path / "bin"
     host_bin.mkdir()
-    claude = host_bin / "claude"
-    claude.write_bytes(source.read_bytes())
-    claude.chmod(0o755)
+    executable = host_bin / frontend
+    executable.write_bytes(source.read_bytes())
+    executable.chmod(0o755)
     home = tmp_path / "home"
     home.mkdir()
     tmpdir = tmp_path / "tmp"
@@ -870,7 +946,7 @@ def test_native_frontend_launcher_seeds_strong_claim(tmp_path):
     }
 
     result = subprocess.run(
-        ["bash", str(LAUNCHER), "--frontend", "claude"],
+        ["bash", str(LAUNCHER), "--frontend", frontend],
         cwd=home,
         env=env,
         capture_output=True,
@@ -884,11 +960,124 @@ def test_native_frontend_launcher_seeds_strong_claim(tmp_path):
     assert len(entries) == 1
     text = entries[0].read_text(encoding="utf-8")
     assert "host_v=1\n" in text
-    assert "host=claude\n" in text
+    assert f"host={frontend}\n" in text
     assert f"host_uid={os.geteuid()}\n" in text
-    assert f"host_exe={claude}\n" in text
+    assert f"host_exe={executable}\n" in text
     assert "host_exe_dev=" in text
     assert "host_exe_ino=" in text
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
+@pytest.mark.parametrize("resume", (False, True), ids=("new", "continue"))
+def test_native_copilot_launcher_adapts_argv_and_resolves_owner(tmp_path, resume):
+    from core.project import sessions
+
+    host_bin = tmp_path / "bin"
+    home = tmp_path / "home"
+    tmpdir = tmp_path / "tmp"
+    target = tmp_path / "target"
+    out_dir = tmp_path / "out"
+    for directory in (host_bin, home, tmpdir, target, out_dir):
+        directory.mkdir()
+    copilot = host_bin / "copilot"
+    _compile_native_fixture(copilot)
+    marker = home / "native-frontend-ready"
+    env = {
+        "PATH": f"{host_bin}:{_system_path()}",
+        "HOME": str(home),
+        "TMPDIR": str(tmpdir),
+        "TERM": "dumb",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "RAPTOR_CONFIG": str(tmp_path / "models.json"),
+        "RAPTOR_OUT_DIR": str(out_dir),
+        "RAPTOR_CC_TRANSPORT_DISABLED": "1",
+        "RAPTOR_COPILOT_TRANSPORT_DISABLED": "1",
+    }
+    process = subprocess.Popen(
+        [
+            "bash",
+            str(LAUNCHER),
+            "--frontend=copilot",
+            "--verbose",
+            "--model",
+            "gpt-6-astra",
+            "--reasoning-effort=max",
+            "--context=long_context",
+            *(["--continue"] if resume else [str(target)]),
+        ],
+        cwd=tmp_path,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        _wait_until(marker.exists)
+        assert int(marker.read_text(encoding="utf-8").strip()) == process.pid
+        argv = [
+            item.decode("utf-8")
+            for item in Path(f"/proc/{process.pid}/cmdline")
+            .read_bytes()
+            .split(b"\0")
+            if item
+        ]
+        assert argv[0] == str(copilot)
+        assert "--no-auto-update" in argv
+        assert argv[argv.index("--log-level") + 1] == "debug"
+        assert argv[argv.index("--model") + 1] == "gpt-6-astra"
+        assert "--reasoning-effort=max" in argv
+        assert "--context=long_context" in argv
+        if resume:
+            assert "--continue" in argv
+            assert "--name" not in argv
+            assert "-i" not in argv
+        else:
+            assert "--continue" not in argv
+            assert argv[argv.index("--name") + 1] == "RAPTOR"
+            assert argv[argv.index("-i") + 1] == f"/raptor {target}"
+        assert "--verbose" not in argv
+        process_env = dict(
+            item.split(b"=", 1)
+            for item in Path(f"/proc/{process.pid}/environ")
+            .read_bytes()
+            .split(b"\0")
+            if b"=" in item
+        )
+        assert process_env[b"RAPTOR_FRONTEND"] == b"copilot"
+        assert process_env[b"RAPTOR_FRONTEND_MODEL"] == b"gpt-6-astra"
+
+        entry = (
+            home
+            / ".local"
+            / "share"
+            / "raptor"
+            / "sessions.d"
+            / str(process.pid)
+        )
+        fields = _wait_until(lambda: sessions._parse_entry(entry))
+        assert fields["host"] == "copilot"
+        assert fields["host_exe"] == str(copilot)
+        assert len(fields["token"]) == 32
+        with (
+            patch.object(sessions, "SESSIONS_DIR", entry.parent),
+            patch.dict(
+                os.environ,
+                {
+                    sessions.ENV_SESSION_PID: str(process.pid),
+                    sessions.ENV_SESSION_TOKEN: fields["token"],
+                },
+            ),
+        ):
+            owner = sessions.resolve_session_owner()
+        assert owner is not None
+        assert owner.pid == process.pid
+        assert owner.frontend is Frontend.COPILOT
+        assert owner.host_verified is True
+    finally:
+        stdout, stderr = _terminate_owned_process_group(process)
+    assert process.returncode == 0, (stdout, stderr)
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")

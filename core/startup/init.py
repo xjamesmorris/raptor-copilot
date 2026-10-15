@@ -667,7 +667,9 @@ def check_llm() -> tuple[list, list]:
             lines.append("   llm: no external LLM configured")
 
         if shutil.which("claude"):
-            lines.append("        claude code ✓")
+            lines.append(
+                "        claude code ✓ (analysis CLI installed; auth not checked)"
+            )
 
     except Exception as e:  # noqa: BLE001
         lines.append("   llm: detection error")
@@ -768,6 +770,26 @@ def _key_source(provider: str, model_entry: dict | None = None) -> str:
     if env_var and os.getenv(env_var):
         return f"via {env_var}"
     return "via models.json"
+
+
+def check_frontend() -> str | None:
+    """Describe the launcher-selected frontend without probing or selecting it."""
+    from core.security.log_sanitisation import escape_nonprintable
+
+    frontend = os.getenv("RAPTOR_FRONTEND")
+    frontend_labels = {
+        "claude": "Claude Code",
+        "copilot": "GitHub Copilot CLI",
+    }
+    if frontend not in frontend_labels:
+        return None
+    model = os.getenv("RAPTOR_FRONTEND_MODEL")
+    model_label = (
+        escape_nonprintable(model)
+        if model
+        else "session/config default"
+    )
+    return f"{frontend_labels[frontend]} (model: {model_label})"
 
 
 def check_env(unavailable_features: set) -> tuple[list, list]:
@@ -1211,6 +1233,7 @@ def main() -> None:
             tool_updates = check_tool_updates()
             llm_lines, llm_warnings = check_llm()
             env_parts, env_warnings = check_env(unavailable)
+            frontend_status = check_frontend()
             lang_line, lang_warnings = check_lang()
             project_line = check_active_project()
         finally:
@@ -1222,6 +1245,7 @@ def main() -> None:
             env_warnings + lang_warnings,
             project_line, lang_line,
             tool_updates=tool_updates,
+            frontend_status=frontend_status,
         )
     except Exception:  # noqa: BLE001
         output = f"{logo}\n\nraptor:~$ {quote}"

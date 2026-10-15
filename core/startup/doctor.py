@@ -366,7 +366,7 @@ def _gather() -> tuple[
     str | None,           # project_line
     list[str],               # advisories
 ]:
-    """Run every check and return the same shape ``init.main`` builds.
+    """Run startup checks and return doctor-rendering inputs.
 
     Silences logging like ``init.main`` does — these checks are
     noisy at WARNING level (LLM key validation, sandbox probes).
@@ -374,6 +374,7 @@ def _gather() -> tuple[
     from .init import (
         check_active_project,
         check_env,
+        check_frontend,
         check_lang,
         check_llm,
         check_tools,
@@ -391,6 +392,9 @@ def _gather() -> tuple[
         tool_warnings = list(tool_warnings) + _module_dep_warnings()
         llm_lines, llm_warnings = check_llm()
         env_parts, env_warnings = check_env(unavailable)
+        frontend_status = check_frontend()
+        if frontend_status:
+            env_parts = [*env_parts, f"frontend {frontend_status}"]
         lang_line, lang_warnings = check_lang()
         env_warnings = list(env_warnings) + list(lang_warnings)
         # Doctor-only depth (same rationale shape as the module-import

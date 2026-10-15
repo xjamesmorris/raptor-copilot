@@ -62,6 +62,10 @@ def write_env_file():
         f'export RAPTOR_DIR={shlex.quote(repo_root)}\n'
         f'export PATH="$PATH":{shlex.quote(bin_dir)}\n'
     )
+    for key in ("RAPTOR_FRONTEND", "RAPTOR_FRONTEND_MODEL"):
+        value = os.environ.get(key)
+        if value:
+            content += f"export {key}={shlex.quote(value)}\n"
 
     try:
         Path(env_file).write_text(content, encoding="utf-8")

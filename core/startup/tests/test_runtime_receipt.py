@@ -4304,7 +4304,9 @@ def test_importing_sessions_keeps_receipt_modules_lazy_and_cycle_free(
     ]
 
 
-def test_t38_existing_copilot_frontend_remains_gated(tmp_path: Path) -> None:
+def test_t38_existing_shebang_copilot_frontend_remains_gated(
+    tmp_path: Path,
+) -> None:
     from core.startup.host import FrontendLaunchState, prepare_frontend
 
     executable = tmp_path / "copilot"
