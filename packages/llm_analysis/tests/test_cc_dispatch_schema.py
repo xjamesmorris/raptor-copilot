@@ -73,6 +73,7 @@ class TestSchemaNormalisedForCCTransport:
         sent = self._invoke(monkeypatch, descriptive)
         # Real JSON Schema shape: properties with typed entries, not
         # bare descriptive strings the CLI validator would ignore.
+        assert sent["type"] == "object"
         assert "properties" in sent
         props = sent["properties"]
         assert props["reasoning"]["type"] == "string"
@@ -82,13 +83,23 @@ class TestSchemaNormalisedForCCTransport:
         # No raw descriptive string survives as a property value.
         assert all(isinstance(v, dict) for v in props.values())
 
-    def test_proper_json_schema_passes_through(self, monkeypatch):
+    def test_property_schema_gains_root_object_type(self, monkeypatch):
         proper = {
             "properties": {"verdict": {"type": "string"}},
             "required": ["verdict"],
         }
         sent = self._invoke(monkeypatch, proper)
-        assert sent == proper
+        assert sent == {**proper, "type": "object"}
+        assert "type" not in proper
+
+    def test_explicit_non_object_root_type_is_preserved(self, monkeypatch):
+        explicit = {
+            "type": "array",
+            "properties": {"verdict": {"type": "string"}},
+            "required": ["verdict"],
+        }
+        sent = self._invoke(monkeypatch, explicit)
+        assert sent == explicit
 
     def test_none_schema_stays_freeform(self, monkeypatch):
         assert self._invoke(monkeypatch, None) is None
@@ -98,6 +109,7 @@ class TestSchemaNormalisedForCCTransport:
         # out as a closed, typed JSON Schema.
         from packages.llm_analysis.prompts import build_analysis_schema
         sent = self._invoke(monkeypatch, build_analysis_schema())
+        assert sent["type"] == "object"
         assert "properties" in sent
         assert all(isinstance(v, dict) for v in sent["properties"].values())
 

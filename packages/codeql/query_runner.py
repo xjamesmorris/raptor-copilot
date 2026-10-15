@@ -169,6 +169,35 @@ def _extract_missing_pack(stderr: str) -> str | None:
     return None
 
 
+def _persist_pack_download_stderr(
+    stderr: str | None,
+    out_dir: Path,
+    language: str,
+) -> tuple[Path, str]:
+    """Persist complete sanitized pack-download stderr as a private artifact."""
+    from core.security.log_sanitisation import escape_nonprintable
+    from core.security.redaction import redact_secrets
+
+    safe_stderr = escape_nonprintable(
+        redact_secrets(stderr or ""),
+        preserve_newlines=True,
+    )
+    safe_language = re.sub(r"[^A-Za-z0-9_.-]+", "_", language)[:64] or "unknown"
+    path = out_dir / f"codeql_{safe_language}_pack_download.stderr.log"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as artifact:
+            fd = -1
+            artifact.write(safe_stderr)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    return path, safe_stderr
+
+
 @dataclass
 class QueryResult:
     """Result of query execution."""
@@ -651,9 +680,51 @@ class QueryRunner:
                         # `[:200]` slice raised TypeError on None,
                         # masking the original "download failed" with
                         # an unrelated traceback.
-                        dl_stderr = (dl.stderr or "")[:200]
+                        try:
+                            artifact_path, safe_dl_stderr = (
+                                _persist_pack_download_stderr(
+                                    dl.stderr, out_dir, language,
+                                )
+                            )
+                        except OSError as exc:
+                            from core.security.log_sanitisation import (
+                                escape_nonprintable,
+                            )
+                            from core.security.redaction import redact_secrets
+
+                            safe_dl_stderr = escape_nonprintable(
+                                redact_secrets(dl.stderr or ""),
+                                preserve_newlines=True,
+                            )
+                            safe_exc = escape_nonprintable(
+                                redact_secrets(str(exc)),
+                            )
+                            artifact_path = None
+                            errors.append(
+                                "Failed to persist full pack download "
+                                f"stderr: {safe_exc}"
+                            )
+                            logger.error(
+                                "✗ Failed to persist full pack download "
+                                "stderr: %s",
+                                safe_exc,
+                            )
+
+                        dl_stderr = safe_dl_stderr[:200]
                         errors.append(f"Pack download failed: {dl_stderr}")
-                        logger.error("✗ Failed to download %s: %s", pack_name, dl_stderr)
+                        logger.error(
+                            "✗ Failed to download %s: %s",
+                            pack_name, dl_stderr,
+                        )
+                        if artifact_path is not None:
+                            errors.append(
+                                "Full sanitized pack download stderr: "
+                                f"{artifact_path}"
+                            )
+                            logger.error(
+                                "  Full sanitized stderr: %s",
+                                artifact_path,
+                            )
 
             if not success:
                 errors.append(f"Analysis failed with exit code {result.returncode}")

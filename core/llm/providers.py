@@ -1480,12 +1480,16 @@ def _normalize_schema(schema: dict[str, Any]) -> dict[str, Any]:
     """Normalize simple format schema to JSON Schema format.
 
     Simple format: {"field": "type description"}
-    JSON Schema format: {"properties": {...}, "required": [...]}
+    JSON Schema format:
+    {"type": "object", "properties": {...}, "required": [...]}
 
-    Returns the schema unchanged if already in JSON Schema format.
+    Property-based schemas gain a root object type when omitted. An explicit
+    type is preserved unchanged.
     """
     if "properties" in schema:
-        return schema  # Already JSON Schema
+        normalized = dict(schema)
+        normalized.setdefault("type", "object")
+        return normalized
 
     type_aliases = {
         "bool": "boolean", "str": "string", "int": "integer",
@@ -1536,7 +1540,11 @@ def _normalize_schema(schema: dict[str, Any]) -> dict[str, Any]:
         desc_lower = str(field_desc).lower()
         if "optional" not in desc_lower and "or null" not in desc_lower:
             required.append(field_name)
-    return {"properties": properties, "required": required}
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": required,
+    }
 
 
 def _schema_to_gemini(schema: dict[str, Any]) -> dict[str, Any]:
