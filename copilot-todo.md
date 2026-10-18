@@ -237,14 +237,32 @@ path; `HANDOFF.md` and `HUMAN-REVIEW.md` are older September 13 snapshots.
   do not introduce silent fallback or broadly relax validation. It may reuse
   MVP-08's contract/tests but must not depend on a new Copilot provider.
 
-- [ ] **MVP-10 - Run and record live frontend parity acceptance.**
+- [x] **MVP-10 - Run and record live frontend parity acceptance.**
+
+  **Completed October 17, 2026 (October 18 UTC):** bounded live Claude Code
+  2.1.301 and Copilot CLI 1.0.100-1 sessions verified all 39 commands, all 18
+  custom agents, Copilot's 52 command/skill entries, exact project/session
+  binding, continuation and explicit resume, read coverage, lifecycle
+  completion/failure/cancellation, direct SessionEnd orphan cleanup, and
+  report/artifact discovery. Coverage manifests and JSON use exact realpaths
+  and mode `0600`; fixtures and source remained unchanged.
+
+  Claude custom agents inherit the parent model even when conflicting
+  subagent environment variables are present. Copilot's built-in managed
+  `execution_subagent` ignored a repository model request and used its
+  upstream-selected model; usage output is therefore authoritative and this
+  is documented as an upstream limitation, not a repository parity failure.
+  The five security-sensitive custom-agent hook policies are enforced by the
+  Claude launcher plugin and are explicitly **not** Copilot guarantees.
+  Live `--yolo` was not exercised, and synthetic runtime receipts remain
+  test-only and non-authorizing.
 
   Suggested acceptance work: compare the supported Claude and native-Linux
   Copilot paths using deterministic fixtures and bounded live smoke runs.
   Existing fake/process tests and one completed scan do not alone prove
   every interactive workflow.
 
-  **Done when:** record evidence for command/skill/agent discovery, initial
+  **Acceptance evidence:** recorded command/skill/agent discovery, initial
   target dispatch, model/flag forwarding, project binding and isolation,
   continuation/resume, read-coverage plugin events, lifecycle completion,
   failure/cancellation, and report/artifact discovery. Distinguish the parent
