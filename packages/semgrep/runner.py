@@ -65,9 +65,8 @@ _SCOPE_ISOLATION_MIN_VERSION = (1, 95, 0)
 # .semgrepignore exists). This list restores the useful part of that
 # default set from RAPTOR code, where a hostile target cannot edit it.
 #
-# Curation rule — dependency/build/artifact directories and generated
-# files ONLY: names that by ecosystem convention hold third-party or
-# machine-generated content nobody hand-edits. Deliberately ABSENT
+# Curation rule — Git's reserved metadata basename plus dependency /
+# build / artifact directories and generated files ONLY. Deliberately ABSENT
 # (diverging from semgrep's built-in defaults, probed on 1.172.0:
 # .env/ .npm/ .tox/ .venv/ .yarn/ build/ dist/ node_modules/ test/
 # tests/ vendor/):
@@ -77,13 +76,20 @@ _SCOPE_ISOLATION_MIN_VERSION = (1, 95, 0)
 #     examples/, docs/, scripts/ etc. out of this list.
 #   - .env/ — the bare name collides with ``.env`` secret FILES;
 #     excluding the pattern would blind secrets rules.
-# Both-direction rationale: ADDING an entry re-opens a name-steerable
-# hiding spot (any first-party-plausible name is a hole a target can
-# mkdir its way into); REMOVING one buys back scan cost and finding
-# noise on third-party code RAPTOR does not report on anyway.
+# Both-direction rationale: beyond the reserved ``.git`` basename,
+# ADDING an entry re-opens a name-steerable hiding spot (any
+# first-party-plausible name is a hole a target can mkdir its way
+# into); REMOVING one buys back scan cost and finding noise on
+# third-party code RAPTOR does not report on anyway.
 # Operators extend per-run via extra_args --exclude / the scanner's
 # exclude-glob filter; entries here must clear the curation rule.
 SCOPE_EXCLUDE_BASELINE: tuple[str, ...] = (
+    # Git metadata, never application source. The bare gitignore-style
+    # basename matches root + nested .git directories AND worktree /
+    # submodule .git pointer files (verified on semgrep 1.172.0).
+    # Do not widen this to a hidden-path glob: .env and first-party
+    # dot-directories deliberately remain in scope.
+    ".git",
     # dependency trees / package-manager state
     "node_modules/",
     "bower_components/",
@@ -219,9 +225,10 @@ def build_cmd(
         # .semgrepignore machinery also drops semgrep's BUILT-IN
         # default ignore set (node_modules/, tests/, vendor/, ...),
         # which only applies when no .semgrepignore file exists —
-        # the SCOPE_EXCLUDE_BASELINE --exclude args below restore
-        # the dependency/build/artifact part of it from RAPTOR code;
-        # tests/-type first-party names stay deliberately IN scope.
+        # the SCOPE_EXCLUDE_BASELINE --exclude args below restore Git
+        # metadata plus the dependency/build/artifact part of it from
+        # RAPTOR code; tests/-type first-party names stay deliberately
+        # IN scope.
         # RAPTOR-owned scope control (--exclude/--include via
         # extra_args, the scanner's exclude-glob filter) is
         # unaffected. --x-ignore-semgrepignore-files is documented

@@ -21,6 +21,14 @@ from packages.semgrep.runner import (
     scope_isolation_available,
     version,
 )
+from packages.semgrep.tests.scope_fixture import (
+    EXPECTED_SCOPE_FINDINGS,
+    GIT_NEAR_MISS_FINDINGS,
+    SCOPE_MARKER,
+    create_git_scope_fixture,
+    relative_scope_path,
+    write_scope_rule,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -138,6 +146,7 @@ class TestBuildCmd:
         clean exit, and both flags restore them.
         """
         cmd = build_cmd(Path("/src"), "p/x", semgrep_bin="semgrep")
+        assert "--disable-nosem" in cmd
         assert "--no-git-ignore" in cmd
         assert "--x-ignore-semgrepignore-files" in cmd
 
@@ -158,6 +167,7 @@ class TestBuildCmd:
         """
         from packages.semgrep.runner import SCOPE_EXCLUDE_BASELINE
         assert SCOPE_EXCLUDE_BASELINE == (
+            ".git",
             "node_modules/",
             "bower_components/",
             ".yarn/",
@@ -183,13 +193,20 @@ class TestBuildCmd:
         )
         # First-party names a target could hide real code under must
         # never creep in (reject-direction guard for the curation rule).
-        for steerable in ("test/", "tests/", "examples/", "docs/", ".env/"):
+        for steerable in (
+            "test/",
+            "tests/",
+            "examples/",
+            "docs/",
+            ".env/",
+            ".*",
+        ):
             assert steerable not in SCOPE_EXCLUDE_BASELINE
 
     def test_scope_exclude_baseline_in_cmd(self):
         """Every baseline pattern rides as an ``--exclude <pattern>``
         pair — --x-ignore-semgrepignore-files drops semgrep's built-in
-        default ignores, and these args are what restores the
+        default ignores, and these args restore Git metadata plus the
         dependency/build/artifact part of that set."""
         from packages.semgrep.runner import SCOPE_EXCLUDE_BASELINE
         cmd = build_cmd(Path("/src"), "p/x", semgrep_bin="semgrep")
@@ -862,6 +879,97 @@ class TestScanScopeLive:
         assert reasons.get("cli_exclude_flags_match", {}).get("count", 0) >= 1, (
             "baseline exclusion happened but was invisible in skipped_summary"
         )
+
+    @pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
+    def test_exact_git_exclusion_keeps_near_misses_and_first_party_scope(
+        self, tmp_path,
+    ):
+        """Only exact .git metadata is excluded; near misses remain live.
+
+        ``git init`` supplies the same sample hooks that produced SG-1's
+        four Bash parse warnings. A nested repository exercises basename
+        matching below the root, while pointer files model submodules and
+        linked worktrees. The matching .github, filename, and application
+        directory near misses prove the policy did not widen beyond .git.
+        Everything else is deliberately uncommitted.
+        """
+        rule = write_scope_rule(tmp_path)
+        target = create_git_scope_fixture(tmp_path)
+
+        result = run_rule(
+            target,
+            str(rule),
+            timeout=120,
+            unsandboxed=True,
+        )
+
+        assert result.ok, result.errors
+        finding_paths = sorted(
+            relative_scope_path(f.file, target) for f in result.findings
+        )
+        assert finding_paths == list(EXPECTED_SCOPE_FINDINGS)
+        assert set(GIT_NEAR_MISS_FINDINGS).issubset(finding_paths)
+
+        failed_paths = [
+            relative_scope_path(entry["path"], target)
+            for entry in result.files_failed
+        ]
+        assert failed_paths == ["broken.sh"]
+        assert "Syntax error" in result.files_failed[0]["reason"]
+        assert not any(".git" in Path(path).parts for path in failed_paths)
+
+        reasons = result.skipped_summary.get("reasons", {})
+        git_skips = reasons.get("cli_exclude_flags_match", {})
+        assert git_skips.get("count", 0) >= 4
+        git_skip_samples = {
+            relative_scope_path(path, target)
+            for path in git_skips.get("sample", [])
+        }
+        assert {
+            ".git",
+            "nested-repo/.git",
+            "submodule/.git",
+            "worktree/.git",
+        }.issubset(git_skip_samples)
+
+    def test_root_and_nested_git_pointer_files_are_excluded(self, tmp_path):
+        """A worktree root cannot also contain a normal ``.git/`` directory."""
+        rule = write_scope_rule(tmp_path)
+        target = tmp_path / "worktree-target"
+        nested = target / "submodule"
+        nested.mkdir(parents=True)
+        (target / ".git").write_text(
+            f"gitdir: ../metadata/{SCOPE_MARKER}\n",
+            encoding="utf-8",
+        )
+        (nested / ".git").write_text(
+            f"gitdir: ../../metadata/{SCOPE_MARKER}\n",
+            encoding="utf-8",
+        )
+        (target / "app.txt").write_text(
+            f"{SCOPE_MARKER}\n",
+            encoding="utf-8",
+        )
+
+        result = run_rule(
+            target,
+            str(rule),
+            timeout=120,
+            unsandboxed=True,
+        )
+
+        assert result.ok, result.errors
+        assert [
+            relative_scope_path(f.file, target) for f in result.findings
+        ] == ["app.txt"]
+        assert result.files_failed == []
+        reasons = result.skipped_summary.get("reasons", {})
+        git_skips = reasons.get("cli_exclude_flags_match", {})
+        assert git_skips.get("count") == 2
+        assert {
+            relative_scope_path(path, target)
+            for path in git_skips.get("sample", [])
+        } == {".git", "submodule/.git"}
 
 
 # Opt-in with ``pytest -m integration``.
