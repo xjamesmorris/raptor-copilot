@@ -1,11 +1,15 @@
 # Shared frontend fixtures
 
 `core.testing.host_events` provides immutable builders for the existing
-Claude hook shapes and candidate-only Copilot hook shapes. Every call returns
-fresh payload containers so malformed, duplicate, reordered, stale, and
+Claude hook shapes, candidate-only Copilot hook shapes, and a synthetic
+transcription of the MVP-10 Copilot 1.0.100-1 PascalCase-plugin `PostToolUse`
+envelope. Session IDs, paths, timestamps, and machine-identity values are
+stable synthetic sentinels; only field aliases and event structure reflect
+the observed host bytes. Every call returns fresh
+payload containers so malformed, duplicate, reordered, stale, and
 foreign-session cases cannot mutate another test. Candidate records always
-carry `candidate-unverified`; they do not grant ownership, lifecycle effects,
-coverage attribution, or live validation.
+carry `candidate-unverified`; live-observed fixtures model bytes only and do
+not grant ownership, lifecycle effects, or coverage attribution.
 
 `core.testing.feature_ledger` derives command, skill, and agent rows from the
 current `.claude` source tree. It reuses the repository's command-frontmatter

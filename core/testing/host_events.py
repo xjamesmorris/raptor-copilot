@@ -1,9 +1,9 @@
 """Deterministic host-event fixtures for cross-host adapter tests.
 
 These values are test evidence, never session authority. Claude fixtures
-model the repository's existing hook contract. Copilot fixtures are fixed as
-candidate-unverified and cannot claim live delivery, permissions, lifecycle
-semantics, or coverage parity.
+model the repository's existing hook contract. The historical Copilot
+candidate remains parse-only; the live hook-v1 fixtures model the event shape
+observed during MVP-10 without granting ownership on their own.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ class FixtureHost(str, Enum):
 
     CLAUDE_LEGACY_V1 = "claude-legacy-v1"
     COPILOT_1_0_84_4_HOOK_CANDIDATE = "copilot-1.0.84-4-hook-candidate"
+    COPILOT_HOOK_V1 = "copilot-hook-v1"
 
 
 class FixtureEventKind(str, Enum):
@@ -46,6 +47,7 @@ class FixtureEvidenceLevel(str, Enum):
 
     EXISTING_CLAUDE_CONTRACT = "existing-claude-hook-contract"
     CANDIDATE_UNVERIFIED = "candidate-unverified"
+    LIVE_OBSERVED = "live-observed"
 
 
 _EVENT_NAMES = MappingProxyType(
@@ -69,6 +71,15 @@ _EVENT_NAMES = MappingProxyType(
                 # W1a observed prompt-mode sessionEnd semantics only as a
                 # candidate turn boundary. It is never a true session end.
                 FixtureEventKind.TURN_END: "sessionEnd",
+            }
+        ),
+        FixtureHost.COPILOT_HOOK_V1: MappingProxyType(
+            {
+                FixtureEventKind.SESSION_START: "sessionStart",
+                FixtureEventKind.TOOL_START: "preToolUse",
+                FixtureEventKind.TOOL_SUCCESS: "postToolUse",
+                FixtureEventKind.TOOL_FAILURE: "postToolUseFailure",
+                FixtureEventKind.SESSION_END: "sessionEnd",
             }
         ),
     }
@@ -118,6 +129,9 @@ _FIELD_NAMES = MappingProxyType(
             dict(_CLAUDE_IDENTITY_FIELDS) | dict(_CLAUDE_TOOL_FIELDS)
         ),
         FixtureHost.COPILOT_1_0_84_4_HOOK_CANDIDATE: MappingProxyType(
+            dict(_COPILOT_IDENTITY_FIELDS) | dict(_COPILOT_TOOL_FIELDS)
+        ),
+        FixtureHost.COPILOT_HOOK_V1: MappingProxyType(
             dict(_COPILOT_IDENTITY_FIELDS) | dict(_COPILOT_TOOL_FIELDS)
         ),
     }
@@ -216,11 +230,12 @@ class HostEventFixture:
             if not isinstance(self.tool_args, Mapping):
                 raise TypeError("tool_args must be a mapping")
             object.__setattr__(self, "tool_args", _freeze(self.tool_args))
-        evidence = (
-            FixtureEvidenceLevel.EXISTING_CLAUDE_CONTRACT
-            if self.host is FixtureHost.CLAUDE_LEGACY_V1
-            else FixtureEvidenceLevel.CANDIDATE_UNVERIFIED
-        )
+        if self.host is FixtureHost.CLAUDE_LEGACY_V1:
+            evidence = FixtureEvidenceLevel.EXISTING_CLAUDE_CONTRACT
+        elif self.host is FixtureHost.COPILOT_1_0_84_4_HOOK_CANDIDATE:
+            evidence = FixtureEvidenceLevel.CANDIDATE_UNVERIFIED
+        else:
+            evidence = FixtureEvidenceLevel.LIVE_OBSERVED
         object.__setattr__(self, "evidence_level", evidence)
 
     def payload(
@@ -423,6 +438,76 @@ def copilot_candidate_read_event(
     )
 
 
+def copilot_read_event(
+    path: str,
+    *,
+    successful: bool = True,
+    argument_name: str = "path",
+    session_id: str = "copilot-session-1",
+    event_id: str | None = None,
+    tool_call_id: str | None = None,
+    tool_name: str = "view",
+    asynchronous: bool = False,
+    include_declared_kind: bool = False,
+    extra_tool_args: Mapping[str, object] | None = None,
+) -> HostEventFixture:
+    """Build the live-observed Copilot read-hook shape."""
+    args: dict[str, object] = {argument_name: path}
+    if extra_tool_args is not None:
+        args.update(extra_tool_args)
+    return HostEventFixture(
+        fixture_id=(
+            "copilot-read-success"
+            if successful
+            else "copilot-read-failure"
+        ),
+        host=FixtureHost.COPILOT_HOOK_V1,
+        event_kind=(
+            FixtureEventKind.TOOL_SUCCESS
+            if successful
+            else FixtureEventKind.TOOL_FAILURE
+        ),
+        session_id=session_id,
+        event_id=event_id,
+        tool_call_id=tool_call_id,
+        tool_name=tool_name,
+        tool_args=args,
+        outcome=FixtureOutcome.UNKNOWN,
+        asynchronous=asynchronous,
+        include_declared_kind=include_declared_kind,
+    )
+
+
+def copilot_live_read_payload(
+    path: str = "/synthetic/fixture/probe.py",
+    *,
+    session_id: str = "11111111-1111-4111-8111-111111111111",
+) -> bytes:
+    """Return a synthetic transcription of the live-observed envelope."""
+    return json.dumps(
+        {
+            "cwd": "/synthetic/raptor-copilot",
+            "hook_event_name": "PostToolUse",
+            "session_id": session_id,
+            "timestamp": "2000-01-02T03:04:05.678Z",
+            "tool_input": {"path": path},
+            "tool_name": "Read",
+            "tool_result": {
+                "result_type": "success",
+                "text_result_for_llm": (
+                    '"""Inert synthetic MVP-10 coverage probe."""\n\n\n'
+                    "def answer() -> int:\n"
+                    "    return 42\n"
+                ),
+            },
+        },
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
 def startup_event(
     host: FixtureHost,
     *,
@@ -478,6 +563,23 @@ def claude_session_end_event(
     )
 
 
+def copilot_session_end_event(
+    *,
+    session_id: str,
+    event_id: str,
+    reason: str = "complete",
+) -> HostEventFixture:
+    """Build the live-observed Copilot session-end registration shape."""
+    return HostEventFixture(
+        fixture_id="copilot-session-end",
+        host=FixtureHost.COPILOT_HOOK_V1,
+        event_kind=FixtureEventKind.SESSION_END,
+        session_id=session_id,
+        event_id=event_id,
+        reason=reason,
+    )
+
+
 __all__ = [
     "FixtureEvidenceLevel",
     "FixtureEventKind",
@@ -488,6 +590,9 @@ __all__ = [
     "claude_read_event",
     "claude_session_end_event",
     "copilot_candidate_read_event",
+    "copilot_live_read_payload",
+    "copilot_read_event",
+    "copilot_session_end_event",
     "startup_event",
     "turn_end_event",
 ]

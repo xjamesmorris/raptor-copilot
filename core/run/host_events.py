@@ -29,6 +29,7 @@ class HostEventProfileId(str, Enum):
 
     CLAUDE_LEGACY_V1 = "claude-legacy-v1"
     COPILOT_1_0_84_4_HOOK_CANDIDATE = "copilot-1.0.84-4-hook-candidate"
+    COPILOT_HOOK_V1 = "copilot-hook-v1"
     UNKNOWN = "unknown"
 
 
@@ -92,6 +93,7 @@ class NormalizedHostEvent:
     raw_tool_name: str | None
     canonical_tool_name: str | None
     tool_args: Mapping[str, object] | None
+    tool_input: Mapping[str, object] | None
     success: bool | None
     reason: str | None
     payload_sha256: str
@@ -130,6 +132,11 @@ PROFILE_META: Mapping[HostEventProfileId, HostEventProfileMeta] = MappingProxyTy
             evidence="snapshot-schema-candidate",
             channel="hook",
         ),
+        HostEventProfileId.COPILOT_HOOK_V1: HostEventProfileMeta(
+            effects_enabled=True,
+            evidence="live-observed-copilot-1.0.100-1-alias-normalized",
+            channel="hook",
+        ),
     }
 )
 
@@ -146,7 +153,34 @@ _TOOL_NAME_ALIASES: Mapping[HostEventProfileId, Mapping[str, str]] = MappingProx
                 "view": "Read",
             }
         ),
+        HostEventProfileId.COPILOT_HOOK_V1: MappingProxyType(
+            {
+                "view": "Read",
+            }
+        ),
     }
+)
+
+_READ_PATH_KEYS: Mapping[HostEventProfileId, str] = MappingProxyType(
+    {
+        HostEventProfileId.CLAUDE_LEGACY_V1: "file_path",
+        HostEventProfileId.COPILOT_1_0_84_4_HOOK_CANDIDATE: "path",
+        HostEventProfileId.COPILOT_HOOK_V1: "path",
+    }
+)
+
+_COPILOT_LIVE_EXACT_ALIAS_PAIRS = (
+    ("eventId", "event_id"),
+    ("parentId", "parent_id"),
+    ("sessionId", "session_id"),
+    ("turnId", "turn_id"),
+    ("agentId", "agent_id"),
+    ("toolCallId", "tool_call_id"),
+)
+_COPILOT_LIVE_CRITICAL_ALIAS_PAIRS = (
+    ("sessionId", "session_id"),
+    ("toolName", "tool_name"),
+    ("toolArgs", "tool_input"),
 )
 
 _FIELD_NAMES: Mapping[HostEventProfileId, Mapping[str, str]] = MappingProxyType(
@@ -169,6 +203,23 @@ _FIELD_NAMES: Mapping[HostEventProfileId, Mapping[str, str]] = MappingProxyType(
             )
         ),
         HostEventProfileId.COPILOT_1_0_84_4_HOOK_CANDIDATE: MappingProxyType(
+            dict(
+                (
+                    ("payload_kind", "hookEventName"),
+                    ("event_id", "eventId"),
+                    ("parent_id", "parentId"),
+                    ("session_id", "sessionId"),
+                    ("turn_id", "turnId"),
+                    ("agent_id", "agentId"),
+                    ("tool_call_id", "toolCallId"),
+                    ("tool_name", "toolName"),
+                    ("tool_args", "toolArgs"),
+                    ("success", "success"),
+                    ("reason", "reason"),
+                )
+            )
+        ),
+        HostEventProfileId.COPILOT_HOOK_V1: MappingProxyType(
             dict(
                 (
                     ("payload_kind", "hookEventName"),
@@ -212,9 +263,137 @@ _EVENT_NAMES: Mapping[HostEventProfileId, Mapping[HostEventKind, str]] = (
                     HostEventKind.AGENT_STOP: "agentStop",
                 }
             ),
+            HostEventProfileId.COPILOT_HOOK_V1: MappingProxyType(
+                {
+                    HostEventKind.SESSION_START: "sessionStart",
+                    HostEventKind.SESSION_END: "sessionEnd",
+                    HostEventKind.TOOL_START: "preToolUse",
+                    HostEventKind.TOOL_SUCCESS: "postToolUse",
+                    HostEventKind.TOOL_FAILURE: "postToolUseFailure",
+                    HostEventKind.AGENT_STOP: "agentStop",
+                }
+            ),
         }
     )
 )
+
+
+def _canonical_read_args(
+    value: object,
+) -> tuple[dict[str, object] | None, str | None]:
+    if not isinstance(value, dict):
+        return None, "bad_tool_args"
+    try:
+        normalized = copy.deepcopy(value)
+    except RecursionError:
+        return None, "depth"
+    has_path = "path" in normalized
+    has_file_path = "file_path" in normalized
+    if (
+        has_path
+        and has_file_path
+        and normalized["path"] != normalized["file_path"]
+    ):
+        return None, "ambiguous_field_alias"
+    if has_path:
+        normalized["file_path"] = normalized.pop("path")
+    return normalized, None
+
+
+def _native_read_args(value: Mapping[str, object]) -> dict[str, object]:
+    normalized = copy.deepcopy(dict(value))
+    if "file_path" in normalized:
+        normalized["path"] = normalized.pop("file_path")
+    return normalized
+
+
+def _normalize_copilot_live_aliases(
+    payload: Mapping[str, object],
+    registration_kind: HostEventKind,
+) -> tuple[dict[str, object] | None, str | None]:
+    """Coalesce the two fixed Copilot hook spellings without precedence."""
+    normalized = dict(payload)
+    has_camel = any(primary in payload for primary, _ in (
+        _COPILOT_LIVE_CRITICAL_ALIAS_PAIRS
+    ))
+    has_snake = any(alias in payload for _, alias in (
+        _COPILOT_LIVE_CRITICAL_ALIAS_PAIRS
+    ))
+    if has_camel and has_snake:
+        for primary, alias in _COPILOT_LIVE_CRITICAL_ALIAS_PAIRS:
+            if (primary in payload) != (alias in payload):
+                return None, "ambiguous_field_alias"
+
+    camel_kind = payload.get("hookEventName")
+    snake_kind = payload.get("hook_event_name")
+    camel_kind_present = "hookEventName" in payload
+    snake_kind_present = "hook_event_name" in payload
+    expected_camel = _EVENT_NAMES[HostEventProfileId.COPILOT_HOOK_V1][
+        registration_kind
+    ]
+    expected_snake = _EVENT_NAMES[HostEventProfileId.CLAUDE_LEGACY_V1][
+        registration_kind
+    ]
+    if camel_kind_present and not isinstance(camel_kind, str):
+        return None, "bad_identifier"
+    if snake_kind_present and not isinstance(snake_kind, str):
+        return None, "bad_identifier"
+    if camel_kind_present and snake_kind_present:
+        if camel_kind != expected_camel or snake_kind != expected_snake:
+            return None, "ambiguous_field_alias"
+        normalized["hookEventName"] = expected_camel
+    elif snake_kind_present:
+        if snake_kind != expected_snake:
+            return None, "registration_mismatch"
+        normalized["hookEventName"] = expected_camel
+    normalized.pop("hook_event_name", None)
+
+    for primary, alias in _COPILOT_LIVE_EXACT_ALIAS_PAIRS:
+        primary_present = primary in payload
+        alias_present = alias in payload
+        if primary_present and alias_present and payload[primary] != payload[alias]:
+            return None, "ambiguous_field_alias"
+        if alias_present and not primary_present:
+            normalized[primary] = payload[alias]
+        normalized.pop(alias, None)
+
+    tool_name_present = "toolName" in payload
+    tool_name_alias_present = "tool_name" in payload
+    if tool_name_present and not isinstance(payload["toolName"], str):
+        return None, "bad_tool_name"
+    if tool_name_alias_present and not isinstance(payload["tool_name"], str):
+        return None, "bad_tool_name"
+    if tool_name_present and tool_name_alias_present:
+        if payload["toolName"] != "view" or payload["tool_name"] != "Read":
+            return None, "ambiguous_field_alias"
+        normalized["toolName"] = "view"
+    elif tool_name_alias_present:
+        normalized["toolName"] = (
+            "view"
+            if payload["tool_name"] == "Read"
+            else "__unsupported_tool__"
+        )
+    normalized.pop("tool_name", None)
+
+    tool_args_present = "toolArgs" in payload
+    tool_args_alias_present = "tool_input" in payload
+    canonical_args: dict[str, object] | None = None
+    if tool_args_present:
+        canonical_args, problem = _canonical_read_args(payload["toolArgs"])
+        if problem is not None:
+            return None, problem
+    if tool_args_alias_present:
+        alias_args, problem = _canonical_read_args(payload["tool_input"])
+        if problem is not None:
+            return None, problem
+        if canonical_args is not None and canonical_args != alias_args:
+            return None, "ambiguous_field_alias"
+        canonical_args = alias_args
+    if canonical_args is not None:
+        normalized["toolArgs"] = _native_read_args(canonical_args)
+    normalized.pop("tool_input", None)
+    return normalized, None
+
 
 _DETAILS = MappingProxyType(
     dict(
@@ -235,9 +414,15 @@ _DETAILS = MappingProxyType(
                 "registration_mismatch",
                 ("hook event does not match the fixed registration"),
             ),
+            ("missing_session_id", "hook event session identity is missing"),
+            ("missing_tool_name", "hook event tool name is missing"),
             ("bad_identifier", "hook event identifier is invalid"),
             ("bad_tool_name", "hook event tool name is invalid"),
             ("bad_tool_args", "hook event tool arguments are invalid"),
+            (
+                "ambiguous_field_alias",
+                "hook event mixes incompatible field aliases",
+            ),
             ("bad_success", "hook event success value is invalid"),
             ("bad_reason", "hook event reason is invalid"),
             ("missing_tool_args", "hook event tool arguments are missing"),
@@ -448,6 +633,19 @@ def normalize_host_event(
             reason_code="unsupported_kind",
         )
 
+    if profile is HostEventProfileId.COPILOT_HOOK_V1:
+        payload, alias_problem = _normalize_copilot_live_aliases(
+            payload,
+            registration_kind,
+        )
+        if payload is None or alias_problem is not None:
+            return _result(
+                HostEventParseDisposition.INVALID,
+                profile=profile,
+                registration_kind=registration_kind,
+                payload_sha256=digest,
+                reason_code=alias_problem or "ambiguous_field_alias",
+            )
     fields = _FIELD_NAMES[profile]
     identifiers: dict[str, str | None] = {}
     for name in (
@@ -479,6 +677,17 @@ def normalize_host_event(
             payload_sha256=digest,
             reason_code="registration_mismatch",
         )
+    if (
+        profile is HostEventProfileId.COPILOT_HOOK_V1
+        and identifiers["session_id"] is None
+    ):
+        return _result(
+            HostEventParseDisposition.INVALID,
+            profile=profile,
+            registration_kind=registration_kind,
+            payload_sha256=digest,
+            reason_code="missing_session_id",
+        )
 
     raw_tool_name, tool_name_valid = _optional_identifier(payload, fields["tool_name"])
     if not tool_name_valid:
@@ -489,11 +698,33 @@ def normalize_host_event(
             payload_sha256=digest,
             reason_code="bad_tool_name",
         )
-    canonical_tool_name = (
-        _TOOL_NAME_ALIASES[profile].get(raw_tool_name)
-        if raw_tool_name is not None
-        else None
-    )
+    if (
+        profile is HostEventProfileId.COPILOT_HOOK_V1
+        and registration_kind
+        in {
+            HostEventKind.TOOL_START,
+            HostEventKind.TOOL_SUCCESS,
+            HostEventKind.TOOL_FAILURE,
+        }
+        and raw_tool_name is None
+    ):
+        return _result(
+            HostEventParseDisposition.INVALID,
+            profile=profile,
+            registration_kind=registration_kind,
+            payload_sha256=digest,
+            reason_code="missing_tool_name",
+        )
+    canonical_tool_name = _TOOL_NAME_ALIASES[profile].get(raw_tool_name)
+    if (
+        canonical_tool_name is None
+        and raw_tool_name is None
+        and profile is HostEventProfileId.CLAUDE_LEGACY_V1
+        and registration_kind is HostEventKind.TOOL_SUCCESS
+    ):
+        # The legacy Claude shim is registered specifically for
+        # PostToolUse(Read), and older payloads omit ``tool_name``.
+        canonical_tool_name = "Read"
 
     tool_args_value = payload.get(fields["tool_args"])
     if fields["tool_args"] in payload:
@@ -517,6 +748,49 @@ def normalize_host_event(
             )
     else:
         tool_args = None
+    if (
+        profile is HostEventProfileId.COPILOT_HOOK_V1
+        and registration_kind
+        in {
+            HostEventKind.TOOL_START,
+            HostEventKind.TOOL_SUCCESS,
+            HostEventKind.TOOL_FAILURE,
+        }
+        and tool_args is None
+    ):
+        return _result(
+            HostEventParseDisposition.INVALID,
+            profile=profile,
+            registration_kind=registration_kind,
+            payload_sha256=digest,
+            reason_code="missing_tool_args",
+        )
+
+    tool_input: Mapping[str, object] | None = None
+    if canonical_tool_name == "Read" and tool_args_value is not None:
+        try:
+            canonical_args = copy.deepcopy(tool_args_value)
+        except RecursionError:
+            return _result(
+                HostEventParseDisposition.INVALID,
+                profile=profile,
+                registration_kind=registration_kind,
+                payload_sha256=digest,
+                reason_code="depth",
+            )
+        path_key = _READ_PATH_KEYS[profile]
+        if path_key != "file_path":
+            if "file_path" in canonical_args:
+                return _result(
+                    HostEventParseDisposition.INVALID,
+                    profile=profile,
+                    registration_kind=registration_kind,
+                    payload_sha256=digest,
+                    reason_code="bad_tool_args",
+                )
+            if path_key in canonical_args:
+                canonical_args["file_path"] = canonical_args.pop(path_key)
+        tool_input = MappingProxyType(canonical_args)
 
     success_value = payload.get(fields["success"])
     if fields["success"] in payload and not isinstance(success_value, bool):
@@ -550,6 +824,7 @@ def normalize_host_event(
         raw_tool_name=raw_tool_name,
         canonical_tool_name=canonical_tool_name,
         tool_args=tool_args,
+        tool_input=tool_input,
         success=success_value if isinstance(success_value, bool) else None,
         reason=reason_value if isinstance(reason_value, str) else None,
         payload_sha256=digest,

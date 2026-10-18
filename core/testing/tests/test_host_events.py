@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import FrozenInstanceError
 
 import pytest
@@ -15,20 +16,28 @@ from core.testing.host_events import (
     claude_read_event,
     claude_session_end_event,
     copilot_candidate_read_event,
+    copilot_live_read_payload,
+    copilot_read_event,
+    copilot_session_end_event,
     startup_event,
     turn_end_event,
 )
 
 
-def test_claude_and_candidate_argument_spellings_remain_distinct() -> None:
+def test_claude_and_copilot_argument_spellings_remain_distinct() -> None:
     claude = claude_read_event("/owned/source.py")
     candidate = copilot_candidate_read_event("/owned/source.py")
+    copilot = copilot_read_event("/owned/source.py")
 
     assert claude.payload()["tool_input"] == {"file_path": "/owned/source.py"}
     assert candidate.payload()["toolArgs"] == {"path": "/owned/source.py"}
+    assert copilot.payload()["toolArgs"] == {"path": "/owned/source.py"}
+    assert "hookEventName" not in copilot.payload()
     assert "file_path" not in candidate.payload()["toolArgs"]
+    assert "file_path" not in copilot.payload()["toolArgs"]
     assert claude.evidence_level is (FixtureEvidenceLevel.EXISTING_CLAUDE_CONTRACT)
     assert candidate.evidence_level is (FixtureEvidenceLevel.CANDIDATE_UNVERIFIED)
+    assert copilot.evidence_level is FixtureEvidenceLevel.LIVE_OBSERVED
 
 
 def test_payload_calls_do_not_share_nested_mutable_values() -> None:
@@ -67,10 +76,10 @@ def test_positive_fixture_can_generate_deliberate_malformed_variants() -> None:
 
 
 def test_success_failure_startup_and_terminal_shapes_are_explicit() -> None:
-    success = copilot_candidate_read_event("/owned/a.py")
-    failure = copilot_candidate_read_event("/owned/a.py", successful=False)
+    success = copilot_read_event("/owned/a.py")
+    failure = copilot_read_event("/owned/a.py", successful=False)
     startup = startup_event(
-        FixtureHost.COPILOT_1_0_84_4_HOOK_CANDIDATE,
+        FixtureHost.COPILOT_HOOK_V1,
         session_id="session-1",
         event_id="event-start",
     )
@@ -84,14 +93,40 @@ def test_success_failure_startup_and_terminal_shapes_are_explicit() -> None:
         session_id="session-1",
         event_id="event-session-end",
     )
+    copilot_session_end = copilot_session_end_event(
+        session_id="session-1",
+        event_id="event-copilot-session-end",
+    )
 
-    assert success.payload()["success"] is True
-    assert success.payload()["hookEventName"] == "postToolUse"
-    assert failure.payload()["success"] is False
-    assert failure.payload()["hookEventName"] == "postToolUseFailure"
+    assert "success" not in success.payload()
+    assert "hookEventName" not in success.payload()
+    assert "success" not in failure.payload()
+    assert "hookEventName" not in failure.payload()
     assert startup.payload()["hookEventName"] == "sessionStart"
     assert turn_end.payload()["hookEventName"] == "sessionEnd"
     assert session_end.payload()["hook_event_name"] == "SessionEnd"
+    assert copilot_session_end.payload()["hookEventName"] == "sessionEnd"
+
+
+def test_sanitized_live_copilot_payload_matches_registered_surface() -> None:
+    payload = json.loads(copilot_live_read_payload())
+
+    assert payload == {
+        "cwd": "/synthetic/raptor-copilot",
+        "hook_event_name": "PostToolUse",
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "timestamp": "2000-01-02T03:04:05.678Z",
+        "tool_input": {"path": "/synthetic/fixture/probe.py"},
+        "tool_name": "Read",
+        "tool_result": {
+            "result_type": "success",
+            "text_result_for_llm": (
+                '"""Inert synthetic MVP-10 coverage probe."""\n\n\n'
+                "def answer() -> int:\n"
+                "    return 42\n"
+            ),
+        },
+    }
 
 
 def test_candidate_session_end_cannot_be_modelled_as_true_session_end() -> None:

@@ -29,6 +29,9 @@ from core.testing.host_events import (
     FixtureHost,
     HostEventFixture,
     copilot_candidate_read_event,
+    copilot_live_read_payload,
+    copilot_read_event,
+    copilot_session_end_event,
     turn_end_event,
 )
 
@@ -56,6 +59,21 @@ def _candidate(
     return normalize_host_event(
         event.to_bytes(),
         profile=HostEventProfileId.COPILOT_1_0_84_4_HOOK_CANDIDATE,
+        registration_kind=kind,
+    )
+
+
+def _copilot(
+    fixture: HostEventFixture | None = None,
+    *,
+    kind: HostEventKind = HostEventKind.TOOL_SUCCESS,
+):
+    event = fixture or copilot_read_event("/owned/source.py")
+    assert event.host is FixtureHost.COPILOT_HOOK_V1
+    assert event.evidence_level is FixtureEvidenceLevel.LIVE_OBSERVED
+    return normalize_host_event(
+        event.to_bytes(),
+        profile=HostEventProfileId.COPILOT_HOOK_V1,
         registration_kind=kind,
     )
 
@@ -211,7 +229,7 @@ def test_e04_typed_fields_fail_closed(field, value, reason_code):
     assert result.reason_code == reason_code
 
 
-def test_e02_e03_candidate_hook_alias_preserves_native_args():
+def test_e02_e03_candidate_hook_alias_adds_canonical_input():
     result = _candidate()
 
     assert result.disposition is HostEventParseDisposition.PARSED
@@ -222,6 +240,218 @@ def test_e02_e03_candidate_hook_alias_preserves_native_args():
         "path": "/owned/source.py",
     }
     assert "file_path" not in (result.event.tool_args or {})
+    assert dict(result.event.tool_input or {}) == {
+        "file_path": "/owned/source.py",
+    }
+
+
+def test_live_frontends_share_one_canonical_read_contract():
+    claude = normalize_host_event(
+        json.dumps(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "claude-session-1",
+                "tool_name": "Read",
+                "tool_input": {"file_path": "/owned/source.py"},
+            }
+        ).encode(),
+        profile=HostEventProfileId.CLAUDE_LEGACY_V1,
+        registration_kind=HostEventKind.TOOL_SUCCESS,
+    )
+    copilot = _copilot()
+
+    for result, session_id in (
+        (claude, "claude-session-1"),
+        (copilot, "copilot-session-1"),
+    ):
+        assert result.disposition is HostEventParseDisposition.PARSED
+        assert result.event is not None
+        assert result.event.canonical_tool_name == "Read"
+        assert dict(result.event.tool_input or {}) == {
+            "file_path": "/owned/source.py",
+        }
+        assert result.event.payload_session_id == session_id
+
+    assert dict(copilot.event.tool_args or {}) == {
+        "path": "/owned/source.py",
+    }
+    assert copilot.event.payload_kind is None
+
+
+@pytest.mark.parametrize(
+    ("omit_field", "reason_code"),
+    [
+        ("sessionId", "missing_session_id"),
+        ("toolName", "missing_tool_name"),
+        ("toolArgs", "missing_tool_args"),
+    ],
+)
+def test_live_copilot_required_fields_fail_closed(omit_field, reason_code):
+    fixture = copilot_read_event("/owned/source.py")
+    result = normalize_host_event(
+        fixture.to_bytes(omit_fields=(omit_field,)),
+        profile=HostEventProfileId.COPILOT_HOOK_V1,
+        registration_kind=HostEventKind.TOOL_SUCCESS,
+    )
+
+    assert result.disposition is HostEventParseDisposition.INVALID
+    assert result.event is None
+    assert result.reason_code == reason_code
+
+
+def test_exact_live_copilot_payload_uses_registered_event_kind():
+    result = normalize_host_event(
+        copilot_live_read_payload(),
+        profile=HostEventProfileId.COPILOT_HOOK_V1,
+        registration_kind=HostEventKind.TOOL_SUCCESS,
+    )
+
+    assert result.disposition is HostEventParseDisposition.PARSED
+    assert result.event is not None
+    assert result.event.payload_kind == "postToolUse"
+    assert result.event.payload_session_id == (
+        "11111111-1111-4111-8111-111111111111"
+    )
+    assert result.event.raw_tool_name == "view"
+    assert result.event.canonical_tool_name == "Read"
+    assert result.event.tool_args == {"path": "/synthetic/fixture/probe.py"}
+    assert result.event.tool_input == {
+        "file_path": "/synthetic/fixture/probe.py",
+    }
+
+
+def test_matching_copilot_event_kind_remains_valid_corroboration():
+    result = _copilot(
+        copilot_read_event(
+            "/owned/source.py",
+            include_declared_kind=True,
+        )
+    )
+
+    assert result.disposition is HostEventParseDisposition.PARSED
+    assert result.event is not None
+    assert result.event.payload_kind == "postToolUse"
+
+
+def test_identical_copilot_aliases_coalesce_deterministically():
+    path = "/owned/source.py"
+    fixture = copilot_read_event(path)
+    result = normalize_host_event(
+        fixture.to_bytes(
+            overrides={
+                "hookEventName": "postToolUse",
+                "hook_event_name": "PostToolUse",
+                "session_id": "copilot-session-1",
+                "tool_name": "Read",
+                "toolArgs": {
+                    "path": path,
+                    "file_path": path,
+                },
+                "tool_input": {"file_path": path},
+            }
+        ),
+        profile=HostEventProfileId.COPILOT_HOOK_V1,
+        registration_kind=HostEventKind.TOOL_SUCCESS,
+    )
+
+    assert result.disposition is HostEventParseDisposition.PARSED
+    assert result.event is not None
+    assert result.event.payload_kind == "postToolUse"
+    assert result.event.raw_tool_name == "view"
+    assert result.event.payload_session_id == "copilot-session-1"
+    assert result.event.tool_args == {"path": path}
+    assert result.event.tool_input == {"file_path": path}
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason_code"),
+    [
+        ({"hookEventName": "sessionEnd"}, "registration_mismatch"),
+        ({"hookEventName": 7}, "bad_identifier"),
+        ({"hookEventName": "postToolUse\n"}, "bad_identifier"),
+        (
+            {
+                "hookEventName": "postToolUse",
+                "hook_event_name": "SessionEnd",
+            },
+            "ambiguous_field_alias",
+        ),
+        (
+            {"session_id": "copilot-session-1"},
+            "ambiguous_field_alias",
+        ),
+        (
+            {
+                "session_id": "other-session",
+                "tool_name": "Read",
+                "tool_input": {"path": "/owned/source.py"},
+            },
+            "ambiguous_field_alias",
+        ),
+        (
+            {
+                "session_id": "copilot-session-1",
+                "tool_name": "Bash",
+                "tool_input": {"path": "/owned/source.py"},
+            },
+            "ambiguous_field_alias",
+        ),
+        (
+            {
+                "session_id": "copilot-session-1",
+                "tool_name": "Read",
+                "tool_input": {"path": "/owned/other.py"},
+            },
+            "ambiguous_field_alias",
+        ),
+        (
+            {
+                "toolArgs": {
+                    "path": "/owned/source.py",
+                    "file_path": "/owned/other.py",
+                },
+            },
+            "ambiguous_field_alias",
+        ),
+    ],
+    ids=[
+        "wrong-kind",
+        "non-string-kind",
+        "control-kind",
+        "conflicting-kind-aliases",
+        "incomplete-mixed-aliases",
+        "conflicting-session-aliases",
+        "conflicting-tool-aliases",
+        "conflicting-argument-aliases",
+        "conflicting-nested-path-aliases",
+    ],
+)
+def test_live_copilot_conflicting_aliases_fail_closed(overrides, reason_code):
+    fixture = copilot_read_event("/owned/source.py")
+    result = normalize_host_event(
+        fixture.to_bytes(overrides=overrides),
+        profile=HostEventProfileId.COPILOT_HOOK_V1,
+        registration_kind=HostEventKind.TOOL_SUCCESS,
+    )
+
+    assert result.disposition is HostEventParseDisposition.INVALID
+    assert result.event is None
+    assert result.reason_code == reason_code
+
+
+def test_live_copilot_non_view_tool_never_becomes_read():
+    result = _copilot(
+        copilot_read_event(
+            "/owned/source.py",
+            tool_name="shell",
+        )
+    )
+
+    assert result.disposition is HostEventParseDisposition.PARSED
+    assert result.event is not None
+    assert result.event.raw_tool_name == "shell"
+    assert result.event.canonical_tool_name is None
+    assert result.event.tool_input is None
 
 
 def test_e13_n8_candidate_session_end_is_only_a_turn_end_parse():
@@ -245,6 +475,22 @@ def test_e13_n8_candidate_session_end_is_only_a_turn_end_parse():
     )
 
 
+def test_live_copilot_session_end_normalizes_as_session_end():
+    result = _copilot(
+        copilot_session_end_event(
+            session_id="copilot-session-1",
+            event_id="event-1",
+        ),
+        kind=HostEventKind.SESSION_END,
+    )
+
+    assert result.disposition is HostEventParseDisposition.PARSED
+    assert result.event is not None
+    assert result.event.registration_kind is HostEventKind.SESSION_END
+    assert result.event.payload_kind == "sessionEnd"
+    assert result.event.payload_session_id == "copilot-session-1"
+
+
 def test_e45_candidate_effects_are_constant_false(monkeypatch):
     """Candidate-unverified fixtures cannot activate candidate effects."""
     monkeypatch.setenv("RAPTOR_COPILOT_EVENTS_ENABLED", "1")
@@ -254,6 +500,17 @@ def test_e45_candidate_effects_are_constant_false(monkeypatch):
     assert meta.effects_enabled is False
     with pytest.raises(TypeError):
         PROFILE_META[HostEventProfileId.COPILOT_1_0_84_4_HOOK_CANDIDATE] = meta
+
+
+def test_live_copilot_profile_is_enabled_by_mvp10_evidence():
+    meta = PROFILE_META[HostEventProfileId.COPILOT_HOOK_V1]
+
+    assert meta.effects_enabled is True
+    assert meta.evidence == "live-observed-copilot-1.0.100-1-alias-normalized"
+    assert (
+        HostEventProfileId.COPILOT_HOOK_V1.value
+        == FixtureHost.COPILOT_HOOK_V1.value
+    )
 
 
 def test_candidate_hook_profile_matches_protocol_provenance() -> None:
@@ -268,6 +525,7 @@ def test_c1_profiles_are_hook_only_and_parser_imports_are_bounded():
     assert set(PROFILE_META) == {
         HostEventProfileId.CLAUDE_LEGACY_V1,
         HostEventProfileId.COPILOT_1_0_84_4_HOOK_CANDIDATE,
+        HostEventProfileId.COPILOT_HOOK_V1,
     }
     assert HostEventProfileId.UNKNOWN not in PROFILE_META
     assert {meta.channel for meta in PROFILE_META.values()} == {"hook"}
@@ -311,13 +569,19 @@ def test_n6_tool_args_are_copied_and_top_level_read_only(monkeypatch):
     )
     assert result.event is not None
     args = result.event.tool_args
+    canonical = result.event.tool_input
     assert args is not None
+    assert canonical is not None
     source["tool_input"]["file_path"] = "/changed.py"
     source["tool_input"]["options"]["offset"] = 99
     assert args["file_path"] == "/owned/source.py"
     assert args["options"] == {"offset": 1}
+    assert canonical["file_path"] == "/owned/source.py"
+    assert canonical["options"] == {"offset": 1}
     with pytest.raises(TypeError):
         args["file_path"] = "/mutated.py"
+    with pytest.raises(TypeError):
+        canonical["file_path"] = "/mutated.py"
 
     aliases = host_events._TOOL_NAME_ALIASES[HostEventProfileId.CLAUDE_LEGACY_V1]
     with pytest.raises(TypeError):
