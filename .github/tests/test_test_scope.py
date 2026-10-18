@@ -897,10 +897,12 @@ class TestOnRealRepo:
         ".github/workflows/lint.yml",
         "CLAUDE.md",
         ".claude/commands/scan.md",
-        # test_ci_controls_docs pins README's self-check section and
-        # pyproject's exact ruff select list; a breaking edit to
-        # either merged green while only these tests would redden.
+        # ci_lint tests pin README's self-check section,
+        # README-Copilot's execution-wait doctrine, and pyproject's exact
+        # ruff select list; a breaking edit to any of them would merge
+        # green while only these tests would redden.
         "README.md",
+        "README-Copilot.md",
         "pyproject.toml",
         # test_libexec_marker_coverage / test_symlink_hop_bound pin
         # the launcher-preamble templates byte-for-byte.

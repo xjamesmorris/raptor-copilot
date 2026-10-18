@@ -187,10 +187,11 @@ TIERS: dict[str, dict] = {
         # .github/tests asserts workflow CONTENT (lint.yml step shapes,
         # workflow paths), pins CLAUDE.md / .claude/commands prose,
         # ruff config in pyproject.toml, README's self-check section,
-        # and the libexec//bin launcher-preamble identity templates —
-        # so edits to any of those must fire this tier too, not only
-        # .github/scripts changes; otherwise a breaking edit merges
-        # green and reddens the next scheduled full run, misattributed.
+        # README-Copilot's execution-wait doctrine, and the libexec//bin
+        # launcher-preamble identity templates — so edits to any of those
+        # must fire this tier too, not only .github/scripts changes;
+        # otherwise a breaking edit merges green and reddens the next
+        # scheduled full run, misattributed.
         #
         # Both directions: every entry here must be content-pinned by
         # a test this tier runs (TestCiLintTriggerClosure derives the
@@ -204,6 +205,7 @@ TIERS: dict[str, dict] = {
             "CLAUDE.md",
             ".claude",
             "README.md",
+            "README-Copilot.md",
             "pyproject.toml",
             "libexec",
             "bin",

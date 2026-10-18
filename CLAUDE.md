@@ -7,10 +7,17 @@ Dangerous operations (apply patches, delete, git push): ASK FIRST.
 
 ## SESSION START
 
-**On first message:**
+**Banner and quick commands are for top-level operator-facing sessions only.**
+Dispatched subagents (including `execution_subagent` and task agents), CI
+jobs, and other non-interactive children skip steps 1 and 2: do not print the
+banner or quick commands, and do not inspect or read `.startup-output`. Begin
+the assigned work immediately, while still performing step 3 if SAGE is
+available.
+
+**On the first message:**
 VERY IMPORTANT: follow these steps in order.
-1. The SessionStart hook has already attached the RAPTOR startup banner to the conversation before the first user message. Output that banner verbatim as a fenced code block (``` with no language tag). Do NOT paraphrase, reformat, or call the Read tool just to fetch `.startup-output`. Only fall back to reading `.startup-output` if the SessionStart hook content is genuinely absent.
-2. On a single line, output "Quick commands:" then list the /agentic, /scan, /fuzz, /web commands (don't explain what they do) and note /commands for the full list.
+1. In a top-level operator-facing session, the SessionStart hook has already attached the RAPTOR startup banner to the conversation before the first user message. Output that banner verbatim as a fenced code block (``` with no language tag). Do NOT paraphrase, reformat, or call the Read tool just to fetch `.startup-output`. Only fall back to reading `.startup-output` if the SessionStart hook content is genuinely absent.
+2. In a top-level operator-facing session, on a single line, output "Quick commands:" then list the /agentic, /scan, /fuzz, /web commands (don't explain what they do) and note /commands for the full list.
 3. If the `sage_inception` tool is present in your available MCP tools, load `core/sage/CLAUDE.md` (persistent-memory workflow). If absent, SAGE is not installed — skip silently and do not mention it.
 
 ---
@@ -23,6 +30,45 @@ RAPTOR pipelines emit progress lines, real-time cost tracking, and the `OUTPUT_D
 Never paste operator-, repo-, or target-derived values inside a double-quoted `python3 -c` block (or any double-quoted program text on a shell command line): the shell expands `$(…)` and backticks carried in the pasted value before the interpreter runs. Dynamic values ride as argv data — a `libexec/raptor-*` shim taking them as arguments, or a script file written with the Write tool and run with `sys.argv` arguments (CI enforces this for instruction-file shell blocks: `.github/tests/test_instruction_python_c_census.py`).
 
 Exception: when the skill itself shows the modification (e.g. a documented `| tee logfile` pattern), follow what the skill prints.
+
+### Copilot long-run wait contract
+
+Higher-priority frontend tool instructions govern routing. Under Copilot's
+current tool contract, `execution_subagent` remains mandatory for builds,
+tests, installs, and multi-command terminal work. Direct `bash` is permitted
+only for the frontend's narrow exception: the parent needs the complete,
+unfiltered stdout of exactly one command (or is retrying a failed
+`execution_subagent` with different flags). A literal RAPTOR analysis dispatch
+fits the first exception because its progress stream and `OUTPUT_DIR` sentinel
+must remain unfiltered. This repository does not create a broader exception;
+if the active frontend instructions do not expose that exception, use
+`execution_subagent`.
+
+When the direct-`bash` exception applies, use `mode="sync"`, a stable
+`shellId`, and an `initial_wait` suitable for observing startup. `initial_wait`
+is only an observation window; never add a `timeout` wrapper or present it as a
+RAPTOR deadline. If the tool result explicitly says the command is still
+running, preserve the `shellId`; do not infer a process or pipeline failure
+from a `shell_error_category=command_timeout` or `is_timeout=true` label alone,
+mark the lifecycle failed, restart the command, or launch a duplicate scan.
+Continue only independent work, then end the turn and wait for the
+`shell_completed` notification. After notification, call `read_bash` once with
+the same `shellId` to retrieve the completed output. Classify the run only
+from that final exit status and RAPTOR lifecycle metadata.
+
+For cancellation or interruption, call `stop_bash` with that exact `shellId`
+and wait for its terminal result; the tool owns termination of the command's
+process tree. Never detach an analysis run, kill it by process name, or abandon
+an attached shell. A real RAPTOR timeout or cancellation is a final
+process/lifecycle outcome, distinct from the frontend wait boundary, SCA's own
+600-second operation timeout, and max-findings capping.
+
+Do not invoke `execution_subagent` merely to re-read completed run artifacts
+or check the session banner; use non-shell read tools. For post-run terminal
+work, keep the mandatory `execution_subagent` route unless one exact command
+independently satisfies the frontend's complete-unfiltered-stdout exception.
+Never broaden that exception to a multi-command validation sequence, and never
+divert a child into the operator-facing startup banner.
 
 ---
 

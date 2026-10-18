@@ -22,6 +22,15 @@ Nothing will be applied to your code - only generated in the out/ directory.
 
 Execute: `libexec/raptor-agentic --repo <path>`
 
+Under the Copilot frontend, follow the higher-priority tool-routing
+instructions and CLAUDE.md's **Copilot long-run wait contract**. When the
+active tool contract permits direct `bash` for exactly one command whose
+complete, unfiltered stdout is required, this literal dispatch qualifies.
+Otherwise use `execution_subagent`. For direct `bash`, keep one stable
+`shellId`; when the result explicitly says the command is still running, wait
+for completion and retrieve its output once. Never classify or restart the
+scan from a `command_timeout` telemetry label alone.
+
 ## Handling `--help` / `-h`
 
 If ARGUMENTS is exactly `--help` or `-h` (the operator wants the flag list, not a run),

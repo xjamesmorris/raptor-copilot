@@ -35,6 +35,9 @@ from core.testing import FakeCLIBehavior, make_hermetic_cli
 REPO_ROOT = Path(__file__).resolve().parents[3]
 LAUNCHER = REPO_ROOT / "bin" / "raptor"
 NATIVE_FIXTURE = Path(__file__).parent / "fixtures" / "native_frontend.c"
+NATIVE_FRONTEND_ARGV_FIXTURE = (
+    Path(__file__).parent / "fixtures" / "native_frontend_argv.c"
+)
 
 
 def _system_path() -> str:
@@ -93,7 +96,11 @@ def _compiler() -> str | None:
     return None
 
 
-def _compile_native_fixture(destination: Path) -> None:
+def _compile_native_fixture(
+    destination: Path,
+    *,
+    source: Path = NATIVE_FIXTURE,
+) -> None:
     compiler = _compiler()
     if compiler is None:
         pytest.skip("A9 blocked: no C compiler is available")
@@ -104,7 +111,7 @@ def _compile_native_fixture(destination: Path) -> None:
             "-Wall",
             "-Wextra",
             "-Werror",
-            str(NATIVE_FIXTURE),
+            str(source),
             "-o",
             str(destination),
         ],
@@ -155,6 +162,100 @@ def _marker_bounded_section(source: str, marker: str) -> str:
     start = source.index(begin)
     stop = source.index(end, start)
     return source[start:stop]
+
+
+def _native_frontend_argv_harness(tmp_path, frontend: str):
+    workspace = make_hermetic_cli(tmp_path)
+    launcher = _materialize_launcher_root(workspace)
+    launcher.write_bytes(LAUNCHER.read_bytes())
+    launcher.chmod(0o700)
+    _compile_native_fixture(
+        workspace.bin_dir / frontend,
+        source=NATIVE_FRONTEND_ARGV_FIXTURE,
+    )
+    capture = workspace.root / f"{frontend}-capture.txt"
+    env = _launcher_env(workspace)
+    env.update(
+        {
+            "RAPTOR_REGISTRY_HOME": str(workspace.root / "registry"),
+            "RAPTOR_TEST_FRONTEND_CAPTURE": str(capture),
+        }
+    )
+    return workspace, launcher, capture, env
+
+
+def _read_native_frontend_capture(
+    capture: Path,
+) -> tuple[list[str], dict[str, str]]:
+    argv: list[str] = []
+    fields: dict[str, str] = {}
+    for line in capture.read_text(encoding="utf-8").splitlines():
+        key, value = line.split("=", 1)
+        if key.startswith("argv["):
+            expected_length, argument = value.split(":", 1)
+            assert len(argument) == int(expected_length)
+            argv.append(argument)
+        else:
+            fields[key] = value
+    return argv, fields
+
+
+def _expected_frontend_path_warning(
+    frontend: str,
+    executable: Path,
+) -> str | None:
+    directory = executable.parent
+    while directory != Path("/"):
+        if directory.stat().st_mode & 0o002:
+            return (
+                f"raptor: WARNING: {frontend} resolves under a "
+                f"world-writable tree: {str(executable)[:200]} "
+                f"(writable ancestor: {str(directory)[:200]})\n"
+            )
+        directory = directory.parent
+    return None
+
+
+def _run_native_frontend(
+    launcher: Path,
+    workspace,
+    env: dict[str, str],
+    args: tuple[str, ...],
+) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", str(launcher), *args],
+        cwd=workspace.cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+
+def _create_probe_project(workspace):
+    from core.project import ProjectManager
+
+    target = workspace.cwd / "target"
+    output_dir = workspace.root / "project-output"
+    target.mkdir()
+    manager = ProjectManager(workspace.root / "registry" / "projects")
+    manager.create("probe", str(target), output_dir=str(output_dir))
+    return manager, target
+
+
+def _expand_target(
+    args: tuple[str, ...],
+    target: Path,
+) -> tuple[str, ...]:
+    return tuple(str(target) if arg == "{target}" else arg for arg in args)
+
+
+def _assert_probe_project_bound(workspace, manager) -> None:
+    assert manager.load("probe").trust == {}
+    entries = list((workspace.root / "registry" / "sessions.d").glob("[0-9]*"))
+    assert len(entries) == 1
+    assert "project=probe\n" in entries[0].read_text(encoding="utf-8")
 
 
 def test_frontend_preparation_keeps_presence_launch_and_provider_separate(
@@ -770,7 +871,14 @@ def test_default_and_explicit_claude_argv_match_contract(tmp_path):
     launcher = _materialize_launcher_root(workspace)
     target = workspace.cwd / "target"
     target.mkdir()
-    common = ("-m", "sonnet", "-v", "--opaque-frontend-arg", str(target))
+    common = (
+        "-m",
+        "sonnet",
+        "-v",
+        "--yolo",
+        "--opaque-frontend-arg",
+        str(target),
+    )
 
     current = LAUNCHER.read_bytes()
     runs = (
@@ -794,6 +902,7 @@ def test_default_and_explicit_claude_argv_match_contract(tmp_path):
         "--model",
         "sonnet",
         "--verbose",
+        "--yolo",
         "--opaque-frontend-arg",
         f"/raptor {target}",
     )
@@ -803,6 +912,462 @@ def test_default_and_explicit_claude_argv_match_contract(tmp_path):
         assert not any(arg.startswith("--frontend=") for arg in invocation.argv)
         assert "RAPTOR_HOST" not in invocation.env
         assert "COPILOT_FRONTEND" not in invocation.env
+
+
+_UNLISTED_MODEL = "rhyolite/custom-model:preview@2026"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
+@pytest.mark.parametrize(
+    ("launcher_args", "frontend_args"),
+    (
+        (
+            (
+                "--frontend=copilot",
+                "--project",
+                "probe",
+                "--yolo",
+                "--model",
+                _UNLISTED_MODEL,
+                "{target}",
+            ),
+            ("--yolo", "--model", _UNLISTED_MODEL),
+        ),
+        (
+            (
+                "{target}",
+                f"--model={_UNLISTED_MODEL}",
+                "--yolo",
+                "--project=probe",
+                "--frontend",
+                "copilot",
+            ),
+            (f"--model={_UNLISTED_MODEL}", "--yolo"),
+        ),
+        (
+            (
+                "--yolo",
+                "--frontend",
+                "copilot",
+                "{target}",
+                "--project",
+                "probe",
+                "--model",
+                _UNLISTED_MODEL,
+            ),
+            ("--yolo", "--model", _UNLISTED_MODEL),
+        ),
+    ),
+    ids=("options-first", "target-first", "interleaved"),
+)
+def test_native_copilot_new_session_orderings_are_unambiguous(
+    tmp_path,
+    launcher_args,
+    frontend_args,
+):
+    workspace, launcher, capture, env = _native_frontend_argv_harness(
+        tmp_path,
+        "copilot",
+    )
+    manager, target = _create_probe_project(workspace)
+
+    result = _run_native_frontend(
+        launcher,
+        workspace,
+        env,
+        _expand_target(launcher_args, target),
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    argv, fields = _read_native_frontend_capture(capture)
+    assert argv == [
+        str(workspace.bin_dir / "copilot"),
+        "--plugin-dir",
+        str(workspace.root / "plugins" / "coverage"),
+        "--no-auto-update",
+        *frontend_args,
+        "--name",
+        "RAPTOR",
+        "-i",
+        f"/raptor {target}",
+    ]
+    assert fields["env.RAPTOR_FRONTEND_MODEL"] == _UNLISTED_MODEL
+    assert "--project" not in argv
+    assert "--project=probe" not in argv
+    assert "probe" not in argv
+    _assert_probe_project_bound(workspace, manager)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
+@pytest.mark.parametrize(
+    ("launcher_args", "frontend_args"),
+    (
+        (
+            (
+                "--frontend",
+                "copilot",
+                "--project",
+                "probe",
+                "--yolo",
+                "--model",
+                _UNLISTED_MODEL,
+                "--continue",
+            ),
+            ("--yolo", "--model", _UNLISTED_MODEL, "--continue"),
+        ),
+        (
+            (
+                "--continue",
+                f"--model={_UNLISTED_MODEL}",
+                "--project=probe",
+                "--yolo",
+                "--frontend=copilot",
+            ),
+            ("--continue", f"--model={_UNLISTED_MODEL}", "--yolo"),
+        ),
+        (
+            (
+                "--yolo",
+                "--project",
+                "probe",
+                "--continue",
+                "--frontend",
+                "copilot",
+                "--model",
+                _UNLISTED_MODEL,
+            ),
+            ("--yolo", "--continue", "--model", _UNLISTED_MODEL),
+        ),
+    ),
+    ids=("options-first", "continue-first", "interleaved"),
+)
+def test_native_copilot_continuation_orderings_are_unambiguous(
+    tmp_path,
+    launcher_args,
+    frontend_args,
+):
+    workspace, launcher, capture, env = _native_frontend_argv_harness(
+        tmp_path,
+        "copilot",
+    )
+    manager, _ = _create_probe_project(workspace)
+
+    result = _run_native_frontend(
+        launcher,
+        workspace,
+        env,
+        launcher_args,
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    argv, fields = _read_native_frontend_capture(capture)
+    assert argv == [
+        str(workspace.bin_dir / "copilot"),
+        "--plugin-dir",
+        str(workspace.root / "plugins" / "coverage"),
+        "--no-auto-update",
+        *frontend_args,
+    ]
+    assert fields["env.RAPTOR_FRONTEND_MODEL"] == _UNLISTED_MODEL
+    assert "--project" not in argv
+    assert "--project=probe" not in argv
+    assert "probe" not in argv
+    assert "--name" not in argv
+    assert "-i" not in argv
+    _assert_probe_project_bound(workspace, manager)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
+@pytest.mark.parametrize(
+    ("launcher_args", "frontend_args", "model_label"),
+    (
+        (
+            (
+                "--frontend=claude",
+                "--project",
+                "probe",
+                "--yolo",
+                "--model",
+                "sonnet",
+                "{target}",
+            ),
+            ("--yolo", "--model", "sonnet"),
+            "sonnet",
+        ),
+        (
+            (
+                "{target}",
+                "--model=sonnet",
+                "--yolo",
+                "--project=probe",
+                "--frontend",
+                "claude",
+            ),
+            ("--model=sonnet", "--yolo"),
+            "<unset>",
+        ),
+    ),
+    ids=("options-first", "target-first"),
+)
+def test_native_claude_yolo_stays_on_claude_argv(
+    tmp_path,
+    launcher_args,
+    frontend_args,
+    model_label,
+):
+    workspace, launcher, capture, env = _native_frontend_argv_harness(
+        tmp_path,
+        "claude",
+    )
+    manager, target = _create_probe_project(workspace)
+
+    result = _run_native_frontend(
+        launcher,
+        workspace,
+        env,
+        _expand_target(launcher_args, target),
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    argv, fields = _read_native_frontend_capture(capture)
+    assert argv == [
+        str(workspace.bin_dir / "claude"),
+        "--plugin-dir",
+        str(workspace.root / "plugins" / "coverage"),
+        "-n",
+        "RAPTOR",
+        *frontend_args,
+        f"/raptor {target}",
+    ]
+    assert fields["env.RAPTOR_FRONTEND_MODEL"] == model_label
+    assert "--project" not in argv
+    assert "--project=probe" not in argv
+    assert "probe" not in argv
+    assert "--no-auto-update" not in argv
+    assert "--name" not in argv
+    assert "-i" not in argv
+    _assert_probe_project_bound(workspace, manager)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
+def test_native_copilot_never_enables_yolo_by_default(tmp_path):
+    workspace, launcher, capture, env = _native_frontend_argv_harness(
+        tmp_path,
+        "copilot",
+    )
+
+    result = _run_native_frontend(
+        launcher,
+        workspace,
+        env,
+        ("--frontend", "copilot"),
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    argv, _ = _read_native_frontend_capture(capture)
+    assert "--yolo" not in argv
+    assert "--allow-all" not in argv
+    assert "--allow-all-tools" not in argv
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
+@pytest.mark.parametrize(
+    ("model", "model_args"),
+    tuple(
+        (
+            model,
+            args,
+        )
+        for model in (
+            "gpt-6-astra",
+            "gpt-6-astra",
+            _UNLISTED_MODEL,
+        )
+        for args in (
+            ("--model", model),
+            (f"--model={model}",),
+        )
+    ) + (("-vendor/model", ("--model=-vendor/model",)),),
+    ids=(
+        "listed-separated",
+        "listed-equals",
+        "unlisted-separated",
+        "unlisted-equals",
+        "arbitrary-separated",
+        "arbitrary-equals",
+        "option-looking-equals",
+    ),
+)
+def test_native_copilot_forwards_every_nonempty_model_spelling_exactly(
+    tmp_path,
+    model,
+    model_args,
+):
+    workspace, launcher, capture, env = _native_frontend_argv_harness(
+        tmp_path,
+        "copilot",
+    )
+
+    result = _run_native_frontend(
+        launcher,
+        workspace,
+        env,
+        ("--frontend", "copilot", *model_args),
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    argv, fields = _read_native_frontend_capture(capture)
+    if len(model_args) == 1:
+        assert model_args[0] in argv
+    else:
+        model_index = argv.index("--model")
+        assert argv[model_index + 1] == model
+    assert fields["env.RAPTOR_FRONTEND_MODEL"] == model
+    assert argv[-2:] == ["-i", "/raptor"]
+    assert "--yolo" not in argv
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
+def test_native_copilot_leaves_unlisted_repo_model_to_native_config(
+    tmp_path,
+):
+    workspace, launcher, capture, env = _native_frontend_argv_harness(
+        tmp_path,
+        "copilot",
+    )
+    settings = workspace.root / ".github" / "copilot" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text(
+        '{\n  "model": "gpt-6-astra"\n}\n',
+        encoding="utf-8",
+    )
+
+    result = _run_native_frontend(
+        launcher,
+        workspace,
+        env,
+        ("--frontend", "copilot"),
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    argv, fields = _read_native_frontend_capture(capture)
+    assert "--model" not in argv
+    assert not any(arg.startswith("--model=") for arg in argv)
+    assert fields["env.RAPTOR_FRONTEND_MODEL"] == "<unset>"
+    assert fields["cwd"] == str(workspace.root)
+    assert "gpt-6-astra" in settings.read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
+@pytest.mark.parametrize(
+    ("model_args", "message"),
+    (
+        (("--model",), "--model requires a value"),
+        (("-m",), "-m requires a value"),
+        (("--model", ""), "--model requires a non-empty value"),
+        (("-m", ""), "-m requires a non-empty value"),
+        (("--model=",), "--model= requires a non-empty value"),
+        (
+            ("--model", "--yolo"),
+            "--model requires a value before the next option",
+        ),
+        (
+            ("-m", "--continue"),
+            "-m requires a value before the next option",
+        ),
+        (
+            ("--model", "--project", "probe"),
+            "--model requires a value before the next option",
+        ),
+        (
+            ("--model", "--project=probe"),
+            "--model requires a value before the next option",
+        ),
+    ),
+    ids=(
+        "missing-long",
+        "missing-short",
+        "empty-long",
+        "empty-short",
+        "empty-equals",
+        "before-yolo",
+        "before-continue",
+        "before-project-separated",
+        "before-project-equals",
+    ),
+)
+def test_native_copilot_rejects_missing_or_empty_model_before_exec(
+    tmp_path,
+    model_args,
+    message,
+):
+    workspace, launcher, capture, env = _native_frontend_argv_harness(
+        tmp_path,
+        "copilot",
+    )
+
+    result = _run_native_frontend(
+        launcher,
+        workspace,
+        env,
+        ("--frontend", "copilot", *model_args),
+    )
+
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert message in result.stderr
+    assert not capture.exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
+@pytest.mark.parametrize(
+    "model_args",
+    (
+        ("--model", "definitely-not-a-real-model"),
+        ("--model=definitely-not-a-real-model",),
+    ),
+    ids=("separated", "equals"),
+)
+def test_native_copilot_upstream_model_rejection_is_unchanged(
+    tmp_path,
+    model_args,
+):
+    workspace, launcher, capture, env = _native_frontend_argv_harness(
+        tmp_path,
+        "copilot",
+    )
+    invalid_model = "definitely-not-a-real-model"
+    env["RAPTOR_TEST_FRONTEND_REJECT_MODEL"] = invalid_model
+
+    result = _run_native_frontend(
+        launcher,
+        workspace,
+        env,
+        ("--frontend", "copilot", "--yolo", *model_args),
+    )
+
+    expected_error = (
+        f"native frontend fixture rejected model upstream: {invalid_model}\n"
+    )
+    assert result.returncode == 64, (result.stdout, result.stderr)
+    assert result.stdout == ""
+    stderr_lines = result.stderr.splitlines(keepends=True)
+    assert stderr_lines[-1] == expected_error
+    expected_warning = _expected_frontend_path_warning(
+        "copilot",
+        workspace.bin_dir / "copilot",
+    )
+    assert stderr_lines[:-1] == (
+        [expected_warning] if expected_warning is not None else []
+    )
+    argv, fields = _read_native_frontend_capture(capture)
+    assert "--yolo" in argv
+    if len(model_args) == 1:
+        assert model_args[0] in argv
+    else:
+        model_index = argv.index("--model")
+        assert argv[model_index + 1] == invalid_model
+    assert fields["env.RAPTOR_FRONTEND_MODEL"] == invalid_model
+    assert "gpt-6-astra" not in argv
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="bash launcher")

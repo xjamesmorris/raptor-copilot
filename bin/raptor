@@ -390,6 +390,8 @@ Options:
                      (Copilot requires a native Linux executable)
   -m, --model MODEL  Choose the frontend model
   -p, --project NAME Set the active project
+  --yolo             Copilot all-permissions opt-in; passed through unchanged
+                     (never enabled by RAPTOR or stored as project trust)
   -v, --verbose      Verbose output
   --trust-repo       Trust target repo's config (skip safety checks)
   -h, --help         Show this help
@@ -637,9 +639,36 @@ while [[ $# -gt 0 ]]; do
             ;;
         -m|--model)
             [[ $# -ge 2 ]] || { echo "raptor: $1 requires a value" >&2; exit 1; }
+            # Copilot model ids are intentionally opaque here: the native
+            # CLI/service owns catalog admission, including valid models not
+            # present in its offline help catalog. Reject only the ambiguous
+            # empty spelling; never substitute or resolve the id in RAPTOR.
+            if [[ "$FRONTEND" == "copilot" && -z "$2" ]]; then
+                echo "raptor: $1 requires a non-empty value" >&2
+                exit 1
+            fi
+            if [[ "$FRONTEND" == "copilot" && "$2" == -* ]]; then
+                echo "raptor: $1 requires a value before the next option" >&2
+                exit 1
+            fi
             FRONTEND_ARGS+=("--model" "$2")
             FRONTEND_MODEL="$2"
             shift 2
+            ;;
+        --model=*)
+            if [[ "$FRONTEND" == "copilot" ]]; then
+                _model_value="${1#--model=}"
+                if [ -z "$_model_value" ]; then
+                    echo "raptor: --model= requires a non-empty value" >&2
+                    exit 1
+                fi
+                # Preserve the operator's exact frontend argument while
+                # keeping RAPTOR's startup label aligned with it.
+                FRONTEND_MODEL="$_model_value"
+                unset _model_value
+            fi
+            FRONTEND_ARGS+=("$1")
+            shift
             ;;
         -v|--verbose)
             if [[ "$FRONTEND" == "copilot" ]]; then

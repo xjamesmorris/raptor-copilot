@@ -8,6 +8,15 @@ exclude_from_listing: true
 
 You are helping the user run RAPTOR, an autonomous security testing framework.
 
+Under the Copilot frontend, follow the higher-priority tool-routing
+instructions and CLAUDE.md's **Copilot long-run wait contract**. When the
+active tool contract permits direct `bash` for exactly one command whose
+complete, unfiltered stdout is required, each literal analysis dispatch below
+qualifies. Otherwise use `execution_subagent`. For direct `bash`, keep one
+stable `shellId`; when the result explicitly says the command is still
+running, wait for completion and retrieve its output once. Never classify or
+restart a scan from a `command_timeout` telemetry label alone.
+
 ## What is RAPTOR?
 
 RAPTOR (Recursive Autonomous Penetration Testing and Observation Robot) is an AI-powered security testing framework that:
