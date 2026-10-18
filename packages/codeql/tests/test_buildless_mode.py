@@ -417,6 +417,70 @@ class TestAgentBuildlessRouting:
         lang_map = agent.database_manager.create_databases_parallel.call_args[0][1]
         assert lang_map["cpp"].command == "make"
 
+    @pytest.mark.parametrize(
+        ("spelling", "canonical"),
+        [
+            ("javascript", "javascript"),
+            ("js", "javascript"),
+            ("typescript", "typescript"),
+            ("ts", "typescript"),
+        ],
+    )
+    def test_interpreted_javascript_skips_package_build_detection(
+        self, tmp_path, spelling, canonical,
+    ):
+        agent = self._agent(tmp_path)
+        agent.run_autonomous_analysis(languages=[spelling])
+
+        agent.build_detector.detect_build_system.assert_not_called()
+        agent.build_detector.validate_build_command.assert_not_called()
+        agent.build_detector.synthesise_build_command.assert_not_called()
+        agent.build_detector.generate_no_build_config.assert_called_once_with(
+            canonical,
+        )
+        lang_map = (
+            agent.database_manager.create_databases_parallel.call_args[0][1]
+        )
+        assert lang_map[canonical].type == "no-build"
+        assert lang_map[canonical].command == ""
+
+    @pytest.mark.parametrize(
+        ("spelling", "canonical"),
+        [("js", "javascript"), ("ts", "typescript")],
+    )
+    def test_explicit_alias_build_command_preserves_opt_in(
+        self, tmp_path, spelling, canonical,
+    ):
+        agent = self._agent(tmp_path)
+        agent.run_autonomous_analysis(
+            languages=[spelling],
+            build_commands={spelling: "node operator-build.js"},
+        )
+
+        agent.build_detector.generate_no_build_config.assert_not_called()
+        lang_map = (
+            agent.database_manager.create_databases_parallel.call_args[0][1]
+        )
+        assert lang_map[canonical].type == "custom"
+        assert lang_map[canonical].command == "node operator-build.js"
+        _, kwargs = agent.database_manager.create_databases_parallel.call_args
+        assert kwargs["traced_languages"] == {canonical}
+
+    def test_javascript_trust_marker_without_command_stays_no_build(
+        self, tmp_path,
+    ):
+        agent = self._agent(tmp_path)
+        agent.run_autonomous_analysis(
+            languages=["javascript"],
+            traced_build=True,
+        )
+
+        agent.build_detector.detect_build_system.assert_not_called()
+        lang_map = (
+            agent.database_manager.create_databases_parallel.call_args[0][1]
+        )
+        assert lang_map["javascript"].command == ""
+
     def test_old_cli_skips_language_with_error(self, tmp_path):
         agent = self._agent(tmp_path)
         agent.database_manager.supports_buildless.return_value = (
@@ -458,6 +522,24 @@ class TestAgentBuildlessRouting:
             languages=["go"], traced_build=True,
         )
         assert result.untrusted_build_languages == []
+
+
+class TestInterpretedBuildEvidencePreserved:
+    def test_build_detector_still_reports_npm_for_other_consumers(
+        self, tmp_path,
+    ):
+        from core.build.build_detector import BuildDetector
+
+        (tmp_path / "package.json").write_text(
+            '{"name":"detector-witness","scripts":{"test":"node test.js"}}',
+            encoding="utf-8",
+        )
+
+        build = BuildDetector(tmp_path).detect_build_system("javascript")
+
+        assert build is not None
+        assert build.type == "npm"
+        assert build.command == "npm install"
 
 
 class TestBuildlessDegradationSummary:

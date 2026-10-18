@@ -160,8 +160,8 @@ class TestLocalPackStderrEchoes:
                 skip_install=True,
             )
         assert result.success is False
-        # Stored errors keep the raw string — the echo is what escapes.
-        assert result.errors and "\x1b" in result.errors[0]
+        assert result.errors and "\x1b" not in result.errors[0]
+        assert "\\x1b" in result.errors[0]
         _assert_inert(caplog.text)
 
     def test_pack_install_stderr_escaped(self, tmp_path, monkeypatch,
@@ -178,6 +178,10 @@ class TestLocalPackStderrEchoes:
 
         import core.sandbox
         monkeypatch.setattr(core.sandbox, "run", _fake)
+        monkeypatch.setattr(
+            "packages.codeql.codeql_proxy_hosts.proxy_hosts_for_codeql",
+            lambda _cli: [],
+        )
         pack = tmp_path / "pack"
         pack.mkdir()
         with caplog.at_level("WARNING", logger="raptor"):

@@ -24,6 +24,11 @@ sys.path.insert(0, os.environ["RAPTOR_DIR"])
 
 from core.config import RaptorConfig
 from core.logging import get_logger
+from core.run.safe_io import (
+    bound_artifact_references_in_record,
+    bounded_artifact_reference_fields,
+    write_private_json,
+)
 from core.sandbox import SandboxSetupError
 from packages.codeql.tunables import CodeQLTunables
 
@@ -131,6 +136,78 @@ def vendored_stdlib_roots(lang: str) -> list[Path]:
 
 
 _STDERR_LENGTH_CAP = 256 * 1024  # 256 KB; codeql stderr is typically <16 KB
+_INSTALL_SUMMARY_CAP = 300
+_HEALTH_STATUS_VALUES = frozenset({"completed", "failed", "skipped"})
+
+
+def _diagnostic_text(value: object | None) -> str:
+    """Normalise captured subprocess output without losing byte evidence."""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _sanitise_diagnostic_stream(value: object | None) -> str:
+    """Redact secrets and escape control bytes in a complete stream."""
+    from core.security.log_sanitisation import escape_nonprintable
+    from core.security.redaction import redact_secrets
+
+    return escape_nonprintable(
+        redact_secrets(_diagnostic_text(value)),
+        preserve_newlines=True,
+    )
+
+
+def _bounded_diagnostic_summary(
+    stderr: object | None,
+    stdout: object | None = None,
+    *,
+    max_chars: int = _INSTALL_SUMMARY_CAP,
+) -> str:
+    """Return a redacted, control-safe, hard-bounded operator summary."""
+    from core.security.log_sanitisation import escape_nonprintable
+    from core.security.redaction import redact_secrets
+
+    stderr_text = _diagnostic_text(stderr)
+    source = stderr_text if stderr_text.strip() else _diagnostic_text(stdout)
+    safe = escape_nonprintable(redact_secrets(source)).strip()
+    if len(safe) <= max_chars:
+        return safe
+    if max_chars <= 3:
+        return safe[:max_chars]
+    return safe[:max_chars - 3] + "..."
+
+
+def _execution_health_state(
+    status: str,
+    *,
+    reason: object = "",
+    artifacts: tuple[Path | str, ...] | list[Path | str] = (),
+    **details: object,
+) -> dict[str, object]:
+    """Build an MVP-01-compatible completed/failed/skipped state."""
+    if status not in _HEALTH_STATUS_VALUES:
+        raise ValueError(f"unsupported health status: {status}")
+
+    state: dict[str, object] = {
+        "status": status,
+        "attempted": status != "skipped",
+        "completed": status == "completed",
+        "failed": status == "failed",
+        "skipped": status == "skipped",
+    }
+    safe_reason = _bounded_diagnostic_summary(reason)
+    if safe_reason:
+        state["reason"] = safe_reason
+        if status == "failed":
+            state["failure_reason"] = safe_reason
+        elif status == "skipped":
+            state["skip_reason"] = safe_reason
+    state.update(details)
+    state.update(bounded_artifact_reference_fields(artifacts))
+    return state
 
 
 def _extract_missing_pack(stderr: str) -> str | None:
@@ -175,13 +252,7 @@ def _persist_pack_download_stderr(
     language: str,
 ) -> tuple[Path, str]:
     """Persist complete sanitized pack-download stderr as a private artifact."""
-    from core.security.log_sanitisation import escape_nonprintable
-    from core.security.redaction import redact_secrets
-
-    safe_stderr = escape_nonprintable(
-        redact_secrets(stderr or ""),
-        preserve_newlines=True,
-    )
+    safe_stderr = _sanitise_diagnostic_stream(stderr)
     safe_language = re.sub(r"[^A-Za-z0-9_.-]+", "_", language)[:64] or "unknown"
     path = out_dir / f"codeql_{safe_language}_pack_download.stderr.log"
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
@@ -198,6 +269,199 @@ def _persist_pack_download_stderr(
     return path, safe_stderr
 
 
+def _persist_local_pack_install_diagnostics(
+    stdout: object | None,
+    stderr: object | None,
+    out_dir: Path,
+    language: str,
+    suite_name: str,
+) -> Path:
+    """Persist complete sanitized pack-install streams as private JSON."""
+    safe_language = re.sub(
+        r"[^A-Za-z0-9_.-]+", "_", language,
+    )[:64] or "unknown"
+    safe_suite = re.sub(
+        r"[^A-Za-z0-9_.-]+", "_", suite_name,
+    )[:64] or "local-pack"
+    path = (
+        out_dir
+        / f"codeql_{safe_language}_{safe_suite}_pack_install.diagnostics.json"
+    )
+    return write_private_json(
+        path,
+        {
+            "schema_version": 1,
+            "stage": "pack_install",
+            "stdout": _sanitise_diagnostic_stream(stdout),
+            "stderr": _sanitise_diagnostic_stream(stderr),
+        },
+    )
+
+
+def _persist_local_pack_query_diagnostics(
+    stdout: object | None,
+    stderr: object | None,
+    out_dir: Path,
+    language: str,
+    suite_name: str,
+) -> Path:
+    """Persist complete sanitized failed-query streams as private JSON."""
+    safe_language = re.sub(
+        r"[^A-Za-z0-9_.-]+", "_", language,
+    )[:64] or "unknown"
+    safe_suite = re.sub(
+        r"[^A-Za-z0-9_.-]+", "_", suite_name,
+    )[:64] or "local-pack"
+    path = (
+        out_dir
+        / f"codeql_{safe_language}_{safe_suite}_query.diagnostics.json"
+    )
+    return write_private_json(
+        path,
+        {
+            "schema_version": 1,
+            "stage": "query",
+            "stdout": _sanitise_diagnostic_stream(stdout),
+            "stderr": _sanitise_diagnostic_stream(stderr),
+        },
+    )
+
+
+def _local_pack_enrichment_health(
+    install: dict[str, object],
+    query: dict[str, object],
+) -> dict[str, object]:
+    """Combine independent install/query states without conflating them."""
+    refs: list[str] = []
+    for state in (install, query):
+        for path in state.get("artifacts", []):
+            ref = str(path)
+            if ref not in refs:
+                refs.append(ref)
+
+    query_status = str(query.get("status", "failed"))
+    install_status = str(install.get("status", "skipped"))
+    diagnostics = install.get("diagnostics")
+    diagnostics_failed = (
+        isinstance(diagnostics, dict)
+        and diagnostics.get("status") == "failed"
+    )
+    degraded = query_status == "completed" and (
+        install_status == "failed" or diagnostics_failed
+    )
+
+    reason = ""
+    if query_status == "failed" and install_status == "failed":
+        reason = "pack install and local-pack query execution failed"
+    elif query_status == "failed":
+        reason = "local-pack query execution failed"
+    elif install_status == "failed":
+        reason = (
+            "local-pack query execution completed after a pack install warning"
+        )
+    elif diagnostics_failed:
+        reason = (
+            "local-pack query execution completed, but install diagnostics "
+            "could not be persisted"
+        )
+    elif install_status == "skipped":
+        reason = "pack install skipped; local-pack query execution completed"
+
+    health = _execution_health_state(
+        query_status,
+        reason=reason,
+        artifacts=refs,
+        degraded=degraded,
+    )
+    health.update({
+        "kind": "local_pack_enrichment",
+        "install": install,
+        "query": query,
+    })
+    return health
+
+
+def summarize_iris_enrichment_health(
+    results: dict[str, "QueryResult"],
+) -> dict[str, object]:
+    """Aggregate per-language IRIS health for the CodeQL run report."""
+    if not results:
+        health = _execution_health_state(
+            "skipped",
+            reason="no IRIS LocalFlowSource pack was attempted",
+        )
+        health.update({
+            "kind": "iris_local_flow_source",
+            "degraded": False,
+            "languages": {},
+        })
+        return health
+
+    languages: dict[str, dict[str, object]] = {}
+    refs: list[str] = []
+    failed = 0
+    degraded = 0
+    for language, result in sorted(results.items()):
+        cell = result.enrichment_health
+        if not isinstance(cell, dict):
+            query_status = "completed" if result.success else "failed"
+            cell = _local_pack_enrichment_health(
+                _execution_health_state(
+                    "skipped",
+                    reason="pack install state unavailable",
+                ),
+                _execution_health_state(
+                    query_status,
+                    reason=(
+                        ""
+                        if result.success
+                        else (
+                            result.errors[0]
+                            if result.errors
+                            else "local-pack query execution failed"
+                        )
+                    ),
+                    artifacts=(
+                        [result.sarif_path] if result.sarif_path else []
+                    ),
+                ),
+            )
+        cell = bound_artifact_references_in_record(cell) or {}
+        languages[language] = cell
+        if cell.get("status") == "failed":
+            failed += 1
+        if cell.get("degraded"):
+            degraded += 1
+        for path in cell.get("artifacts", []):
+            ref = str(path)
+            if ref not in refs:
+                refs.append(ref)
+
+    status = "failed" if failed else "completed"
+    reason = ""
+    if failed:
+        reason = (
+            f"{failed} of {len(languages)} IRIS LocalFlowSource "
+            "query executions failed"
+        )
+    elif degraded:
+        reason = (
+            f"{degraded} of {len(languages)} IRIS LocalFlowSource "
+            "query executions completed with install diagnostic warnings"
+        )
+    health = _execution_health_state(
+        status,
+        reason=reason,
+        artifacts=refs,
+        degraded=bool(degraded),
+    )
+    health.update({
+        "kind": "iris_local_flow_source",
+        "languages": languages,
+    })
+    return health
+
+
 @dataclass
 class QueryResult:
     """Result of query execution."""
@@ -210,6 +474,7 @@ class QueryResult:
     errors: list[str]
     suite_name: str
     queries_executed: int = 0
+    enrichment_health: dict[str, object] | None = None
 
 
 # `codeql database analyze --threat-model` first shipped in CLI 2.15.3.
@@ -1109,12 +1374,17 @@ class QueryRunner:
                 try:
                     results[lang] = future.result()
                 except Exception as e:  # noqa: BLE001
-                    logger.warning("IRIS LocalFlowSource (%s) raised: %s", lang, e)
+                    safe_error = _bounded_diagnostic_summary(e)
+                    logger.warning(
+                        "IRIS LocalFlowSource (%s) raised: %s",
+                        lang,
+                        safe_error,
+                    )
                     db, _ = analyzable[lang]
                     results[lang] = QueryResult(
                         success=False, language=lang,
                         database_path=db, sarif_path=None, findings_count=0,
-                        duration_seconds=0.0, errors=[str(e)],
+                        duration_seconds=0.0, errors=[safe_error],
                         suite_name="raptor-iris-local",
                     )
         return results
@@ -1205,12 +1475,17 @@ class QueryRunner:
                 try:
                     results[lang] = future.result()
                 except Exception as e:  # noqa: BLE001
-                    logger.warning("curated queries (%s) raised: %s", lang, e)
+                    safe_error = _bounded_diagnostic_summary(e)
+                    logger.warning(
+                        "curated queries (%s) raised: %s",
+                        lang,
+                        safe_error,
+                    )
                     db, _ = analyzable[lang]
                     results[lang] = QueryResult(
                         success=False, language=lang,
                         database_path=db, sarif_path=None, findings_count=0,
-                        duration_seconds=0.0, errors=[str(e)],
+                        duration_seconds=0.0, errors=[safe_error],
                         suite_name="raptor-curated",
                     )
         return results
@@ -1240,6 +1515,94 @@ class QueryRunner:
         from core.config import RaptorConfig
         from core.sandbox import run as sandbox_run
 
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        def _persist_install_streams(
+            stdout: object | None,
+            stderr: object | None,
+        ) -> tuple[dict[str, object], list[Path]]:
+            try:
+                artifact_path = _persist_local_pack_install_diagnostics(
+                    stdout,
+                    stderr,
+                    out_dir,
+                    lang,
+                    suite_name,
+                )
+            except OSError as exc:
+                reason = (
+                    "failed to persist complete pack install diagnostics: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                safe_reason = _bounded_diagnostic_summary(reason)
+                logger.warning(
+                    "%s pack install (%s) diagnostic artifact write failed: %s",
+                    label,
+                    lang,
+                    safe_reason,
+                )
+                return (
+                    _execution_health_state("failed", reason=reason),
+                    [],
+                )
+            logger.debug(
+                "%s pack install (%s) diagnostics: %s",
+                label,
+                lang,
+                artifact_path,
+            )
+            return (
+                _execution_health_state(
+                    "completed",
+                    artifacts=[artifact_path],
+                ),
+                [artifact_path],
+            )
+
+        def _persist_query_streams(
+            stdout: object | None,
+            stderr: object | None,
+        ) -> tuple[dict[str, object], list[Path]]:
+            try:
+                artifact_path = _persist_local_pack_query_diagnostics(
+                    stdout,
+                    stderr,
+                    out_dir,
+                    lang,
+                    suite_name,
+                )
+            except OSError as exc:
+                reason = (
+                    "failed to persist complete query diagnostics: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                safe_reason = _bounded_diagnostic_summary(reason)
+                logger.warning(
+                    "%s (%s) query diagnostic artifact write failed: %s",
+                    label,
+                    lang,
+                    safe_reason,
+                )
+                return (
+                    _execution_health_state("failed", reason=reason),
+                    [],
+                )
+            logger.debug(
+                "%s (%s) query diagnostics: %s",
+                label,
+                lang,
+                artifact_path,
+            )
+            return (
+                _execution_health_state(
+                    "completed",
+                    artifacts=[artifact_path],
+                ),
+                [artifact_path],
+            )
+
+        install_state: dict[str, object]
+
         # Skip the install entirely when every dep pinned in the
         # in-repo lockfile is already present in the standard pack
         # cache. In normal RAPTOR setups (where `~/.codeql/packages/
@@ -1248,10 +1611,28 @@ class QueryRunner:
         # avoids both the subprocess and the sandbox network-permit
         # round-trip. Sandboxed CI environments without a populated
         # pack cache fall through to the install attempt as before.
-        if skip_install or _iris_pack_deps_already_resolved(pack_dir):
+        deps_already_resolved = _iris_pack_deps_already_resolved(pack_dir)
+        if skip_install or deps_already_resolved:
+            skip_reason = (
+                "pack install skipped because dependency resolution "
+                "was supplied by the caller"
+                if skip_install
+                else (
+                    "pack install skipped because pinned dependencies "
+                    "are present in the local CodeQL cache"
+                )
+            )
             logger.debug(
                 "%s pack (%s): deps already resolvable, skipping install",
                 label, lang,
+            )
+            install_state = _execution_health_state(
+                "skipped",
+                reason=skip_reason,
+                diagnostics=_execution_health_state(
+                    "skipped",
+                    reason="pack install was not attempted",
+                ),
             )
         else:
             # Lazy `codeql pack install` — populates dependency cache
@@ -1291,34 +1672,87 @@ class QueryRunner:
                     capture_output=True, text=True,
                     timeout=180,
                 )
-                if install_proc.returncode != 0:
-                    # Surface install failure at warning level so
-                    # operators see *why* a subsequent analyze
-                    # failure is happening. Common failure mode:
-                    # sandboxed CI without network on a fresh
-                    # checkout (lockfile committed but dep packs not
-                    # cached locally).
-                    install_err = (
-                        install_proc.stderr or install_proc.stdout or ""
-                    ).strip()[:300]
-                    # Escaped at the echo: install stderr relays
-                    # registry-influenced content — control/bidi
-                    # bytes must not reach the operator terminal raw
-                    # (same contract as the analyze stderr echoes).
-                    from core.security.log_sanitisation import (
-                        escape_nonprintable,
+                diagnostics, artifacts = _persist_install_streams(
+                    install_proc.stdout,
+                    install_proc.stderr,
+                )
+                if install_proc.returncode == 0:
+                    install_state = _execution_health_state(
+                        "completed",
+                        artifacts=artifacts,
+                        returncode=0,
+                        diagnostics=diagnostics,
+                    )
+                else:
+                    install_summary = _bounded_diagnostic_summary(
+                        install_proc.stderr,
+                        install_proc.stdout,
+                    )
+                    reason = (
+                        f"pack install returned {install_proc.returncode}"
+                    )
+                    if install_summary:
+                        reason += f": {install_summary}"
+                    install_state = _execution_health_state(
+                        "failed",
+                        reason=reason,
+                        artifacts=artifacts,
+                        returncode=install_proc.returncode,
+                        diagnostics=diagnostics,
                     )
                     logger.warning(
                         "%s pack install (%s) returned %s: %s",
                         label,
                         lang,
                         install_proc.returncode,
-                        escape_nonprintable(
-                            install_err, preserve_newlines=True,
-                        ),
+                        install_summary or "(no diagnostic output)",
                     )
-            except Exception as e:  # noqa: BLE001
-                logger.warning("%s pack install (%s) raised: %s", label, lang, e)
+            except subprocess.TimeoutExpired as exc:
+                stdout = getattr(exc, "stdout", None)
+                if stdout is None:
+                    stdout = getattr(exc, "output", None)
+                diagnostics, artifacts = _persist_install_streams(
+                    stdout,
+                    getattr(exc, "stderr", None),
+                )
+                reason = "pack install timed out after 180 seconds"
+                install_state = _execution_health_state(
+                    "failed",
+                    reason=reason,
+                    artifacts=artifacts,
+                    timed_out=True,
+                    diagnostics=diagnostics,
+                )
+                summary = _bounded_diagnostic_summary(
+                    getattr(exc, "stderr", None),
+                    stdout,
+                )
+                logger.warning(
+                    "%s pack install (%s) timed out: %s",
+                    label,
+                    lang,
+                    summary or "(no diagnostic output)",
+                )
+            except (SandboxSetupError, OSError) as exc:
+                reason = (
+                    "pack install could not complete: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                install_state = _execution_health_state(
+                    "failed",
+                    reason=reason,
+                    error_type=type(exc).__name__,
+                    diagnostics=_execution_health_state(
+                        "skipped",
+                        reason="the install process returned no captured streams",
+                    ),
+                )
+                logger.warning(
+                    "%s pack install (%s) could not complete: %s",
+                    label,
+                    lang,
+                    _bounded_diagnostic_summary(reason),
+                )
 
         sarif_path = out_dir / sarif_name
         cmd = [
@@ -1341,13 +1775,66 @@ class QueryRunner:
         except SandboxSetupError:
             raise  # sandbox isolation could not engage — fail loud, never mask as a benign result
 
-        except Exception as e:  # noqa: BLE001
-            logger.warning("%s (%s) analyze raised: %s", label, lang, e)
+        except subprocess.TimeoutExpired as exc:
+            reason = (
+                "local-pack query execution timed out after "
+                f"{RaptorConfig.CODEQL_ANALYZE_TIMEOUT} seconds"
+            )
+            stdout = getattr(exc, "stdout", None)
+            if stdout is None:
+                stdout = getattr(exc, "output", None)
+            diagnostics, artifacts = _persist_query_streams(
+                stdout,
+                getattr(exc, "stderr", None),
+            )
+            query_state = _execution_health_state(
+                "failed",
+                reason=reason,
+                artifacts=artifacts,
+                timed_out=True,
+                diagnostics=diagnostics,
+            )
+            logger.warning("%s (%s) failed: %s", label, lang, reason)
             return QueryResult(
                 success=False, language=lang,
                 database_path=db, sarif_path=None, findings_count=0,
                 duration_seconds=time.time() - analysis_start,
-                errors=[str(e)], suite_name=suite_name,
+                errors=[reason], suite_name=suite_name,
+                enrichment_health=_local_pack_enrichment_health(
+                    install_state,
+                    query_state,
+                ),
+            )
+        except OSError as exc:
+            reason = (
+                "local-pack query execution could not start: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            safe_reason = _bounded_diagnostic_summary(reason)
+            query_state = _execution_health_state(
+                "failed",
+                reason=safe_reason,
+                error_type=type(exc).__name__,
+                diagnostics=_execution_health_state(
+                    "skipped",
+                    reason="the query process returned no captured streams",
+                ),
+            )
+            logger.warning(
+                "%s (%s) analyze could not start: %s",
+                label,
+                lang,
+                safe_reason,
+            )
+            return QueryResult(
+                success=False, language=lang,
+                database_path=db, sarif_path=None, findings_count=0,
+                duration_seconds=time.time() - analysis_start,
+                errors=[safe_reason], suite_name=suite_name,
+                enrichment_health=_local_pack_enrichment_health(
+                    install_state,
+                    query_state,
+                ),
             )
 
         if proc.returncode == 0:
@@ -1360,40 +1847,88 @@ class QueryRunner:
                 # a clean zero-finding scan (run_suite's guard, applied
                 # to the IRIS + curated sibling).
                 reason = self._unreadable_sarif_reason(sarif_path)
-                logger.warning("%s (%s) failed: %s", label, lang, reason)
+                safe_reason = _bounded_diagnostic_summary(reason)
+                diagnostics, artifacts = _persist_query_streams(
+                    proc.stdout,
+                    proc.stderr,
+                )
+                logger.warning(
+                    "%s (%s) failed: %s",
+                    label,
+                    lang,
+                    safe_reason,
+                )
+                query_state = _execution_health_state(
+                    "failed",
+                    reason=safe_reason,
+                    artifacts=artifacts,
+                    returncode=0,
+                    diagnostics=diagnostics,
+                )
                 return QueryResult(
                     success=False, language=lang,
                     database_path=db, sarif_path=None, findings_count=0,
                     duration_seconds=time.time() - analysis_start,
-                    errors=[reason], suite_name=suite_name,
+                    errors=[safe_reason], suite_name=suite_name,
+                    enrichment_health=_local_pack_enrichment_health(
+                        install_state,
+                        query_state,
+                    ),
                 )
             logger.info("✓ %s (%s): %s findings", label, lang, n)
+            query_state = _execution_health_state(
+                "completed",
+                artifacts=[sarif_path],
+                returncode=0,
+            )
             return QueryResult(
                 success=True, language=lang,
                 database_path=db, sarif_path=sarif_path,
                 findings_count=n,
                 duration_seconds=time.time() - analysis_start,
                 errors=[], suite_name=suite_name,
+                enrichment_health=_local_pack_enrichment_health(
+                    install_state,
+                    query_state,
+                ),
             )
 
-        err = (proc.stderr or proc.stdout or "").strip()[:300]
-        # Escaped at the echo only: analyze stderr quotes hostile
-        # source from the scanned repo (extractor diagnostics), so
-        # control/bidi bytes must not reach the operator terminal raw.
-        # The stored error list keeps the raw string — it is the data
-        # plane consumers (RefinementFeedback.tool_errors, reports)
-        # sanitise at their own render sites.
-        from core.security.log_sanitisation import escape_nonprintable
+        safe_err = _bounded_diagnostic_summary(proc.stderr, proc.stdout)
+        diagnostics, artifacts = _persist_query_streams(
+            proc.stdout,
+            proc.stderr,
+        )
         logger.warning(
             "%s (%s) failed: %s", label, lang,
-            escape_nonprintable(err, preserve_newlines=True),
+            safe_err or f"exit code {proc.returncode}",
+        )
+        query_state = _execution_health_state(
+            "failed",
+            reason=(
+                f"local-pack query execution returned {proc.returncode}: "
+                f"{safe_err}"
+                if safe_err
+                else (
+                    "local-pack query execution returned "
+                    f"{proc.returncode}"
+                )
+            ),
+            artifacts=artifacts,
+            returncode=proc.returncode,
+            diagnostics=diagnostics,
         )
         return QueryResult(
             success=False, language=lang,
             database_path=db, sarif_path=None, findings_count=0,
             duration_seconds=time.time() - analysis_start,
-            errors=[err] if err else [],
+            errors=[safe_err] if safe_err else [
+                f"analysis failed with exit code {proc.returncode}",
+            ],
             suite_name=suite_name,
+            enrichment_health=_local_pack_enrichment_health(
+                install_state,
+                query_state,
+            ),
         )
 
     def run_local_pack(

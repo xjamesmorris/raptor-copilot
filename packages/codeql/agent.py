@@ -27,7 +27,12 @@ from core.config import RaptorConfig
 from core.json import load_json_bounded, save_json
 from core.logging import get_logger
 from core.run.output import unique_run_suffix as _unique_run_suffix
-from core.run.safe_io import safe_run_mkdir
+from core.run.safe_io import (
+    bound_artifact_references_in_record,
+    bounded_artifact_reference_fields,
+    safe_run_mkdir,
+    sanitise_artifact_reference,
+)
 from core.sandbox import SANDBOX_ENGAGE_EXIT_CODE, SandboxSetupError
 from packages.codeql.database_manager import (
     AUTOBUILD_LANGUAGES,
@@ -36,7 +41,11 @@ from packages.codeql.database_manager import (
     DatabaseResult,
 )
 from packages.codeql.language_detector import LanguageDetector, LanguageInfo
-from packages.codeql.query_runner import QueryResult, QueryRunner
+from packages.codeql.query_runner import (
+    QueryResult,
+    QueryRunner,
+    summarize_iris_enrichment_health,
+)
 
 logger = get_logger()
 
@@ -62,6 +71,13 @@ _LANGUAGE_ALIASES = {
     "kt": "kotlin",
     "py": "python",
 }
+
+# JavaScript and TypeScript are extracted directly by CodeQL's bundled
+# JavaScript extractor. BuildDetector still records npm/yarn/pnpm for its
+# other consumers, but CodeQL must not turn a package manifest into an
+# implicit dependency install. A non-empty operator-supplied build command
+# is the only opt-in to traced repository build logic for these languages.
+_INTERPRETED_NO_BUILD_LANGUAGES = frozenset({"javascript", "typescript"})
 
 
 def _normalise_language(name: str) -> str:
@@ -128,6 +144,10 @@ class CodeQLWorkflowResult:
     total_findings: int
     sarif_files: list[str]
     errors: list[str]
+    # IRIS LocalFlowSource is additive enrichment. Its health is
+    # reported separately so an install warning or enrichment query
+    # failure cannot rewrite a successful standard-CodeQL result.
+    enrichment_health: dict | None = None
     # Per-(language, CWE) standard-vs-IRIS finding counts, present only
     # when the standard pass ran with threat models AND the IRIS pass
     # produced a SARIF — data for deciding whether IRIS queries are
@@ -196,20 +216,37 @@ class CodeQLWorkflowResult:
             lang: {
                 'success': result.success,
                 'language': result.language,
-                'database_path': str(result.database_path),
-                'sarif_path': str(result.sarif_path) if result.sarif_path else None,
+                'database_path': sanitise_artifact_reference(
+                    result.database_path,
+                ),
+                'sarif_path': (
+                    sanitise_artifact_reference(result.sarif_path)
+                    if result.sarif_path else None
+                ),
                 'findings_count': result.findings_count,
                 'duration_seconds': result.duration_seconds,
                 'errors': result.errors,
                 'suite_name': result.suite_name,
                 'queries_executed': result.queries_executed,
+                'enrichment_health': bound_artifact_references_in_record(
+                    result.enrichment_health,
+                ),
             }
             for lang, result in self.analyses_completed.items()
         }
 
         # CRITICAL: Convert sarif_files — the type annotation says
         # List[str], but the workflow appends Path objects.
-        data['sarif_files'] = [str(p) if isinstance(p, Path) else p for p in self.sarif_files]
+        sarif_fields = bounded_artifact_reference_fields(self.sarif_files)
+        data['sarif_files'] = sarif_fields["artifacts"]
+        if sarif_fields.get("artifact_references_truncated"):
+            data["sarif_file_references_truncated"] = True
+            data["sarif_file_references_omitted"] = sarif_fields[
+                "artifact_references_omitted"
+            ]
+        data["enrichment_health"] = bound_artifact_references_in_record(
+            self.enrichment_health,
+        )
 
         return data
 
@@ -343,6 +380,18 @@ class CodeQLAgent:
         """
         errors = []
 
+        # Normalise build-command keys at the same boundary as explicit
+        # language names. raptor_codeql passes the spelling the operator
+        # supplied (for example "js"), while the routing loop below only
+        # sees canonical names ("javascript"). Without this, an explicit
+        # --build-command could be mistaken for an implicit build and the
+        # JavaScript no-build route would silently discard the opt-in.
+        if build_commands:
+            build_commands = {
+                _normalise_language(language): command
+                for language, command in build_commands.items()
+            }
+
         sage_build_cmd: str | None = None
         sage_build_langs: str | None = None
         try:
@@ -456,6 +505,24 @@ class CodeQLAgent:
                     # Operator explicitly opted this language into a
                     # traced build (asserts trust in the repo).
                     traced_languages.add(lang)
+                if (
+                    lang in _INTERPRETED_NO_BUILD_LANGUAGES
+                    and not (build_commands and lang in build_commands)
+                ):
+                    # CodeQL's JavaScript extractor does not need a package
+                    # install or lifecycle script. Keep BuildDetector's npm /
+                    # yarn / pnpm evidence intact for other consumers, but
+                    # bypass it in this CodeQL-specific route unless the
+                    # operator supplied an explicit command.
+                    logger.info(
+                        "%s: CodeQL no-build extraction — package managers "
+                        "and repository lifecycle scripts will not execute",
+                        lang,
+                    )
+                    language_build_map[lang] = (
+                        self.build_detector.generate_no_build_config(lang)
+                    )
+                    continue
                 if (
                     lang in BUILDLESS_DEFAULT_LANGUAGES
                     and lang not in traced_languages
@@ -805,6 +872,9 @@ class CodeQLAgent:
                 total_findings=total_findings,
                 sarif_files=sarif_files,
                 errors=errors,
+                enrichment_health=summarize_iris_enrichment_health(
+                    iris_results,
+                ),
                 threat_model_overlap=threat_model_overlap,
                 learned_models=learned_models,
                 source_summaries=source_summaries_cell,
