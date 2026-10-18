@@ -1,5 +1,5 @@
 ---
-name: audit
+name: audit-in-session
 description: "Hypothesis-driven, tool-grounded security review of coverage gaps"
 user-invocable: false
 ---
@@ -92,7 +92,8 @@ Review strategies are selected per-function based on file paths, parameter types
 | **Crypto** | Crypto APIs, key material, RNG | Correct algorithm usage? Timing side channels? Key lifecycle? |
 | **Aliasing** | splice, zero-copy, scatterlist, sk_buff | Alias assumptions? Who owns backing pages? Can another subsystem write through the alias? |
 
-Strategy details and CVE exemplars are in `.claude/skills/audit/review.md`.
+Strategy details and CVE exemplars are in
+`.claude/skills/audit-in-session/review.md`.
 
 ## [CRITIQUE]
 

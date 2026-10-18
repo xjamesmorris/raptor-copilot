@@ -1,6 +1,6 @@
 ---
 name: audit-review
-description: "Review prompt and strategy exemplars for /audit"
+description: "Review prompt and strategy exemplars for /audit's in-session skill"
 user-invocable: false
 ---
 

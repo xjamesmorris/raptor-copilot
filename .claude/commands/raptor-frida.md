@@ -68,7 +68,7 @@ automatic post-run I/O correlation join).
 /raptor-frida --target com.example.app --template ssl-unpin --usb --spawn --duration 120
 
 # Remote frida-server
-/raptor-frida --target target-proc --host 10.10.20.1 --template api-trace
+/raptor-frida --target target-proc --host 192.0.2.10 --template api-trace
 
 # Operator-supplied hook
 /raptor-frida --target Safari --script ./my-hook.js --duration 30

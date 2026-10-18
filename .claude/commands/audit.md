@@ -77,7 +77,7 @@ libexec/raptor-resolve-mode [--local] [--model <name>]
 
 Output is one line:
 - `orchestrator <model>` → follow Steps 1–4 below (`libexec/raptor-audit run` with the external LLM)
-- `in-session` → load and follow `.claude/skills/audit/SKILL.md` (Claude Code is the LLM; covers study, map, review loop, cross-session resume, scoping). Skip Steps 1–4.
+- `in-session` → load and follow `.claude/skills/audit-in-session/SKILL.md` (Claude Code is the LLM; covers study, map, review loop, cross-session resume, scoping). Skip Steps 1–4.
 
 ### Step 1: Resolve output directory
 

@@ -279,8 +279,9 @@ def check_raptor_structure() -> Tuple[bool, str]:
         "packages/static-analysis",
         "packages/web",
         ".claude/commands",
-        ".claude/agents",
         ".claude/skills",
+        ".github/agents",
+        "plugins/agents/agents",
     ]
 
     missing = []

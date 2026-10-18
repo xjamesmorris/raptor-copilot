@@ -1,5 +1,5 @@
 ---
-name: frida
+name: frida-instrumentation
 description: Dynamic instrumentation via Frida - attach to or spawn a process, load a JS hook script, capture send() events into a lifecycle-managed run directory. Supports local, USB-attached, and remote frida-server targets.
 ---
 
@@ -77,7 +77,7 @@ raptor frida --target ./victim --template api-trace --duration 60
 raptor frida --target com.example.app --template ssl-unpin --usb --spawn --duration 120
 
 # Connect to remote frida-server
-raptor frida --target target-proc --host 10.10.20.1 --template api-trace
+raptor frida --target target-proc --host 192.0.2.10 --template api-trace
 
 # Operator-supplied hook
 raptor frida --target Safari --script ./my-hook.js --duration 30

@@ -10,12 +10,14 @@ from __future__ import annotations
 import importlib.util
 import re
 from collections import defaultdict
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from types import ModuleType
 from typing import cast
+
+import yaml
 
 
 class FeatureAssetKind(str, Enum):
@@ -56,6 +58,13 @@ class FeatureCollisionClass(str, Enum):
     DUPLICATE_SKILL = "duplicate_skill"
     DUPLICATE_AGENT = "duplicate_agent"
     DUPLICATE_BUILTIN = "duplicate_builtin"
+
+
+class FrontendAdapter(str, Enum):
+    """Decision-layer discovery adapters exercised by parity tests."""
+
+    CLAUDE = "claude"
+    COPILOT = "copilot"
 
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -171,6 +180,69 @@ class FeatureLedger:
         }
 
 
+@dataclass(frozen=True)
+class FrontendInventoryEntry:
+    """One source asset projected through a frontend discovery adapter."""
+
+    canonical_name: str
+    asset_kind: FeatureAssetKind
+    source_asset: str
+    surface: str
+    enabled: bool
+
+
+@dataclass(frozen=True)
+class FrontendDuplicate:
+    """A duplicate name on one frontend-visible discovery surface."""
+
+    surface: str
+    canonical_name: str
+    members: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class FrontendInventory:
+    """Deterministic projection of repository assets into one frontend."""
+
+    adapter: FrontendAdapter
+    entries: tuple[FrontendInventoryEntry, ...]
+    warnings: tuple[str, ...] = ()
+
+    @property
+    def duplicates(self) -> tuple[FrontendDuplicate, ...]:
+        by_key: dict[tuple[str, str], list[FrontendInventoryEntry]] = defaultdict(
+            list
+        )
+        for entry in self.entries:
+            by_key[(entry.surface, entry.canonical_name)].append(entry)
+        return tuple(
+            FrontendDuplicate(
+                surface=surface,
+                canonical_name=name,
+                members=tuple(sorted(item.source_asset for item in members)),
+            )
+            for (surface, name), members in sorted(by_key.items())
+            if len(members) > 1
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a stable JSON-compatible frontend inventory."""
+        return {
+            "adapter": self.adapter.value,
+            "entries": [
+                {
+                    "canonical_name": entry.canonical_name,
+                    "asset_kind": entry.asset_kind.value,
+                    "source_asset": entry.source_asset,
+                    "surface": entry.surface,
+                    "enabled": entry.enabled,
+                }
+                for entry in self.entries
+            ],
+            "warnings": list(self.warnings),
+        }
+
+
 def _load_frontmatter_parser(
     repo_root: Path,
 ) -> Callable[[str], dict[str, str]]:
@@ -192,6 +264,92 @@ def _load_frontmatter_parser(
     return cast(Callable[[str], dict[str, str]], parser)
 
 
+def _load_yaml_frontmatter(path: Path) -> dict[str, object]:
+    """Load strict YAML frontmatter for skills and custom agents."""
+    text = path.read_text(encoding="utf-8")
+    if not text.startswith("---\n"):
+        raise ValueError(f"{path}: missing YAML frontmatter")
+    end = text.find("\n---\n", 4)
+    if end == -1:
+        raise ValueError(f"{path}: unterminated YAML frontmatter")
+    try:
+        loaded = yaml.safe_load(text[4:end])
+    except yaml.YAMLError as exc:
+        raise ValueError(f"{path}: malformed YAML frontmatter: {exc}") from exc
+    if not isinstance(loaded, dict):
+        raise ValueError(f"{path}: YAML frontmatter must be a mapping")
+    return cast(dict[str, object], loaded)
+
+
+def _canonical_skill_name(path: Path, metadata: Mapping[str, object]) -> str:
+    raw_name = metadata.get("name", path.parent.name)
+    if not isinstance(raw_name, str) or not raw_name.strip():
+        raise ValueError(f"{path}: skill name must be a non-empty string")
+    name = re.sub(r"\s+", "-", raw_name.strip())
+    _validate_name(name, f"{path}: skill name")
+    return name
+
+
+def _canonical_agent_name(path: Path, metadata: Mapping[str, object]) -> str:
+    raw_name = metadata.get("name", path.stem)
+    if not isinstance(raw_name, str) or not raw_name.strip():
+        raise ValueError(f"{path}: agent name must be a non-empty string")
+    name = raw_name.strip()
+    _validate_name(name, f"{path}: agent name")
+    return name
+
+
+def _validate_description(path: Path, metadata: Mapping[str, object]) -> None:
+    description = metadata.get("description")
+    if not isinstance(description, str) or not description.strip():
+        raise ValueError(f"{path}: description must be a non-empty string")
+
+
+def _validate_agent_metadata(path: Path, metadata: Mapping[str, object]) -> None:
+    _validate_description(path, metadata)
+    skills = metadata.get("skills")
+    if skills is not None:
+        if not isinstance(skills, list) or not all(
+            isinstance(item, str) and item.strip() for item in skills
+        ):
+            raise ValueError(
+                f"{path}: agent skills must be a YAML array of non-empty names"
+            )
+        if len(skills) != len(set(skills)):
+            raise ValueError(f"{path}: agent skills contain duplicate names")
+    if metadata.get("model") != "inherit":
+        raise ValueError(
+            f"{path}: authoritative Claude agent must declare model: inherit"
+        )
+
+
+def _flat_metadata(metadata: Mapping[str, object]) -> dict[str, str]:
+    """Keep adapter-relevant metadata in the ledger's scalar form."""
+    out: dict[str, str] = {}
+    keys = {
+        "description",
+        "disable-model-invocation",
+        "dispatch",
+        "enabled",
+        "exclude_from_listing",
+        "model",
+        "name",
+        "skills",
+        "user-invocable",
+    }
+    for key in keys:
+        if key not in metadata:
+            continue
+        value = metadata[key]
+        if isinstance(value, bool):
+            out[key] = "true" if value else "false"
+        elif isinstance(value, str):
+            out[key] = value
+        elif key == "skills" and isinstance(value, list):
+            out[key] = ",".join(cast(list[str], value))
+    return out
+
+
 def _source_entry(
     *,
     repo_root: Path,
@@ -201,7 +359,7 @@ def _source_entry(
     behavior: str,
     capability_requirement: str,
     host_mapping: str,
-    metadata: dict[str, str],
+    metadata: Mapping[str, str],
 ) -> FeatureLedgerEntry:
     operator_exception = None
     if metadata.get("exclude_from_listing", "").lower() == "true":
@@ -210,7 +368,18 @@ def _source_entry(
         sorted(
             (key, value)
             for key, value in metadata.items()
-            if key in {"dispatch", "exclude_from_listing", "user-invocable"}
+            if key
+            in {
+                "description",
+                "disable-model-invocation",
+                "dispatch",
+                "enabled",
+                "exclude_from_listing",
+                "model",
+                "name",
+                "skills",
+                "user-invocable",
+            }
         )
     )
     return FeatureLedgerEntry(
@@ -295,6 +464,97 @@ def _collisions(
     )
 
 
+def _metadata_enabled(entry: FeatureLedgerEntry) -> bool:
+    metadata = dict(entry.metadata)
+    if metadata.get("enabled", "").lower() == "false":
+        return False
+    if (
+        entry.asset_kind is FeatureAssetKind.COMMAND
+        and metadata.get("user-invocable", "true").lower() == "false"
+    ):
+        return False
+    if (
+        entry.asset_kind is FeatureAssetKind.SKILL
+        and metadata.get("disable-model-invocation", "false").lower() == "true"
+    ):
+        return False
+    return True
+
+
+def build_frontend_inventory(
+    ledger: FeatureLedger,
+    adapter: FrontendAdapter,
+) -> FrontendInventory:
+    """Project authoritative assets through Claude or Copilot discovery."""
+    entries: list[FrontendInventoryEntry] = []
+    warnings: list[str] = []
+    for entry in ledger.entries:
+        if entry.asset_kind is FeatureAssetKind.HOST_BUILTIN:
+            continue
+        if entry.asset_kind is FeatureAssetKind.AGENT:
+            surface = "agent"
+        elif adapter is FrontendAdapter.COPILOT:
+            # Copilot's JSON skill inventory includes both `.claude/commands`
+            # and `.claude/skills`, so they share one name namespace.
+            surface = "skill"
+        else:
+            # Claude's compatibility loader also requires command and skill
+            # names to be disjoint: a same-name skill can hide a slash command.
+            surface = "prompt"
+        entries.append(
+            FrontendInventoryEntry(
+                canonical_name=entry.canonical_name,
+                asset_kind=entry.asset_kind,
+                source_asset=entry.source_asset,
+                surface=surface,
+                enabled=_metadata_enabled(entry),
+            )
+        )
+    return FrontendInventory(
+        adapter=adapter,
+        entries=tuple(
+            sorted(
+                entries,
+                key=lambda item: (
+                    item.surface,
+                    item.canonical_name,
+                    item.asset_kind.value,
+                    item.source_asset,
+                ),
+            )
+        ),
+        warnings=tuple(sorted(warnings)),
+    )
+
+
+def frontend_parity_errors(
+    ledger: FeatureLedger,
+    inventory: FrontendInventory,
+) -> tuple[str, ...]:
+    """Compare authoritative declarations with one frontend adapter."""
+    declared = {
+        entry.source_asset
+        for entry in ledger.entries
+        if entry.asset_kind is not FeatureAssetKind.HOST_BUILTIN
+    }
+    adapted = {entry.source_asset for entry in inventory.entries}
+    errors: list[str] = []
+    for source_asset in sorted(declared - adapted):
+        errors.append(f"missing: {source_asset}")
+    for source_asset in sorted(adapted - declared):
+        errors.append(f"unexpected: {source_asset}")
+    for duplicate in inventory.duplicates:
+        errors.append(
+            f"duplicate {duplicate.surface} name {duplicate.canonical_name!r}: "
+            + ", ".join(duplicate.members)
+        )
+    for entry in inventory.entries:
+        if not entry.enabled:
+            errors.append(f"disabled: {entry.source_asset}")
+    errors.extend(f"warning: {warning}" for warning in inventory.warnings)
+    return tuple(errors)
+
+
 def build_feature_ledger(
     repo_root: Path,
     *,
@@ -329,8 +589,9 @@ def build_feature_ledger(
 
     skills_dir = root / ".claude" / "skills"
     for path in sorted(skills_dir.rglob("SKILL.md")):
-        metadata = parser(path.read_text(encoding="utf-8"))
-        name = path.parent.name
+        yaml_metadata = _load_yaml_frontmatter(path)
+        _validate_description(path, yaml_metadata)
+        name = _canonical_skill_name(path, yaml_metadata)
         entries.append(
             _source_entry(
                 repo_root=root,
@@ -340,14 +601,15 @@ def build_feature_ledger(
                 behavior="load authoritative skill body",
                 capability_requirement="skill_loading",
                 host_mapping=name,
-                metadata=metadata,
+                metadata=_flat_metadata(yaml_metadata),
             )
         )
 
-    agents_dir = root / ".claude" / "agents"
+    agents_dir = root / "plugins" / "agents" / "agents"
     for path in sorted(agents_dir.glob("*.md")):
-        metadata = parser(path.read_text(encoding="utf-8"))
-        name = path.stem
+        yaml_metadata = _load_yaml_frontmatter(path)
+        _validate_agent_metadata(path, yaml_metadata)
+        name = _canonical_agent_name(path, yaml_metadata)
         entries.append(
             _source_entry(
                 repo_root=root,
@@ -357,7 +619,7 @@ def build_feature_ledger(
                 behavior="load authoritative agent definition",
                 capability_requirement="agent_dispatch",
                 host_mapping=name,
-                metadata=metadata,
+                metadata=_flat_metadata(yaml_metadata),
             )
         )
 
@@ -402,6 +664,12 @@ __all__ = [
     "FeatureLedger",
     "FeatureLedgerEntry",
     "FeatureStatus",
+    "FrontendAdapter",
+    "FrontendDuplicate",
+    "FrontendInventory",
+    "FrontendInventoryEntry",
     "HostBuiltin",
     "build_feature_ledger",
+    "build_frontend_inventory",
+    "frontend_parity_errors",
 ]

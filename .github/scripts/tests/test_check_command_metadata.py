@@ -51,6 +51,18 @@ def test_leading_slash_stripped(mod) -> None:
     assert mod._excluded_names("`/commands`") == {"commands"}
 
 
+def test_skill_names_use_frontend_slugging(mod) -> None:
+    skill = (
+        mod.REPO
+        / ".claude"
+        / "skills"
+        / "crash-analysis"
+        / "gcov-coverage"
+        / "SKILL.md"
+    )
+    assert mod._canonical_skill_name(skill) == "Code-Coverage-with-gcov"
+
+
 def test_repo_sentence_matches_frontmatter_set(mod) -> None:
     """The shipped commands.md sentence must parse to exactly the
     frontmatter-excluded set (the lint's end-to-end contract)."""
@@ -64,3 +76,12 @@ def test_repo_sentence_matches_frontmatter_set(mod) -> None:
         if fm.get("exclude_from_listing", "").lower() == "true":
             flagged.add(md.stem)
     assert names == flagged
+
+
+def test_repo_command_and_skill_names_are_disjoint(mod) -> None:
+    commands = {path.stem for path in mod.COMMANDS_DIR.glob("*.md")}
+    skills = {
+        mod._canonical_skill_name(path)
+        for path in mod.SKILLS_DIR.rglob("SKILL.md")
+    }
+    assert commands.isdisjoint(skills)
