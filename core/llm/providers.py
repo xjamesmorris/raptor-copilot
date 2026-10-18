@@ -1476,75 +1476,19 @@ def _coerce_to_schema(data: dict[str, Any], schema: dict[str, Any]) -> dict[str,
     return coerced
 
 
-def _normalize_schema(schema: dict[str, Any]) -> dict[str, Any]:
-    """Normalize simple format schema to JSON Schema format.
+def _normalize_schema(
+    schema: dict[str, Any] | bool,
+) -> dict[str, Any] | bool:
+    """Convert only RAPTOR descriptive shorthand to JSON Schema.
 
-    Simple format: {"field": "type description"}
-    JSON Schema format:
-    {"type": "object", "properties": {...}, "required": [...]}
-
-    Property-based schemas gain a root object type when omitted. An explicit
-    type is preserved unchanged.
+    Advanced JSON Schema roots are deep-copied without semantic rewriting.
+    Ordinary property-based object nodes gain a missing ``type: object`` for
+    Claude's stricter transport contract. Caller-owned nested objects stay
+    isolated from later provider adaptation.
     """
-    if "properties" in schema:
-        normalized = dict(schema)
-        normalized.setdefault("type", "object")
-        return normalized
+    from .schema_normalization import normalize_schema
 
-    type_aliases = {
-        "bool": "boolean", "str": "string", "int": "integer",
-        "float": "number", "list": "array", "dict": "object",
-    }
-
-    properties = {}
-    for field_name, field_desc in schema.items():
-        if isinstance(field_desc, dict):
-            properties[field_name] = field_desc
-            continue
-
-        field_desc_str = str(field_desc)
-        parts = field_desc_str.split()
-        field_type = parts[0].strip() if parts else "string"
-        field_type = type_aliases.get(field_type, field_type)
-
-        desc_lower = field_desc_str.lower()
-        # Detect nullable: "string or null", "float or null"
-        if " or null" in desc_lower:
-            prop = {"type": [field_type, "null"]}
-        elif desc_lower.startswith("null or "):
-            # "null or string" — the type is the token after "null or",
-            # i.e. parts[2] (parts[1] is always the literal "or")
-            actual = parts[2].strip() if len(parts) > 2 else "string"
-            actual = type_aliases.get(actual, actual)
-            prop = {"type": [actual, "null"]}
-        else:
-            prop = {"type": field_type}  # type: ignore[dict-item]
-
-        # Arrays need an items definition for Gemini
-        if field_type == "array":
-            prop["items"] = {"type": "string"}  # type: ignore[assignment]
-
-        # Extract description
-        if " - " in field_desc_str:
-            prop["description"] = field_desc_str.split(" - ", 1)[1].strip()  # type: ignore[assignment]
-        elif "(" in field_desc_str:
-            prop["description"] = field_desc_str[field_desc_str.find("("):].strip()  # type: ignore[assignment]
-
-        properties[field_name] = prop
-
-    required = []
-    for field_name, field_desc in schema.items():
-        if isinstance(field_desc, dict):
-            required.append(field_name)
-            continue
-        desc_lower = str(field_desc).lower()
-        if "optional" not in desc_lower and "or null" not in desc_lower:
-            required.append(field_name)
-    return {
-        "type": "object",
-        "properties": properties,
-        "required": required,
-    }
+    return normalize_schema(schema)
 
 
 def _schema_to_gemini(schema: dict[str, Any]) -> dict[str, Any]:
@@ -4860,6 +4804,8 @@ class ClaudeCodeLLMProvider(LLMProvider):
 
         from .cc_adapter import (
             CCDispatchConfig,
+            CCMissingRootTypeError,
+            CCRequestSchemaError,
             CCTransportError,
             build_cc_command,
             run_cc_streaming,
@@ -4914,7 +4860,17 @@ class ClaudeCodeLLMProvider(LLMProvider):
                 )
         except subprocess.TimeoutExpired as e:
             msg = f"claude -p timed out after {call_timeout}s"
-            raise CCTransportError(msg) from e
+            raise CCTransportError(
+                msg,
+                diagnostic={
+                    "transport": "claude_code",
+                    "structured": False,
+                    "per_call_budget_usd": self._budget_usd,
+                    "timeout_s": call_timeout,
+                    "model": self.config.model_name,
+                },
+                error_kind="timeout",
+            ) from e
         duration = _time.monotonic() - start
 
         # Book usage BEFORE the error check: a failed call (budget
@@ -4941,7 +4897,30 @@ class ClaudeCodeLLMProvider(LLMProvider):
         )
 
         if sr.error:
-            transport_error = CCTransportError(sr.error)
+            if sr.error_kind == "missing_root_type":
+                error_cls = CCMissingRootTypeError
+            elif sr.error_kind == "request_schema":
+                error_cls = CCRequestSchemaError
+            else:
+                error_cls = CCTransportError
+            transport_error = error_cls(
+                sr.error,
+                diagnostic={
+                    **(sr.diagnostic or {}),
+                    "transport": "claude_code",
+                    "structured": False,
+                    "per_call_budget_usd": self._budget_usd,
+                    "timeout_s": call_timeout,
+                    "model": self.config.model_name,
+                },
+                error_kind=sr.error_kind,
+            )
+            _attach_billed_usage(
+                transport_error,
+                cost_usd=sr.cost_usd,
+                tokens_in=sr.input_tokens,
+                tokens_out=sr.output_tokens,
+            )
             attach_cost_observation(transport_error, observation)
             raise transport_error
 
@@ -4975,7 +4954,7 @@ class ClaudeCodeLLMProvider(LLMProvider):
     def generate_structured(
         self,
         prompt: str,
-        schema: dict[str, Any],
+        schema: dict[str, Any] | bool,
         system_prompt: str | None = None,
         **kwargs,
     ) -> StructuredResponse:
@@ -4991,6 +4970,8 @@ class ClaudeCodeLLMProvider(LLMProvider):
 
         from .cc_adapter import (
             CCDispatchConfig,
+            CCMissingRootTypeError,
+            CCRequestSchemaError,
             CCTransportError,
             build_cc_command,
             run_cc_streaming,
@@ -5019,13 +5000,14 @@ class ClaudeCodeLLMProvider(LLMProvider):
         # CCDispatchConfig.system_prompt (which build_cc_command
         # converts into a `--system-prompt-file` flag).
         call_timeout = self._effective_timeout_s(kwargs.pop("timeout_s", None))
+        wire_schema = _normalize_schema(schema)
 
         cc_config = CCDispatchConfig(
             claude_bin=self._claude_bin,
             tools="",                                # see generate() comment
             budget_usd=self._budget_usd,
             timeout_s=call_timeout,  # type: ignore[arg-type]
-            json_schema=schema,
+            json_schema=wire_schema,
             capture_json_envelope=False,
             stream_json=True,
             system_prompt=system_prompt,
@@ -5057,7 +5039,18 @@ class ClaudeCodeLLMProvider(LLMProvider):
                 )
         except subprocess.TimeoutExpired as e:
             msg = f"claude -p timed out after {call_timeout}s"
-            raise CCTransportError(msg) from e
+            raise CCTransportError(
+                msg,
+                diagnostic={
+                    "transport": "claude_code",
+                    "structured": True,
+                    "request_schema": wire_schema,
+                    "per_call_budget_usd": self._budget_usd,
+                    "timeout_s": call_timeout,
+                    "model": self.config.model_name,
+                },
+                error_kind="timeout",
+            ) from e
         duration = _time.monotonic() - start
 
         # Book usage BEFORE the error/parse checks: a failed call
@@ -5084,7 +5077,31 @@ class ClaudeCodeLLMProvider(LLMProvider):
         )
 
         if sr.error:
-            error = CCTransportError(sr.error)
+            if sr.error_kind == "missing_root_type":
+                error_cls = CCMissingRootTypeError
+            elif sr.error_kind == "request_schema":
+                error_cls = CCRequestSchemaError
+            else:
+                error_cls = CCTransportError
+            error = error_cls(
+                sr.error,
+                diagnostic={
+                    **(sr.diagnostic or {}),
+                    "transport": "claude_code",
+                    "structured": True,
+                    "request_schema": wire_schema,
+                    "per_call_budget_usd": self._budget_usd,
+                    "timeout_s": call_timeout,
+                    "model": self.config.model_name,
+                },
+                error_kind=sr.error_kind,
+            )
+            _attach_billed_usage(
+                error,
+                cost_usd=sr.cost_usd,
+                tokens_in=sr.input_tokens,
+                tokens_out=sr.output_tokens,
+            )
             attach_cost_observation(error, observation)
             raise error
 

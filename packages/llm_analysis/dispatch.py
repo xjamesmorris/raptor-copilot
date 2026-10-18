@@ -91,6 +91,189 @@ class _ErrorDictResult(Exception):
         self.metadata = metadata or {}
 
 
+def _exception_chain(error: BaseException) -> list[BaseException]:
+    """Bounded, cycle-safe exception chain for typed transport metadata."""
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen and len(chain) < 16:
+        chain.append(current)
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return chain
+
+
+def _exception_billed_usage(
+    error: BaseException,
+) -> tuple[float, int, int]:
+    """Return partial (cost, tokens, thinking tokens) attached to failure."""
+    for item in _exception_chain(error):
+        raw_cost = getattr(item, "billed_cost_usd", None)
+        raw_in = getattr(item, "billed_tokens_in", None)
+        raw_out = getattr(item, "billed_tokens_out", None)
+        raw_thinking = getattr(item, "billed_thinking_tokens", None)
+        if all(value is None for value in (
+            raw_cost, raw_in, raw_out, raw_thinking,
+        )):
+            continue
+        cost = (
+            float(raw_cost)
+            if isinstance(raw_cost, (int, float))
+            and not isinstance(raw_cost, bool)
+            and math.isfinite(float(raw_cost))
+            and float(raw_cost) >= 0.0
+            else 0.0
+        )
+
+        def _tokens(value: Any) -> int:
+            return (
+                int(value)
+                if isinstance(value, int)
+                and not isinstance(value, bool)
+                and value >= 0
+                else 0
+            )
+
+        return (
+            cost,
+            _tokens(raw_in) + _tokens(raw_out),
+            _tokens(raw_thinking),
+        )
+    return 0.0, 0, 0
+
+
+def classify_dispatch_error_text(error_str: str) -> str:
+    """Classify sanitized transport text when no typed cause survives."""
+    lower = (error_str or "").lower()
+    if (
+        "input_schema.type: field required" in lower
+        or 'strict mode: missing type "object"' in lower
+    ):
+        return "missing_root_type"
+    if (
+        "--json-schema is not a valid json schema" in lower
+        or "strict mode: unknown keyword" in lower
+    ):
+        return "request_schema"
+    return _classify_error(error_str)
+
+
+def classify_dispatch_exception(error: BaseException) -> str:
+    """Classify a dispatch failure without discarding typed causes."""
+    from core.llm.cc_adapter import (
+        CCMissingRootTypeError,
+        CCRequestSchemaError,
+    )
+
+    chain = _exception_chain(error)
+    if any(isinstance(item, CCMissingRootTypeError) for item in chain):
+        return "missing_root_type"
+    if any(isinstance(item, CCRequestSchemaError) for item in chain):
+        return "request_schema"
+    return classify_dispatch_error_text(str(error))
+
+
+def _sanitise_private_diagnostic(value: Any, *, depth: int = 0) -> Any:
+    """Redact and control-escape a diagnostic payload without truncating it."""
+    if depth >= 16:
+        return "<max-depth>"
+    if isinstance(value, str):
+        from core.security.log_sanitisation import escape_nonprintable
+        from core.security.redaction import redact_secrets
+
+        return escape_nonprintable(
+            redact_secrets(value),
+            preserve_newlines=True,
+        )
+    if isinstance(value, dict):
+        return {
+            str(_sanitise_private_diagnostic(key, depth=depth + 1)):
+            _sanitise_private_diagnostic(item, depth=depth + 1)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            _sanitise_private_diagnostic(item, depth=depth + 1)
+            for item in value
+        ]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return _sanitise_private_diagnostic(str(value), depth=depth + 1)
+
+
+def persist_dispatch_diagnostic(
+    cost_tracker: Any,
+    *,
+    task_name: str,
+    item_id: str,
+    model_name: str,
+    error: BaseException,
+) -> dict[str, Any]:
+    """Persist complete sanitized transport evidence as private JSON.
+
+    The public error record keeps only a bounded excerpt; the private artifact
+    carries the transport's complete sanitized stderr/stream diagnostic plus
+    request settings (schema, timeout, per-call budget) attached by the
+    provider. Returns report-safe artifact-reference fields.
+    """
+    diagnostic = None
+    chain = _exception_chain(error)
+    for item in chain:
+        candidate = getattr(item, "diagnostic", None)
+        if isinstance(candidate, dict):
+            diagnostic = candidate
+            break
+    diagnostic_dir = getattr(cost_tracker, "diagnostic_dir", None)
+    if diagnostic is None or diagnostic_dir is None:
+        return {}
+
+    try:
+        import uuid
+        from pathlib import Path
+
+        from core.run.safe_io import (
+            bounded_artifact_reference_fields,
+            safe_run_mkdir,
+            write_private_json,
+        )
+
+        diagnostic_dir = Path(diagnostic_dir)
+        safe_run_mkdir(diagnostic_dir.parent)
+        safe_run_mkdir(diagnostic_dir)
+        name = f"llm-dispatch-{uuid.uuid4().hex}.diagnostics.json"
+        path = diagnostic_dir / name
+        payload = {
+            "schema_version": 1,
+            "task": task_name,
+            "item_id": item_id,
+            "model": model_name,
+            "error_type": classify_dispatch_exception(error),
+            "error": str(error),
+            "exception_chain": [
+                {
+                    "type": type(item).__name__,
+                    "message": str(item),
+                }
+                for item in chain
+            ],
+            "transport_diagnostic": diagnostic,
+        }
+        write_private_json(path, _sanitise_private_diagnostic(payload))
+        reference = f"{diagnostic_dir.name}/{name}"
+        fields = bounded_artifact_reference_fields([reference])
+        return {
+            "diagnostic_artifact": reference,
+            **fields,
+        }
+    except (OSError, TypeError, ValueError) as exc:
+        logger.warning(
+            "failed to persist private %s dispatch diagnostic: %s",
+            task_name,
+            escape_nonprintable(str(exc)),
+        )
+        return {}
+
+
 _PROVENANCE_METADATA_FIELDS = frozenset({
     "analysed_by",
     "analysed_by_provider",
@@ -106,8 +289,14 @@ _ACCOUNTING_METADATA_FIELDS = frozenset({
     "cost_usd",
     "duration_seconds",
 })
+_DIAGNOSTIC_METADATA_FIELDS = frozenset({
+    "diagnostic_artifact",
+    "artifacts",
+})
 DISPATCH_METADATA_FIELDS = (
-    _PROVENANCE_METADATA_FIELDS | _ACCOUNTING_METADATA_FIELDS
+    _PROVENANCE_METADATA_FIELDS
+    | _ACCOUNTING_METADATA_FIELDS
+    | _DIAGNOSTIC_METADATA_FIELDS
 )
 
 
@@ -420,7 +609,12 @@ def record_exception_accounting(
 ) -> dict[str, Any]:
     """Record a failed dispatch and any accounting evidence attached by core."""
     observation = cost_observation_from_exception(error)
-    if observation is None:
+    partial_cost, partial_tokens, partial_thinking = (
+        _exception_billed_usage(error)
+    )
+    if observation is None and not (
+        partial_cost or partial_tokens or partial_thinking
+    ):
         record_attempt = getattr(cost_tracker, "record_attempt", None)
         if callable(record_attempt):
             record_attempt(
@@ -429,11 +623,19 @@ def record_exception_accounting(
                 failed=True,
             )
         return {}
+    if observation is None:
+        observation = CostObservation.unknown()
     route = observation.route
     result = DispatchResult(
         result={},
-        cost=observation.legacy_cost_usd,
-        model=route.model if route else "",
+        cost=(
+            observation.legacy_cost_usd
+            if observation.has_numeric_usd
+            else partial_cost
+        ),
+        tokens=partial_tokens,
+        thinking_tokens=partial_thinking,
+        model=route.model if route else model_name,
         provider=route.provider if route else "",
         cost_observation=observation,
         core_accounted=True,
@@ -610,7 +812,9 @@ def dispatch_task(
             participate.
 
     Returns:
-        List of result dicts, one per item dispatched. Failed items have "error" key.
+        Result dicts in submitted work order (model-major, then input order).
+        Failed items have an ``error`` key; work cancelled by an abort keeps
+        an explicit ``error_type="cancelled"`` record.
     """
     selected = task.select_items(items, prior_results)
     if not selected:
@@ -690,7 +894,7 @@ def dispatch_task(
 
     try:  # guarantees _throttle.close() on any exit path
         return _dispatch_inner(
-            task, work, selected, dispatch_fn, cost_tracker,
+            task, work, dispatch_fn, cost_tracker,
             max_parallel, prefilter_fn, prior_results, _throttle,
             start, system_prompt, profile_name,
         )
@@ -705,7 +909,7 @@ def dispatch_task(
 
 
 def _dispatch_inner(
-    task, work, selected, dispatch_fn, cost_tracker,
+    task, work, dispatch_fn, cost_tracker,
     max_parallel, prefilter_fn, prior_results, _throttle,
     start, system_prompt, profile_name,
 ):
@@ -715,7 +919,12 @@ def _dispatch_inner(
     total = len(work)
     completed = 0
     running_cost = 0.0
-    results = []
+    results_by_order: dict[int, dict[str, Any]] = {}
+
+    def _store_result(index: int, result: dict[str, Any]) -> None:
+        """Keep one result per submitted work item in submission order."""
+        results_by_order[index] = result
+
     abort = False
     abort_reason = "auth failure"
     _per_model_auth_fail: set = set()
@@ -749,7 +958,7 @@ def _dispatch_inner(
 
     with ThreadPoolExecutor(max_workers=max_parallel) as executor:
         futures = {}
-        for model, item in work:
+        for dispatch_index, (model, item) in enumerate(work):
             def _do_one(m=model, it=item):
                 # Circuit-breaker enforcement. All (model, item)
                 # futures are pre-submitted before the drain loop
@@ -792,7 +1001,7 @@ def _dispatch_inner(
                     return dispatch_fn(prompt, schema, system_prompt, task.temperature, m)
 
             future = executor.submit(_do_one)
-            futures[future] = (model, item)
+            futures[future] = (dispatch_index, model, item)
 
         # Which futures the drain loop below actually consumed — the
         # post-abort straggler sweep needs the complement.
@@ -800,7 +1009,7 @@ def _dispatch_inner(
 
         for future in as_completed(futures):
             drained_futures.add(future)
-            model, item = futures[future]
+            dispatch_index, model, item = futures[future]
             item_id = task.get_item_id(item)
             model_key = _model_key(model)
             completed += 1
@@ -845,7 +1054,7 @@ def _dispatch_inner(
                 processed["_quality"] = getattr(dispatch_result, "quality", 1.0)
                 item_cost = processed.get("cost_usd", 0)
                 running_cost += item_cost
-                results.append(processed)
+                _store_result(dispatch_index, processed)
                 # Reset this model's consecutive-failure counter
                 # — successful response means we're not in a
                 # death spiral for this model.
@@ -932,7 +1141,7 @@ def _dispatch_inner(
                 # record the skip without touching the per-model
                 # consecutive-failure counters or telemetry.
                 model_name = model.model_name if model is not None else "?"
-                results.append({
+                _store_result(dispatch_index, {
                     "finding_id": item_id,
                     "error": "skipped (model circuit-broken)",
                     "error_type": "circuit_breaker",
@@ -955,7 +1164,7 @@ def _dispatch_inner(
 
             except Exception as e:  # noqa: BLE001 — per-item isolation: one failed dispatch must not sink the batch
                 err_str = str(e)
-                error_type = _classify_error(err_str)
+                error_type = classify_dispatch_exception(e)
                 model_name = model.model_name if model is not None else "?"
                 error_metadata: dict[str, Any] = {}
                 if isinstance(e, _ErrorDictResult) and e.model_name:
@@ -969,6 +1178,13 @@ def _dispatch_inner(
                         error_metadata = record_exception_accounting(
                             cost_tracker, e, model_name=model_key,
                         )
+                    error_metadata.update(persist_dispatch_diagnostic(
+                        cost_tracker,
+                        task_name=task.name,
+                        item_id=item_id,
+                        model_name=model_name,
+                        error=e,
+                    ))
                 error_record = {
                     "finding_id": item_id,
                     "error": err_str,
@@ -976,7 +1192,7 @@ def _dispatch_inner(
                     "analysed_by": model_name,
                 }
                 error_record.update(error_metadata)
-                results.append(error_record)
+                _store_result(dispatch_index, error_record)
                 display = escape_nonprintable(task.get_item_display(item))
                 prefix = (
                     f"  [{completed}/{total} "
@@ -989,7 +1205,15 @@ def _dispatch_inner(
                 print(f"{prefix} {display} FAILED — {escape_nonprintable(err_str)}")
 
                 # Record schema failure telemetry (skip auth/network errors)
-                if error_type not in ("auth", "timeout") and profile_name:
+                if (
+                    error_type not in (
+                        "auth",
+                        "missing_root_type",
+                        "timeout",
+                        "request_schema",
+                    )
+                    and profile_name
+                ):
                     with _nonces_lock:
                         nonce = _nonces.pop((item_id, model_key), "")
                     if nonce:
@@ -1098,20 +1322,39 @@ def _dispatch_inner(
         # LOST and the backfill below rewrote its real outcome as
         # "aborted (...)" — a paid-for result (or a real failure that
         # telemetry must count) mislabelled as an abort casualty.
-        for future, (model, item) in futures.items():
-            if (future in drained_futures or future.cancelled()
-                    or not future.done()):
+        for future, (dispatch_index, model, item) in futures.items():
+            if future in drained_futures:
                 continue
             item_id = task.get_item_id(item)
             model_key = _model_key(model)
             model_name = model.model_name if model is not None else "?"
+            if future.cancelled():
+                _store_result(dispatch_index, {
+                    "finding_id": item_id,
+                    "error": f"aborted ({abort_reason})",
+                    "error_type": "cancelled",
+                    "analysed_by": model_name,
+                })
+                continue
+            if not future.done():
+                # The executor context waits for running futures, so this is a
+                # defensive record for a future implementation that changes
+                # shutdown semantics. Never silently drop submitted work.
+                _store_result(dispatch_index, {
+                    "finding_id": item_id,
+                    "error": f"aborted ({abort_reason})",
+                    "error_type": "cancelled",
+                    "analysed_by": model_name,
+                })
+                continue
             err_str = None
             dispatch_result = None
+            error_metadata: dict[str, Any] = {}
             exc = future.exception()
             if isinstance(exc, _ModelCircuitOpen):
                 # Short-circuited before dispatch: no API call, no
                 # fresh failure — same skip row as the drain loop.
-                results.append({
+                _store_result(dispatch_index, {
                     "finding_id": item_id,
                     "error": "skipped (model circuit-broken)",
                     "error_type": "circuit_breaker",
@@ -1120,6 +1363,16 @@ def _dispatch_inner(
                 continue
             if exc is not None:
                 err_str = str(exc)
+                error_metadata = record_exception_accounting(
+                    cost_tracker, exc, model_name=model_key,
+                )
+                error_metadata.update(persist_dispatch_diagnostic(
+                    cost_tracker,
+                    task_name=task.name,
+                    item_id=item_id,
+                    model_name=model_name,
+                    error=exc,
+                ))
             else:
                 dispatch_result = future.result()
                 payload = getattr(dispatch_result, "result", None)
@@ -1127,19 +1380,25 @@ def _dispatch_inner(
                 # (mirrors the drain loop's envelope handling).
                 if isinstance(payload, dict) and "error" in payload:
                     err_str = str(payload.get("error"))
-                    _err_cost = getattr(dispatch_result, "cost", 0) or 0
-                    _err_tokens = getattr(
-                        dispatch_result, "tokens", 0) or 0
+                    record_dispatch_accounting(
+                        cost_tracker,
+                        dispatch_result,
+                        failed=True,
+                    )
+                    error_metadata = dispatch_result_metadata(
+                        dispatch_result,
+                        failed=True,
+                    )
                     _err_model = getattr(
                         dispatch_result, "model", "") or ""
-                    if _err_cost > 0 or _err_tokens > 0:
-                        cost_tracker.add_cost(
-                            _err_model or "unknown", _err_cost,
-                            tokens=_err_tokens,
-                        )
                     if _err_model:
                         model_name = _err_model
             if err_str is None:
+                record_dispatch_accounting(
+                    cost_tracker,
+                    dispatch_result,
+                    failed=False,
+                )
                 try:
                     processed = task.process_result(item, dispatch_result)
                 except Exception as e:  # noqa: BLE001 — per-item isolation, as in the drain loop
@@ -1148,18 +1407,6 @@ def _dispatch_inner(
                     processed["finding_id"] = item_id
                     processed["_quality"] = getattr(
                         dispatch_result, "quality", 1.0)
-                    item_cost = processed.get("cost_usd", 0)
-                    item_tokens = getattr(
-                        dispatch_result, "tokens", 0) or 0
-                    item_thinking = getattr(
-                        dispatch_result, "thinking_tokens", 0) or 0
-                    if (item_cost > 0 or item_tokens > 0
-                            or item_thinking > 0):
-                        cost_tracker.add_cost(
-                            processed.get("analysed_by", "unknown"),
-                            item_cost, tokens=item_tokens,
-                            thinking_tokens=item_thinking,
-                        )
                     # Nonce-leak check, mirroring the drain's success
                     # path: the leak flag still has consumers after an
                     # abort — the defense summary merged into run
@@ -1195,15 +1442,32 @@ def _dispatch_inner(
                         )
                         if nonce_leaked_in(nonce, raw_text):
                             processed["_nonce_leaked"] = True
-                    results.append(processed)
+                    _store_result(dispatch_index, processed)
                     continue
-            error_type = _classify_error(err_str)
-            results.append({"finding_id": item_id, "error": err_str,
-                            "error_type": error_type,
-                            "analysed_by": model_name})
+            error_type = (
+                classify_dispatch_exception(exc)
+                if exc is not None
+                else classify_dispatch_error_text(err_str)
+            )
+            error_record = {
+                "finding_id": item_id,
+                "error": err_str,
+                "error_type": error_type,
+                "analysed_by": model_name,
+            }
+            error_record.update(error_metadata)
+            _store_result(dispatch_index, error_record)
             # Record the straggler's failure telemetry exactly like
             # the drain loop would have (skip auth/network errors).
-            if error_type not in ("auth", "timeout") and profile_name:
+            if (
+                error_type not in (
+                    "auth",
+                    "missing_root_type",
+                    "timeout",
+                    "request_schema",
+                )
+                and profile_name
+            ):
                 with _nonces_lock:
                     nonce = _nonces.pop((item_id, model_key), "")
                 if nonce:
@@ -1220,18 +1484,25 @@ def _dispatch_inner(
                         schema_retried=False,
                     )
 
-        completed_ids = {r.get("finding_id") for r in results}
-        for item in selected:
+        for dispatch_index, (model, item) in enumerate(work):
+            if dispatch_index in results_by_order:
+                continue
             item_id = task.get_item_id(item)
-            if item_id not in completed_ids:
-                # Pre-fix this hardcoded "aborted (auth failure)" even
-                # when the abort came from the all-models-circuit-broken
-                # branch — mislabelling non-auth death spirals in the
-                # per-item error records. Carry the actual reason.
-                results.append({
-                    "finding_id": item_id,
-                    "error": f"aborted ({abort_reason})",
-                })
+            model_name = model.model_name if model is not None else "?"
+            # Defensive backfill by WORK ITEM, not finding id. A multi-model
+            # run can have one successful model and one cancelled model for
+            # the same finding; item-id backfill let the success erase the
+            # cancelled peer entirely.
+            _store_result(dispatch_index, {
+                "finding_id": item_id,
+                "error": f"aborted ({abort_reason})",
+                "error_type": "cancelled",
+                "analysed_by": model_name,
+            })
 
     # Finalize (e.g. consensus verdict rules)
-    return task.finalize(results, prior_results)
+    ordered_results = [
+        results_by_order[index]
+        for index in sorted(results_by_order)
+    ]
+    return task.finalize(ordered_results, prior_results)

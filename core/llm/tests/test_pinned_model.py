@@ -756,13 +756,18 @@ class TestPinnedMaxTokensCap:
         cfg = _pinned_llm_config("anthropic/claude-big-test")
         assert cfg.primary_model.max_tokens == 32000
 
-    def test_unknown_model_keeps_base_value(self, monkeypatch):
-        """No published limits: the base's operator-sized value beats
-        the blind 4096 floor (pre-fix behaviour preserved)."""
+    def test_unknown_model_does_not_inherit_base_capability(
+        self,
+        monkeypatch,
+    ):
+        """No published limits: a sibling's cap is not capability
+        evidence for the unlisted pinned model."""
         self._install_base(monkeypatch, max_tokens=64000)
         self._install_limits(monkeypatch, {})
         cfg = _pinned_llm_config("anthropic/claude-unknown-test")
-        assert cfg.primary_model.max_tokens == 64000
+        assert cfg.primary_model.max_tokens == 4096
+        assert cfg.primary_model.max_context == 32000
+        assert cfg.primary_model.cost_per_1k_tokens == 0.0
 
 
 def test_pinned_llm_config_tolerates_non_dict_config_entries(monkeypatch):

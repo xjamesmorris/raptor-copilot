@@ -451,6 +451,88 @@ primary — resolvable whenever the `claude` binary is installed.
 5. Shorthand resolution: bare tokens like `haiku`, `opus`, `sonnet` match against
    configured model names. Ambiguous matches raise an error.
 
+### Explicit catalogue-unlisted Claude models
+
+The built-in model tables provide verified limits and prices; they are not an
+allowlist. A model that the selected Claude backend actually serves can be used
+without editing the catalogue:
+
+```bash
+# Interactive frontend: forwarded verbatim to the native Claude Code CLI.
+bin/raptor --frontend claude --model rhyolite-preview /path/to/target
+
+# Headless analysis through Claude Code.
+python3 raptor.py agentic --repo /path/to/target \
+  --model claudecode/rhyolite-preview
+
+# Direct Anthropic API route.
+python3 raptor.py agentic --repo /path/to/target \
+  --model anthropic/rhyolite-preview
+```
+
+The interactive launcher does not validate or rewrite the model string. For
+headless analysis, `provider/model` selects the route explicitly and the model
+portion is retained exactly. A direct Anthropic selection may borrow only a
+configured Anthropic credential and `api_base`; it does not borrow a sibling
+model's limits or price. A `claudecode/...` selection uses the installed
+Claude Code CLI's own authentication. In both cases an upstream "unknown
+model", entitlement, or other rejection remains a visible call failure; RAPTOR
+does not substitute a catalogue model. A single explicit `--model` also
+suppresses config-derived fallback models; an unlisted explicit model also
+does not acquire a catalogue-derived fast-tier specialist.
+
+Only the first recognized route qualifier is structural. Everything after it
+is an opaque upstream model ID and is preserved byte-for-byte, including
+additional `/`, `.`, `:`, `_`, `+`, and `@` separators. Thus
+`claudecode/vendor/rhyolite.preview:beta+tools@20261016` reaches Claude Code as
+`vendor/rhyolite.preview:beta+tools@20261016`. Route aliases such as
+`claude-code/...` canonicalize the provider to `claudecode` without rewriting
+the model. If the same opaque model name appears under multiple configured
+providers, an explicit qualifier wins; it cannot be captured by an exact name
+on another provider. For headless and pinned calls, a usable configured
+same-provider credential/`api_base` also wins over ambient provider defaults,
+so an environment API key cannot silently move the explicit model off its
+configured gateway.
+
+This route/family split also applies to local models:
+`ollama/gpt-oss:20b`, `ollama/gemma3`, `ollama/mistral`, and
+`ollama/command-r` all stay on the configured Ollama endpoint even though
+their underlying families are OpenAI, Google, Mistral, and Cohere
+respectively. Family detection remains available for cross-family review; it
+never overrides an explicit routing provider.
+
+An unusual unqualified name is accepted only when it exactly matches a
+`models.json` entry, which supplies the otherwise unknowable provider route:
+
+```json
+{
+  "models": [
+    {
+      "provider": "claudecode",
+      "model": "rhyolite-preview",
+      "max_context": 200000,
+      "max_output": 32000
+    }
+  ]
+}
+```
+
+Unqualified names that are neither exact configured entries nor unambiguous
+configured shorthand still fail loudly with a `provider/model` remedy. This
+keeps typo handling and shorthand ambiguity unchanged.
+
+Catalogue-unlisted means capability and price metadata are **unknown**:
+
+- no limits or prices are added to `MODEL_LIMITS` / `MODEL_COSTS`;
+- direct-provider USD accounting remains Unknown rather than using an invented
+  zero or sibling price;
+- Claude Code cost is CLI-reported when its result envelope supplies it and
+  Unknown otherwise;
+- for an exact configured entry, set `max_context` and `max_output` to values
+  documented by that backend. Provider-qualified one-off selections use
+  conservative internal request bounds, not a claim about the model's true
+  capacity.
+
 Core callers that require an immutable route can construct
 `LLMClient(pinned_config=ModelConfig(...))`. This disables fallback and task
 specialization and revalidates the provider, model, and route fields before

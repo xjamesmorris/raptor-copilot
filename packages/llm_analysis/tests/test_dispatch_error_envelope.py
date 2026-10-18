@@ -11,8 +11,12 @@ burns one full timeout per finding for the whole run).
 
 from __future__ import annotations
 
+import json
 import sys
+import threading
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
@@ -39,6 +43,35 @@ def _make_finding(finding_id: str) -> dict:
 
 
 class TestErrorDictRoutedToFailurePath:
+
+    @pytest.mark.parametrize(("message", "expected"), [
+        (
+            'strict mode: missing type "object" for keyword '
+            '"properties" at "#"',
+            "missing_root_type",
+        ),
+        (
+            "--json-schema is not a valid JSON Schema: strict mode: "
+            'unknown keyword: "reasoning"',
+            "request_schema",
+        ),
+    ])
+    def test_schema_error_envelope_keeps_distinct_classification(
+        self, message, expected,
+    ):
+        results = dispatch_task(
+            task=AnalysisTask(),
+            items=[_make_finding("f-000")],
+            dispatch_fn=lambda *args: DispatchResult(
+                result={"error": message},
+                model="claude-code",
+            ),
+            role_resolution={},
+            prior_results={},
+            cost_tracker=CostTracker(0),
+            max_parallel=1,
+        )
+        assert results[0]["error_type"] == expected
 
     def test_error_envelopes_are_failure_records(self):
         import time
@@ -188,6 +221,89 @@ class TestErrorDictRoutedToFailurePath:
         )
         assert tracker.total_cost == 0.25
         assert tracker.get_summary()["total_tokens"] == 1234
+
+    def test_completed_straggler_failures_are_all_accounted(self):
+        """Every already-running failure survives the breaker sweep."""
+        findings = [_make_finding(f"f-{i:03d}") for i in range(10)]
+        barrier = threading.Barrier(len(findings))
+        tracker = CostTracker(0)
+
+        def fail_together(prompt, schema, system_prompt, temperature, model):
+            barrier.wait(timeout=5)
+            return DispatchResult(
+                result={"error": "request schema rejected"},
+                model="claude-code",
+                tokens=1,
+            )
+
+        results = dispatch_task(
+            task=AnalysisTask(),
+            items=findings,
+            dispatch_fn=fail_together,
+            role_resolution={},
+            prior_results={},
+            cost_tracker=tracker,
+            max_parallel=len(findings),
+        )
+
+        assert len(results) == len(findings)
+        assert all("error" in result for result in results)
+        summary = tracker.get_summary()
+        assert summary["failed_dispatches"] == len(findings)
+        assert summary["total_tokens"] == len(findings)
+
+    def test_typed_schema_failure_writes_private_complete_diagnostic(
+        self, tmp_path,
+    ):
+        from core.llm.cc_adapter import CCRequestSchemaError
+
+        secret = "glpat-AbCdEfGhIjKlMnOpQrStUvWx"
+        full_stderr = (
+            "strict mode: unknown keyword: \"reasoning\"\n"
+            + "detail-" * 300
+            + secret
+            + "\x1b[31mTAIL"
+        )
+        error = CCRequestSchemaError(
+            "claude -p exited 1: invalid JSON Schema",
+            error_kind="request_schema",
+            diagnostic={
+                "stderr": full_stderr,
+                "request_schema": {
+                    "type": "object",
+                    "reasoning": {"type": "string"},
+                },
+                "per_call_budget_usd": "5.00",
+                "timeout_s": 600,
+            },
+        )
+        tracker = CostTracker(
+            0,
+            diagnostic_dir=tmp_path / "diagnostics",
+        )
+
+        results = dispatch_task(
+            task=AnalysisTask(),
+            items=[_make_finding("f-000")],
+            dispatch_fn=lambda *args: (_ for _ in ()).throw(error),
+            role_resolution={},
+            prior_results={},
+            cost_tracker=tracker,
+            max_parallel=1,
+        )
+
+        result = results[0]
+        assert result["error_type"] == "request_schema"
+        artifact = tmp_path / result["diagnostic_artifact"]
+        assert artifact.stat().st_mode & 0o777 == 0o600
+        payload = json.loads(artifact.read_text(encoding="utf-8"))
+        stored = payload["transport_diagnostic"]["stderr"]
+        assert "detail-" * 300 in stored
+        assert "TAIL" in stored
+        assert secret not in stored
+        assert "[REDACTED]" in stored
+        assert "\x1b" not in stored
+        assert result["artifacts"] == [result["diagnostic_artifact"]]
 
 
 class TestThinkingTokenTelemetry:

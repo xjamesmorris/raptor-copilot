@@ -1033,12 +1033,22 @@ def _model_config_from_entry(entry: dict) -> 'ModelConfig':
     from core.llm.model_data import resolve_model_costs, resolve_model_limits
     limits = resolve_model_limits(model_name) or {}
     costs = resolve_model_costs(model_name) or {}
-    if costs:
-        cost_per_1k = (costs.get("input", 0.005) + costs.get("output", 0.005)) / 2
-    elif provider == "ollama":
+    if provider in ("ollama", "claudecode", "claudecode-resumable"):
+        # Local/CLI transports do not inherit direct-API catalogue
+        # pricing. Claude Code reports per-call cost in its result
+        # envelope when available; when absent the accounting basis is
+        # unknown, never an invented Anthropic rate.
         cost_per_1k = 0.0
+    elif costs:
+        cost_per_1k = (
+            costs.get("input", 0.005) + costs.get("output", 0.005)
+        ) / 2
     else:
-        cost_per_1k = 0.005
+        # An explicitly configured, catalogue-unlisted model is still
+        # routable, but its price is unknown. A non-zero fallback here
+        # turns a guess into CONFIGURED_RATE accounting and presents it
+        # as budget evidence.
+        cost_per_1k = 0.0
 
     # Honour the operator-configured remote Ollama host (see
     # ``_get_configured_models`` for the same fix in the cold-start
@@ -1151,8 +1161,19 @@ def _build_fast_model_for(primary: 'ModelConfig') -> Optional['ModelConfig']:
     tiers — a future model addition only needs catalog entries, not
     plumbing changes here.
     """
-    fast_name = PROVIDER_FAST_MODELS.get(primary.provider)
+    from core.llm.model_data import resolve_model_limits
+
+    provider = getattr(primary, "provider", "")
+    fast_name = PROVIDER_FAST_MODELS.get(provider)
     if not fast_name:
+        return None
+
+    model_name = getattr(primary, "model_name", None)
+    if not model_name or resolve_model_limits(model_name) is None:
+        # Provider affinity does not authorize substituting a
+        # catalogued sibling for an explicitly selected unlisted
+        # model. The operator can still configure a specialist
+        # explicitly.
         return None
 
     limits = MODEL_LIMITS.get(fast_name, {})
@@ -1820,6 +1841,8 @@ class LLMConfig:
 
         Skips silently when:
           * no primary model is available (no provider to map from);
+          * the primary model itself is absent from the verified
+            capability catalogue;
           * the primary's provider has no entry in
             ``PROVIDER_FAST_MODELS`` (Ollama, Claude Code) — those
             providers don't have a meaningful "smaller, cheaper"
@@ -1898,7 +1921,9 @@ class LLMConfig:
 
         Resolution, most specific first:
           1. an exact configured entry for ``model_id`` — returned as-is, so
-             its per-model settings (temperature, base, role) are preserved;
+             its per-model settings (temperature, base, role) are preserved.
+             An explicit provider qualifier restricts exact matching to that
+             route; a bare exact unusual name retains its configured route;
           2. shorthand expansion — a bare token like ``"haiku"`` / ``"opus"``
              is looked up as a hyphen-separated segment of some configured
              model's bare name. When exactly one configured model matches,
@@ -1909,7 +1934,8 @@ class LLMConfig:
              carry a credential, the one whose name shares the longest prefix
              with ``model_id`` — a configured ``claude-opus-4-6`` lends its
              key to ``claude-opus-4-8`` ahead of a ``claude-haiku-*`` entry;
-             its api_key / api_base are borrowed onto a config for ``model_id``;
+             its credential and route fields are borrowed onto a config for
+             ``model_id``;
           4. otherwise a bare config (api_key=None) so the SDK / dispatcher /
              provider env var supplies the credential at call time.
         """
@@ -1919,6 +1945,7 @@ class LLMConfig:
         )
         from core.security.llm_family import (
             bare_model_id,
+            explicit_provider_of,
             provider_of,
             resolve_model_shorthand,
             routing_model_id,
@@ -1927,7 +1954,15 @@ class LLMConfig:
 
         candidates = self._configured_models()
         bare = bare_model_id(model_id)
+        provider = provider_of(model_id)
+        explicit_provider = explicit_provider_of(model_id)
         for mc in candidates:
+            # An explicit/recognizable route is authoritative. Two
+            # providers may legitimately expose the same opaque model
+            # name; an exact bare-name match must not override the
+            # caller's provider qualifier.
+            if explicit_provider and mc.provider != explicit_provider:
+                continue
             if mc.model_name in (model_id, bare):
                 return mc
             if _strip_dated_alias(mc.model_name) == bare:
@@ -1964,7 +1999,6 @@ class LLMConfig:
             if mc is not None:
                 return mc
 
-        provider = provider_of(model_id)
         if not provider:
             # Fail loudly rather than synthesizing a keyless, provider-less
             # config that fails opaquely downstream — an explicit override
@@ -1989,6 +2023,12 @@ class LLMConfig:
             # Canonical resolver chain — covers dated/prefixed forms
             # the two-step probe missed.
             limits = resolve_model_limits(bare) or {}
+            model_kwargs: dict[str, Any] = {}
+            if limits:
+                model_kwargs.update(
+                    max_tokens=limits["max_output"],
+                    max_context=limits["max_context"],
+                )
             return ModelConfig(
                 provider=provider,
                 # Wire-form name: Bedrock ids need the vendor-dotted
@@ -1996,14 +2036,17 @@ class LLMConfig:
                 model_name=routing_model_id(model_id),
                 api_key=best.api_key,
                 api_base=best.api_base,
-                max_tokens=limits.get("max_output", best.max_tokens),
-                max_context=limits.get("max_context", best.max_context),
                 # Bedrock routing fields ride along (defaults for other
                 # providers): dropping them sent a borrowed-credential
                 # override to the wrong surface / ambient region.
                 bedrock_api=best.bedrock_api,
                 aws_profile=best.aws_profile,
                 aws_region=best.aws_region,
+                # Unknown models keep ModelConfig's conservative local
+                # request bounds. Do not borrow a sibling model's
+                # published capabilities and present them as this
+                # model's limits.
+                **model_kwargs,
             )
         return ModelConfig(provider=provider, model_name=routing_model_id(model_id))
 
@@ -2069,3 +2112,24 @@ class LLMConfig:
             if model.enabled:
                 return model
         return self.primary_model
+
+
+_LLM_CONFIG_RESOLVER_TYPE = LLMConfig
+
+
+def _config_for_model_from_candidates(
+    candidates: list[ModelConfig],
+    model_id: str,
+) -> ModelConfig:
+    """Resolve ``model_id`` with :meth:`LLMConfig.config_for_model`.
+
+    This lightweight adapter lets CLI resolution reuse the canonical
+    exact/shorthand/provider logic without constructing a full
+    auto-detected ``LLMConfig`` (and without loading any config-derived
+    fallback roles into the eventual explicit-model run).
+    """
+    resolver = object.__new__(_LLM_CONFIG_RESOLVER_TYPE)
+    resolver.primary_model = None
+    resolver.fallback_models = list(candidates)
+    resolver.specialized_models = {}
+    return _LLM_CONFIG_RESOLVER_TYPE.config_for_model(resolver, model_id)

@@ -58,7 +58,12 @@ class CostTracker:
     cutoff signals.
     """
 
-    def __init__(self, max_cost: float = 0.0) -> None:
+    def __init__(
+        self,
+        max_cost: float = 0.0,
+        *,
+        diagnostic_dir: Path | str | None = None,
+    ) -> None:
         self._lock = threading.RLock()  # Reentrant — get_summary calls _budget_ratio
         self._total_cost = 0.0
         self._total_tokens = 0
@@ -78,6 +83,9 @@ class CostTracker:
         self._core_cache_hits = 0
         self._failed_attempts = 0
         self._unclassified_legacy_events = 0
+        self.diagnostic_dir = (
+            Path(diagnostic_dir) if diagnostic_dir is not None else None
+        )
 
     def add_cost(self, model_name: str, cost: float, tokens: int = 0,
                  thinking_tokens: int = 0) -> None:
@@ -465,6 +473,11 @@ class CostTracker:
                             self._accounting_summary,
                             provider_accounting_total,
                         )
+                for route, markers in self._core_route_accounting.items():
+                    route_accounting[route] = _overlay_failure_accounting(
+                        route_accounting.get(route, AccountingSummary()),
+                        markers,
+                    )
 
             if self._unclassified_legacy_events:
                 accounting = replace(
@@ -573,6 +586,48 @@ def _merge_accounting_summaries(
     if right == AccountingSummary():
         return left
     return left.merge(right)
+
+
+def _overlay_failure_accounting(
+    base: AccountingSummary,
+    markers: AccountingSummary,
+) -> AccountingSummary:
+    """Overlay failure-only evidence already counted in a core snapshot.
+
+    Provider snapshots carry call/cost totals but not package-side knowledge
+    that those unknown-basis calls failed. ``max`` preserves a future provider
+    that supplies the same marker itself without double-counting it.
+    """
+    if markers.unknown_failed_attempts == 0:
+        return base
+    return replace(
+        base,
+        unknown_failed_attempts=max(
+            base.unknown_failed_attempts,
+            markers.unknown_failed_attempts,
+        ),
+        retained_reservation_estimate_usd=max(
+            base.retained_reservation_estimate_usd,
+            markers.retained_reservation_estimate_usd,
+        ),
+        exposure_unresolved=(
+            base.exposure_unresolved or markers.exposure_unresolved
+        ),
+        usd_total_complete=(
+            base.usd_total_complete and markers.usd_total_complete
+        ),
+        authoritative_remaining_usd=(
+            None
+            if (
+                base.authoritative_remaining_usd is None
+                or markers.authoritative_remaining_usd is None
+            )
+            else min(
+                base.authoritative_remaining_usd,
+                markers.authoritative_remaining_usd,
+            )
+        ),
+    )
 
 
 def _accounting_has_activity(summary: AccountingSummary) -> bool:
@@ -797,6 +852,76 @@ def _cap_findings(findings: list, max_findings: int) -> list:
     return findings[:max_findings]
 
 
+def _build_assessment_summary(
+    *,
+    requested: int,
+    eligible: int,
+    selected: int,
+    analyzed: int,
+    cap: int,
+    cap_source: str,
+) -> dict[str, Any]:
+    """Build the machine-readable assessment-completeness contract.
+
+    ``requested`` is the number of prepared findings presented to the
+    orchestrator. ``eligible`` excludes findings already resolved by a
+    mechanical skip before LLM selection. ``selected`` is the count admitted
+    to dispatch after the count cap, and ``analyzed`` is the count that
+    returned a non-error analysis result.
+
+    A run can therefore finish its pipeline successfully while this summary is
+    ``partial``. That distinction is consumed by the aggregate agentic report
+    and lifecycle metadata rather than turning useful partial output into a
+    hard failure.
+    """
+    requested = max(int(requested), 0)
+    eligible = max(min(int(eligible), requested), 0)
+    selected = max(min(int(selected), eligible), 0)
+    analyzed = max(min(int(analyzed), selected), 0)
+    cap = max(int(cap), 0)
+
+    unreviewed = eligible - analyzed
+    unselected = eligible - selected
+    analysis_failures = selected - analyzed
+    cap_applied = cap > 0 and eligible > cap and selected == cap
+    cap_reason = None
+    if cap_applied:
+        cap_reason = (
+            "provider default cap"
+            if cap_source == "provider_default"
+            else "explicit --max-findings cap"
+        )
+
+    reasons: list[str] = []
+    if cap_reason:
+        reasons.append(cap_reason)
+    elif unselected:
+        reasons.append("not all eligible findings were selected")
+    if analysis_failures:
+        reasons.append(
+            f"{analysis_failures} selected finding"
+            f"{'s' if analysis_failures != 1 else ''} failed analysis"
+        )
+    reason = "; ".join(reasons) or None
+
+    return {
+        "status": "complete" if unreviewed == 0 else "partial",
+        "requested": requested,
+        "eligible": eligible,
+        "selected": selected,
+        "analyzed": analyzed,
+        "unreviewed": unreviewed,
+        "unselected": unselected,
+        "analysis_failures": analysis_failures,
+        "not_eligible": requested - eligible,
+        "cap": cap,
+        "cap_applied": cap_applied,
+        "cap_source": cap_source,
+        "cap_reason": cap_reason,
+        "reason": reason,
+    }
+
+
 def _finalize_results_for_emit(results: list) -> None:
     """Strip operator-internal fields + stamp explicit status on
     each per-finding record before it lands in
@@ -876,92 +1001,96 @@ def build_llm_config_from_flags(
 
     Returns LLMConfig or None if no model could be resolved.
     """
+    from dataclasses import replace
+
     from core.llm.config import (
         LLMConfig,
+        _config_for_model_from_candidates,
+        _entry_auth_resolvable,
         _get_configured_models,
         _model_config_from_entry,
     )
     from core.llm.model_data import PROVIDER_ENV_KEYS
     from core.security.llm_family import (
         bare_model_id,
+        explicit_provider_of,
         provider_of,
-        resolve_model_shorthand,
+        routing_model_id,
     )
 
     models = models or []
     llm_config = None
+    configured_entries = [
+        entry for entry in _get_configured_models()
+        if isinstance(entry, dict)
+    ]
+    configured_pairs = [
+        (entry, _model_config_from_entry(entry))
+        for entry in configured_entries
+    ]
+    configured_candidates = [mc for _entry, mc in configured_pairs]
 
     def _resolve_model(name: str, role: str):
-        # Operators may write any of ``--model claude-haiku-4-5``,
-        # ``--model anthropic/claude-haiku-4-5``, or an aggregator
-        # form like ``--model together/anthropic/claude-haiku-4-5``;
-        # ``models.json`` always stores the bare model under a
-        # separate ``provider`` key. Compute provider via
-        # ``provider_of`` (which peels aggregators) and bare model
-        # via ``bare_model_id`` so all three forms collapse to the
-        # same lookup. Leaving the prefix in the entry's ``model``
-        # field would produce ``anthropic/anthropic/claude-haiku-4-5``
-        # when downstream re-prepends the provider — the SDK ships
-        # that to Anthropic which 404s as an unknown model.
-        #
-        # Shorthand pass first: bare tier tokens (``haiku`` / ``opus`` /
-        # ``sonnet``) that don't parse as a real model id resolve to a
-        # unique configured entry when possible, then re-enter the
-        # provider-lookup path with the full name. Ambiguous shorthand
-        # raises inside resolve_model_shorthand with the candidate
-        # list. Missing shorthand returns None → falls through to the
-        # existing loud-failure path unchanged.
-        if provider_of(name) == "":
-            # Pass only the canonical ``model`` field per configured
-            # entry. The ``_configured_model`` alias is deliberately
-            # excluded — including both would raise a false ambiguity
-            # error when they're just two names for the same entry
-            # (e.g. ``claude-haiku-4-5`` alias + ``claude-haiku-4-5-
-            # 20251001`` canonical, both with token "haiku"). Operators
-            # who want to select an entry by an alias-specific token
-            # can pass the alias directly — the exact-match path below
-            # handles that.
-            configured_names = [
-                cfg_entry.get("model") or ""
-                for cfg_entry in _get_configured_models()
-            ]
-            resolved = resolve_model_shorthand(name, configured_names)
-            if resolved is not None and resolved != name:
-                # Substitute the resolved full name and continue. The
-                # dated-snapshot lookup below still runs on the
-                # resolved name, so an aggregator-hosted or Bedrock-
-                # shaped configured model resolves correctly.
-                name = resolved
-        provider = provider_of(name)
-        bare = bare_model_id(name)
-        entry: dict[str, Any] = {"model": bare, "provider": provider, "role": role}
-        for cfg_entry in _get_configured_models():
-            # Match against either the resolved model name or the
-            # operator's original alias. The Anthropic resolver
-            # rewrites ``model`` to the dated snapshot and stashes
-            # the alias in ``_configured_model``; without the alias
-            # compare, an entry whose ``model`` is now
-            # ``claude-haiku-4-5-20251001`` would miss ``--model
-            # claude-haiku-4-5``. Gate by provider too so two
-            # same-named entries under different providers don't
-            # collide (e.g. ``ollama/llama-3`` vs ``together/llama-3``).
-            if provider and cfg_entry.get("provider") != provider:
+        # Exact configured names are authoritative even when the model
+        # vocabulary is unknown to RAPTOR. This is the path for a
+        # backend-specific alias: retain its declared provider, route,
+        # credentials, limits, and canonical alias resolution.
+        explicit_provider = explicit_provider_of(name)
+        requested_bare = bare_model_id(name)
+        mc = None
+        for entry, configured in configured_pairs:
+            if explicit_provider and configured.provider != explicit_provider:
                 continue
-            cfg_name = cfg_entry.get("model")
-            cfg_alias = cfg_entry.get("_configured_model")
-            if (bare in (cfg_name, cfg_alias)) and cfg_entry.get("api_key"):
-                entry["api_key"] = cfg_entry["api_key"]
+            entry_names = {
+                value
+                for value in (
+                    entry.get("model"),
+                    entry.get("_configured_model"),
+                )
+                if isinstance(value, str) and value
+            }
+            if name in entry_names or requested_bare in entry_names:
+                mc = configured
                 break
-        mc = _model_config_from_entry(entry)
-        if not mc.api_key:
-            if not provider:
-                # Unrecognizable name and no configured entry matched it by
-                # name — fail loudly with the recognizable-id hint rather
-                # than the unhelpful "Set ??? env var" path below.
-                from core.security.llm_family import unknown_model_message
-                print(f"\n  ✗ {unknown_model_message(name)}", file=sys.stderr)
+
+        if mc is None:
+            try:
+                mc = _config_for_model_from_candidates(
+                    configured_candidates,
+                    name,
+                )
+            except ValueError as exc:
+                if "ambiguous model shorthand" in str(exc):
+                    raise
+                print(f"\n  ✗ {exc}", file=sys.stderr)
                 return None
-            env_key = PROVIDER_ENV_KEYS.get(provider, "???")
+
+        mc = replace(mc, role=role)
+        if not _entry_auth_resolvable(mc):
+            provider = mc.provider or provider_of(name)
+            if provider:
+                env_config = _model_config_from_entry({
+                    "model": routing_model_id(name),
+                    "provider": provider,
+                    "role": role,
+                })
+                if _entry_auth_resolvable(env_config):
+                    mc = env_config
+
+        if not _entry_auth_resolvable(mc):
+            provider = mc.provider or provider_of(name)
+            if provider in ("claudecode", "claudecode-resumable"):
+                print(
+                    f"\n  ✗ Claude Code CLI unavailable for --model {name}",
+                    file=sys.stderr,
+                )
+                print(
+                    "  Install/authenticate the claude CLI or choose "
+                    "a configured API provider",
+                    file=sys.stderr,
+                )
+                return None
+            env_key = PROVIDER_ENV_KEYS.get(provider, "provider credentials")
             print(f"\n  ✗ No API key for --model {name}", file=sys.stderr)
             print(f"  Set {env_key} or add the key to models.json", file=sys.stderr)
             return None
@@ -977,10 +1106,19 @@ def build_llm_config_from_flags(
             # explicit --model list (here) and explicit --consensus/--judge/
             # --aggregate flags (below) populate roles — nothing the operator
             # didn't ask for sneaks in, and an explicit single-provider --model
-            # can never silently fall back cross-provider. Specialized
-            # fast-tier models are still auto-seeded by __post_init__ from the
-            # primary's OWN provider, so they stay same-provider (cheap).
+            # can never silently fall back cross-provider. Catalogued
+            # primaries retain same-provider fast-tier specialization;
+            # uncatalogued primaries clear it below because provider affinity
+            # alone is not permission to substitute a different model.
             llm_config = LLMConfig(primary_model=primary_mc, fallback_models=[])
+            from core.llm.model_data import resolve_model_limits
+            if resolve_model_limits(primary_mc.model_name) is None:
+                # The provider mapping alone is not evidence that an
+                # unlisted explicit model may be silently replaced by
+                # RAPTOR's catalogued fast-tier sibling. Keep every
+                # task on the operator's exact model unless they name
+                # another role model explicitly.
+                llm_config.specialized_models.clear()
             # Pin the operator's --model process-wide so any sub-consumer
             # deep in the run that constructs ``LLMConfig()`` no-arg
             # honours the operator's choice instead of silently falling
@@ -1253,7 +1391,11 @@ def orchestrate(
         logger.info("Phase 3 ran full analysis — orchestration not needed")
         return None
 
-    findings = report.get("results", [])
+    prepared_findings = report.get("results", [])
+    requested_findings = (
+        len(prepared_findings) if isinstance(prepared_findings, list) else 0
+    )
+    findings = prepared_findings if isinstance(prepared_findings, list) else []
     # Chokepoint-suppressed prep records are RETAINED in the report
     # (explicit disqualifier with a stamped skip status, never a
     # silent drop) — but they are pre-refuted: dispatching them would
@@ -1268,6 +1410,7 @@ def orchestrate(
                 and f.get("status") in ALL_STATUSES
                 and is_skipped(f))
     ]
+    eligible_findings = len(findings)
     if not findings:
         print("\n  No findings to analyse")
         return None
@@ -1340,6 +1483,7 @@ def orchestrate(
 
     was_unspecified = max_findings is None
     max_findings = resolve_max_findings(max_findings, llm_config)
+    cap_source = "provider_default" if was_unspecified else "explicit"
     if max_findings == 0 and was_unspecified:
         logger.info(
             "local primary: analysing all %d findings (no cap; bound by "
@@ -1349,6 +1493,7 @@ def orchestrate(
     if max_findings > 0 and len(findings) > max_findings:
         logger.info("Capping at %d findings (of %d)", max_findings, len(findings))
         findings = _cap_findings(findings, max_findings)
+    selected_findings = len(findings)
 
     # Resolve model roles
     from core.llm.config import resolve_model_roles
@@ -1364,7 +1509,10 @@ def orchestrate(
 
     # Cost tracking
     max_cost = getattr(llm_config, 'max_cost_per_scan', 0) if llm_config else 0
-    cost_tracker = CostTracker(max_cost=max_cost or 0)
+    cost_tracker = CostTracker(
+        max_cost=max_cost or 0,
+        diagnostic_dir=out_dir / "diagnostics",
+    )
     if rank_cost:
         cost_tracker.add_cost(rank_model or "ranking", rank_cost)
 
@@ -1716,15 +1864,66 @@ def orchestrate(
         # pre-filled (the setdefault stamp above keeps an existing
         # value, so that field is prep-report-controlled).
         prefilter_fn = make_prefilter_fn(
-            client, pending_claims=pending_fp_claims, repo=repo_path,
+            client,
+            pending_claims=pending_fp_claims,
+            repo=repo_path,
+            cost_tracker=cost_tracker,
         )
 
-    analysis_results = dispatch_task(
+    dispatch_batches: list[dict[str, Any]] = []
+
+    def _run_dispatch(
+        task,
+        items,
+        resolution,
+        prior,
+        *,
+        phase: str | None = None,
+        prefilter=None,
+    ) -> list[dict[str, Any]]:
+        batch_results = dispatch_task(
+            task,
+            items,
+            dispatch_fn,
+            resolution,
+            prior,
+            cost_tracker,
+            max_parallel,
+            prefilter_fn=prefilter,
+        )
+        if batch_results or task.name == "analysis":
+            dispatch_batches.append(_summarize_dispatch_batch(
+                task.name,
+                batch_results,
+                input_items=len(items),
+                phase=phase,
+            ))
+        return batch_results
+
+    analysis_results = _run_dispatch(
         AnalysisTask(profile=profile, allow_unreachable=allow_unreachable),
-        findings, dispatch_fn, role_resolution,
-        results_by_id, cost_tracker, max_parallel,
-        prefilter_fn=prefilter_fn,
+        findings,
+        role_resolution,
+        results_by_id,
+        phase="analysis_primary",
+        prefilter=prefilter_fn,
     )
+    analysis_attempt_results = list(analysis_results)
+
+    if prefilter_fn is not None:
+        dispatch_results = getattr(prefilter_fn, "dispatch_results", None)
+        if callable(dispatch_results):
+            prefilter_records = dispatch_results()
+            if prefilter_records:
+                dispatch_batches.insert(
+                    0,
+                    _summarize_dispatch_batch(
+                        "fast_tier_prefilter",
+                        prefilter_records,
+                        input_items=len(findings),
+                        phase="analysis_enrichment",
+                    ),
+                )
 
     # Adjudicate the fall-through cheap "clear_fp" claims against the
     # full verdicts so agentic:<rule_id> cells accumulate trust and
@@ -1781,11 +1980,14 @@ def orchestrate(
             cc_role_resolution = _cc_fallback_role_resolution(
                 role_resolution,
             )
-            analysis_results = dispatch_task(
+            analysis_results = _run_dispatch(
                 AnalysisTask(profile=profile, allow_unreachable=allow_unreachable),
-                findings, dispatch_fn, cc_role_resolution,
-                results_by_id, cost_tracker, max_parallel,
+                findings,
+                cc_role_resolution,
+                results_by_id,
+                phase="analysis_claude_fallback",
             )
+            analysis_attempt_results.extend(analysis_results)
             # Downstream stages (multi-model correlation, collapse
             # detection) must see the single-contributor reality of
             # the fallback, not the external panel that never ran.
@@ -1935,14 +2137,15 @@ def orchestrate(
         if checker_model:
             checker_name = checker_model.model_name
             checker_profile = get_profile_for(checker_name)
-            dispatch_task(
+            _run_dispatch(
                 CrossFamilyCheckTask(
                     checker_model=checker_model,
                     results_by_id=results_by_id,
                     profile=checker_profile,
                 ),
-                findings, dispatch_fn, role_resolution,
-                results_by_id, cost_tracker, max_parallel,
+                findings,
+                role_resolution,
+                results_by_id,
             )
         else:
             # No cross-family checker could be resolved — commonly an
@@ -1962,9 +2165,11 @@ def orchestrate(
     verdicts_pre_retry = _snapshot_verdicts(results_by_id)
 
     # Stage F: self-contradiction check + retry contradictions and low confidence
-    dispatch_task(
-        RetryTask(results_by_id=results_by_id, profile=profile), findings,
-        dispatch_fn, role_resolution, results_by_id, cost_tracker, max_parallel,
+    _run_dispatch(
+        RetryTask(results_by_id=results_by_id, profile=profile),
+        findings,
+        role_resolution,
+        results_by_id,
     )
 
     # Snapshot original primary verdicts BEFORE the consensus
@@ -1995,9 +2200,11 @@ def orchestrate(
         # tell budget-skipped (no spend) from all-errored (spend
         # incurred but every call failed) afterwards.
         _ct_before = cost_tracker.total_cost if cost_tracker else 0.0
-        consensus_dispatch_records = dispatch_task(
-            consensus_task, findings, dispatch_fn, role_resolution,
-            results_by_id, cost_tracker, max_parallel,
+        consensus_dispatch_records = _run_dispatch(
+            consensus_task,
+            findings,
+            role_resolution,
+            results_by_id,
         )
         # Pre-fix the post-dispatch check was:
         #
@@ -2046,10 +2253,11 @@ def orchestrate(
         for fid, snap in _snapshot_verdicts(results_by_id).items():
             if fid not in primary_verdicts_before_judge:
                 primary_verdicts_before_judge[fid] = snap
-        dispatch_task(
+        _run_dispatch(
             JudgeTask(results_by_id=results_by_id, profile=profile),
-            findings, dispatch_fn, role_resolution,
-            results_by_id, cost_tracker, max_parallel,
+            findings,
+            role_resolution,
+            results_by_id,
         )
 
         # Record JUDGE_REVIEW scorecard events for multi-judge
@@ -2225,10 +2433,11 @@ def orchestrate(
             # Pass `findings` so AggregationTask can pull SI evidence
             # per memory-corruption finding for tie-breaking on
             # disputed cases (see AggregationTask.build_prompt).
-            aggregate_results = dispatch_task(
+            aggregate_results = _run_dispatch(
                 AggregationTask(profile=profile, findings=findings),
-                [aggregate_payload], dispatch_fn,
-                role_resolution, results_by_id, cost_tracker, max_parallel,
+                [aggregate_payload],
+                role_resolution,
+                results_by_id,
             )
             for r in aggregate_results:
                 if "error" not in r:
@@ -2242,9 +2451,11 @@ def orchestrate(
     # only select findings that are exploitable AND missing exploit_code/patch_code,
     # so this is a no-op when CC already generated them.
     if not no_exploits:
-        dispatch_task(
-            ExploitTask(profile=profile), findings, dispatch_fn, role_resolution,
-            results_by_id, cost_tracker, max_parallel,
+        _run_dispatch(
+            ExploitTask(profile=profile),
+            findings,
+            role_resolution,
+            results_by_id,
         )
 
     # checkers_dir lets the patch gate replay synthesized checkers
@@ -2258,10 +2469,11 @@ def orchestrate(
     _pre_gated_ids: set[str] = set()
     if not no_patches:
         _patch_task = PatchTask(profile=profile, checkers_dir=_checkers_dir)
-        dispatch_task(
+        _run_dispatch(
             _patch_task,
-            findings, dispatch_fn, role_resolution,
-            results_by_id, cost_tracker, max_parallel,
+            findings,
+            role_resolution,
+            results_by_id,
         )
         _pre_gated_ids = _patch_task.gated_ids
 
@@ -2283,9 +2495,11 @@ def orchestrate(
     group_task = GroupAnalysisTask(
         results_by_id=results_by_id, findings=findings, profile=profile,
     )
-    group_results = dispatch_task(
-        group_task, groups, dispatch_fn, role_resolution,
-        results_by_id, cost_tracker, max_parallel,
+    group_results = _run_dispatch(
+        group_task,
+        groups,
+        role_resolution,
+        results_by_id,
     )
     group_analyses = {}
     for r in group_results:
@@ -2360,6 +2574,21 @@ def orchestrate(
         core_stats=core_stats,
         core_precharged_cost=rank_cost,
     )
+    findings_analysed = sum(
+        1 for r in per_finding_results if "error" not in r
+    )
+    findings_failed = sum(
+        1 for r in per_finding_results if "error" in r
+    )
+    assessment = _build_assessment_summary(
+        requested=requested_findings,
+        eligible=eligible_findings,
+        selected=selected_findings,
+        analyzed=findings_analysed,
+        cap=max_findings,
+        cap_source=cap_source,
+    )
+    merged["assessment"] = assessment
     merged["orchestration"] = {
         "mode": dispatch_mode,
         "multi_model": len(analysis_models_list) > 1,
@@ -2396,10 +2625,23 @@ def orchestrate(
         "aggregate_models": [m.model_name for m in aggregate_models],
         "aggregated": aggregation is not None,
         "calibrated_aggregation": calibrated_summary,
-        "findings_dispatched": len(findings),
-        "findings_analysed": sum(1 for r in per_finding_results if "error" not in r),
-        "findings_failed": sum(1 for r in per_finding_results if "error" in r),
-        "failed_by_model": _per_model_failure_summary(analysis_results),
+        "findings_dispatched": selected_findings,
+        "findings_analysed": findings_analysed,
+        "findings_failed": findings_failed,
+        "assessment": assessment,
+        "failed_by_model": _per_model_failure_summary(
+            analysis_attempt_results,
+        ),
+        "dispatch_batches": dispatch_batches,
+        "dispatch_failures": sum(
+            int(batch.get("failed", 0) or 0)
+            for batch in dispatch_batches
+        ),
+        "dispatch_incomplete_tasks": [
+            batch.get("phase") or batch.get("task")
+            for batch in dispatch_batches
+            if not batch.get("complete", False)
+        ],
         "structural_groups": len(groups),
         "cross_family_checked": cross_family_checked,
         "cross_family_disputes": cross_family_disputes,
@@ -2816,6 +3058,81 @@ def _per_model_failure_summary(
     return by_model
 
 
+def _summarize_dispatch_batch(
+    task: str,
+    results: list[dict[str, Any]],
+    *,
+    input_items: int,
+    phase: str | None = None,
+) -> dict[str, Any]:
+    """Summarize one task batch without dropping mixed failures.
+
+    Final fallback results can be entirely successful while an earlier review
+    or enrichment batch failed. Keeping each batch separate prevents the
+    successful subset from overwriting that operational evidence.
+    """
+    rows = [row for row in results if isinstance(row, dict)]
+    successful = [row for row in rows if "error" not in row]
+    errored = [row for row in rows if "error" in row]
+    def _was_not_run(row: dict[str, Any]) -> bool:
+        return (
+            row.get("error_type") in {"cancelled", "circuit_breaker"}
+            or str(row.get("error") or "").startswith(
+                ("aborted", "skipped"),
+            )
+        )
+
+    not_run = [row for row in errored if _was_not_run(row)]
+    failed = [row for row in errored if not _was_not_run(row)]
+    if successful and (failed or not_run):
+        status = "partial"
+    elif successful:
+        status = "succeeded"
+    elif failed:
+        status = "failed"
+    elif not_run:
+        status = "skipped"
+    else:
+        status = "not_run"
+
+    error_types = Counter(
+        str(row.get("error_type") or "error")
+        for row in failed
+    )
+    artifacts: list[object] = []
+    for row in errored:
+        for key in ("diagnostic_artifact", "cc_debug_file", "artifact"):
+            if row.get(key):
+                artifacts.append(row[key])
+        refs = row.get("artifacts")
+        if isinstance(refs, list):
+            artifacts.extend(refs)
+
+    summary: dict[str, Any] = {
+        "task": task,
+        "phase": phase or task,
+        "status": status,
+        "input_items": max(int(input_items), 0),
+        "result_records": len(rows),
+        "succeeded": len(successful),
+        "failed": len(failed),
+        "not_run": len(not_run),
+        "complete": not failed and not not_run,
+        "error_types": dict(sorted(error_types.items())),
+        "failed_by_model": _per_model_failure_summary(failed),
+    }
+    if failed:
+        summary["first_error"] = sanitise_for_terminal(
+            str(failed[0].get("error") or ""),
+            max_len=500,
+        )
+    if artifacts:
+        from core.run.safe_io import bounded_artifact_reference_fields
+
+        summary.update(bounded_artifact_reference_fields(artifacts))
+    return summary
+
+
 def _detect_multi_model_collapse(
     results_by_id: dict[str, dict],
     n_analysis_models: int,
@@ -3018,6 +3335,12 @@ def _merge_results(
                     finding["error_type"] = cc["error_type"]
             if cc is not None and cc.get("cc_debug_file"):
                 finding["cc_debug_file"] = cc["cc_debug_file"]
+            if cc is not None and cc.get("diagnostic_artifact"):
+                finding["diagnostic_artifact"] = cc[
+                    "diagnostic_artifact"
+                ]
+            if cc is not None and isinstance(cc.get("artifacts"), list):
+                finding["artifacts"] = list(cc["artifacts"])
             continue
 
         analysed += 1

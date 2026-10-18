@@ -552,7 +552,7 @@ class CCDispatchConfig:
     add_dirs: tuple[str, ...] = ()
     budget_usd: str = "1.00"
     timeout_s: int = 300
-    json_schema: dict[str, Any] | None = None
+    json_schema: dict[str, Any] | bool | None = None
     capture_json_envelope: bool = True
     # System prompt passed via the CLI's system-prompt channel
     # (`--system-prompt-file`, or inline `--system-prompt` for
@@ -1268,6 +1268,25 @@ class CCTransportError(RuntimeError):
 
     is_api_transport = True
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        diagnostic: dict[str, Any] | None = None,
+        error_kind: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.diagnostic = diagnostic
+        self.error_kind = error_kind
+
+
+class CCRequestSchemaError(CCTransportError):
+    """Claude Code rejected ``--json-schema`` before model generation."""
+
+
+class CCMissingRootTypeError(CCRequestSchemaError):
+    """Claude Code requires an object root type for object keywords."""
+
 
 @dataclass
 class StreamJsonResult:
@@ -1283,6 +1302,26 @@ class StreamJsonResult:
     cache_creation_tokens: int = 0
     model: str | None = None
     error: str | None = None
+    error_kind: str | None = None
+    diagnostic: dict[str, Any] | None = None
+
+
+def _cc_error_kind(message: str) -> str:
+    """Classify transport-authored Claude CLI failure text."""
+    lower = (message or "").lower()
+    if (
+        "input_schema.type: field required" in lower
+        or 'strict mode: missing type "object"' in lower
+    ):
+        return "missing_root_type"
+    if (
+        "--json-schema is not a valid json schema" in lower
+        or "strict mode: unknown keyword" in lower
+    ):
+        return "request_schema"
+    if "error_max_budget_usd" in lower:
+        return "budget"
+    return "transport"
 
 
 def _finite_cost(value: Any) -> float | None:
@@ -1768,18 +1807,36 @@ def run_cc_streaming(
 
     if proc.returncode != 0:
         stderr_text = b"".join(stderr_chunks.items()).decode("utf-8", "replace")
-        from core.security.prompt_output_sanitise import escape_nonprintable
+        from core.security.log_sanitisation import escape_nonprintable
         partial = parse_stream_json_lines(collected.items())
         # Aborts (budget cap, API refusal) exit nonzero with EMPTY
         # stderr — the cause lives in the final stream-json result
         # event. Prefer stderr when present, else the parsed event's
         # error/subtype, so the operator never sees a bare "exited 1:".
         cause = (stderr_text or "").strip() or (partial.error or "")
+        safe_cause = escape_nonprintable(
+            redact_secrets(cause),
+            preserve_newlines=True,
+        )
         err = StreamJsonResult()
         err.error = (
             f"claude -p exited {proc.returncode}: "
-            f"{escape_nonprintable(redact_secrets(cause[:500]))}"
+            f"{safe_cause[:500]}"
         )
+        err.error_kind = _cc_error_kind(err.error)
+        err.diagnostic = {
+            "returncode": proc.returncode,
+            "stderr": escape_nonprintable(
+                redact_secrets(stderr_text),
+                preserve_newlines=True,
+            ),
+            "stream_error": escape_nonprintable(
+                redact_secrets(partial.error or ""),
+                preserve_newlines=True,
+            ),
+            "stdout_truncated": collected.truncated,
+            "stderr_truncated": stderr_chunks.truncated,
+        }
         err.session_id = partial.session_id
         # A failed call still SPENT money — a budget abort
         # (error_max_budget_usd) burns up to the per-call cap before

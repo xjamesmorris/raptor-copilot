@@ -92,8 +92,9 @@ def invoke_cc_simple(prompt, schema, repo_path, claude_bin, out_dir,
         # needs the same conversion or the CLI receives a document a
         # JSON-Schema validator treats as annotation-only (type/enum/
         # required all unenforced) or rejects outright. Reuse the one
-        # canonical converter so both lanes constrain identically; it
-        # passes already-normalised schemas through unchanged.
+        # canonical converter so both lanes constrain identically. Advanced
+        # roots pass through; ordinary property-object schemas gain the root
+        # type Claude's strict transport requires.
         from core.llm.providers import _normalize_schema
         effective_schema = _normalize_schema(effective_schema)
     config = CCDispatchConfig(
@@ -219,7 +220,7 @@ def invoke_cc_simple(prompt, schema, repo_path, claude_bin, out_dir,
     # traceback. write_debug here gives them the raw
     # stdout/stderr to diagnose.
     try:
-        if schema:
+        if schema is not None:
             parsed = parse_cc_structured(proc.stdout, proc.stderr, "unknown")
         else:
             parsed = parse_cc_freeform(proc.stdout, proc.stderr)
@@ -241,7 +242,12 @@ def invoke_cc_simple(prompt, schema, repo_path, claude_bin, out_dir,
     )
 
     quality = 1.0
-    if schema and isinstance(parsed, dict) and "error" not in parsed:
+    if (
+        schema is not None
+        and isinstance(effective_schema, dict)
+        and isinstance(parsed, dict)
+        and "error" not in parsed
+    ):
         from core.llm.response_validation import (
             unknown_response_fields,
             validate_structured_response,

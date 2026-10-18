@@ -34,6 +34,7 @@ from packages.llm_analysis.dispatch import (
     DispatchTask,
     dispatch_task,
     record_dispatch_accounting,
+    record_exception_accounting,
     strip_dispatch_metadata,
 )
 from packages.llm_analysis.orchestrator import (
@@ -464,6 +465,52 @@ def test_cost_tracker_mixed_summary_and_honest_zero_rendering():
     }) == ["   Thinking tokens: 7"]
 
 
+def test_core_snapshot_keeps_route_failure_markers_for_fourteen_failures():
+    route = RouteIdentity("claudecode", "session-default")
+    observation = CostObservation.unknown(route=route)
+    tracker = CostTracker()
+    core_accounting = AccountingSummary()
+    provider_accounting = AccountingSummary()
+
+    for _ in range(14):
+        error = attach_cost_observation(
+            RuntimeError("request schema rejected"),
+            observation,
+        )
+        record_exception_accounting(
+            tracker,
+            error,
+            model_name=route.model,
+        )
+        core_accounting = (
+            core_accounting
+            .add(observation)
+            .add_unknown_failure()
+        )
+        provider_accounting = provider_accounting.add(observation)
+
+    summary = tracker.get_summary(core_stats={
+        "total_cost": 0.0,
+        "accounting": core_accounting.as_dict(),
+        "providers": {
+            "claudecode:session-default": {
+                "total_cost": 0.0,
+                "total_tokens": 0,
+                "accounting": provider_accounting.as_dict(),
+            },
+        },
+    })
+
+    assert summary["failed_dispatches"] == 14
+    assert summary["unknown_calls"] == 14
+    assert summary["unknown_failed_attempts"] == 14
+    route_summary = summary["accounting_by_route"][
+        "claudecode/session-default"
+    ]
+    assert route_summary["unknown_calls"] == 14
+    assert route_summary["unknown_failed_attempts"] == 14
+
+
 @pytest.mark.parametrize(
     "observation",
     [
@@ -757,6 +804,8 @@ def test_raised_observation_is_settled_once():
             0.4, route=RouteIdentity("claudecode", "m"),
         ),
     )
+    error.billed_tokens_in = 11  # type: ignore[attr-defined]
+    error.billed_tokens_out = 7  # type: ignore[attr-defined]
 
     def fail(*args):
         raise error
@@ -768,6 +817,7 @@ def test_raised_observation_is_settled_once():
     assert results[0]["error_type"] == "timeout"
     assert results[0]["analysed_by_provider"] == "claudecode"
     assert summary["total_cost"] == 0.4
+    assert summary["total_tokens"] == 18
     assert summary["cli_reported_calls"] == 1
     assert summary["failed_dispatches"] == 1
 

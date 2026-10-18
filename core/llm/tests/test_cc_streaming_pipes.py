@@ -95,6 +95,55 @@ def test_child_exiting_before_reading_prompt_reports_exit_code():
     assert "exited 7" in sr.error
 
 
+def test_invalid_json_schema_exit_is_typed_and_keeps_full_diagnostic():
+    message = (
+        'Error: --json-schema is not a valid JSON Schema: strict mode: '
+        'unknown keyword: "reasoning"'
+    )
+    script = (
+        "import sys\n"
+        f"sys.stderr.write({message!r})\n"
+        "sys.stderr.flush()\n"
+        "sys.exit(1)\n"
+    )
+
+    sr = run_cc_streaming(
+        [sys.executable, "-c", script],
+        prompt="",
+        env=_env(),
+        timeout_s=30,
+    )
+
+    assert sr.error_kind == "request_schema"
+    assert sr.diagnostic["returncode"] == 1
+    assert sr.diagnostic["stderr"] == message
+    assert sr.diagnostic["stream_error"] == ""
+    assert message in sr.error
+
+
+def test_missing_root_type_is_distinct_from_unknown_keyword():
+    message = (
+        'strict mode: missing type "object" for keyword "properties" at "#"'
+    )
+    script = (
+        "import sys\n"
+        f"sys.stderr.write({message!r})\n"
+        "sys.stderr.flush()\n"
+        "sys.exit(1)\n"
+    )
+
+    sr = run_cc_streaming(
+        [sys.executable, "-c", script],
+        prompt="",
+        env=_env(),
+        timeout_s=30,
+    )
+
+    assert sr.error_kind == "missing_root_type"
+    assert sr.error_kind != "request_schema"
+    assert sr.diagnostic["stderr"] == message
+
+
 def test_failed_call_carries_parsed_spend_telemetry():
     """A budget abort exits nonzero AFTER emitting a result event with
     the real spend. The error StreamJsonResult must carry that

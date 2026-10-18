@@ -24,6 +24,10 @@ from core.schema_constants import (
     VULN_TYPES,
     normalise_vuln_type,
 )
+from core.llm.schema_normalization import (
+    descriptor_type_token,
+    is_raptor_descriptive_schema,
+)
 
 _CVSS_RE = re.compile(
     r"^CVSS:3\.[01]/"
@@ -100,7 +104,9 @@ EXEMPT_FREEFORM_PARSE_SITES: tuple = (
 )
 
 
-def _allowed_top_level_keys(schema: dict[str, Any]) -> set[str] | None:
+def _allowed_top_level_keys(
+    schema: dict[str, Any] | bool,
+) -> set[str] | None:
     """Return the set of permitted top-level keys, or None when the
     schema does not describe a closed object (strict check skipped).
 
@@ -121,12 +127,7 @@ def _allowed_top_level_keys(schema: dict[str, Any]) -> set[str] | None:
         if schema.get("additionalProperties"):
             return None  # explicitly-open object
         keys = set(props)
-    elif "type" not in schema and all(isinstance(v, str) for v in schema.values()):
-        # Simple format. A top-level "type" key marks a JSON Schema
-        # fragment (e.g. {"type": "array"}) rather than a field list —
-        # skip those conservatively. (A simple schema with a field
-        # literally named "type" also skips: conservative, never
-        # rejects a response the schema didn't clearly constrain.)
+    elif is_raptor_descriptive_schema(schema):
         keys = set(schema)
     else:
         return None
@@ -137,7 +138,7 @@ def _allowed_top_level_keys(schema: dict[str, Any]) -> set[str] | None:
 
 def unknown_response_fields(
     raw: Any,
-    schema: dict[str, Any],
+    schema: dict[str, Any] | bool,
 ) -> list[str]:
     """Return the top-level keys of ``raw`` not permitted by ``schema``.
 
@@ -257,7 +258,9 @@ _DEFAULT_WEIGHT = 0.5
 _QUALITY_RETRY_THRESHOLD: float = 0.5
 
 
-def _resolve_weights(schema: dict[str, Any]) -> dict[str, float]:
+def _resolve_weights(
+    schema: dict[str, Any] | bool,
+) -> dict[str, float]:
     """Pick the right weight table for a schema, or fall back to uniform."""
     props = _get_properties(schema)
     field_names = set(props)
@@ -269,28 +272,33 @@ def _resolve_weights(schema: dict[str, Any]) -> dict[str, float]:
 
 # ---- Schema helpers ----------------------------------------------------------
 
-def _get_properties(schema: dict[str, Any]) -> dict[str, Any]:
+def _get_properties(
+    schema: dict[str, Any] | bool,
+) -> dict[str, Any]:
+    if not isinstance(schema, dict):
+        return {}
     if "properties" in schema:
         return schema.get("properties", {})
     # Simple schema: values are description strings like "boolean" or
     # "float (0.0-1.0)".  Return as-is — _get_field_type and _is_nullable
     # both handle string descriptions.
-    return schema
+    return schema if is_raptor_descriptive_schema(schema) else {}
 
 
-def _get_required(schema: dict[str, Any]) -> set[str]:
+def _get_required(
+    schema: dict[str, Any] | bool,
+) -> set[str]:
+    if not isinstance(schema, dict):
+        return set()
     if "properties" in schema:
         return set(schema.get("required", []))
-    return set(schema)
+    return set(schema) if is_raptor_descriptive_schema(schema) else set()
 
 
 def _get_field_type(field_spec: Any) -> str:
     """Extract the primary type from a JSON Schema property or simple description."""
     if isinstance(field_spec, str):
-        parts = field_spec.split()
-        token = parts[0].strip().lower() if parts else "string"
-        return {"bool": "boolean", "str": "string", "int": "integer",
-                "float": "number", "list": "array"}.get(token, token)
+        return descriptor_type_token(field_spec) or "string"
     if isinstance(field_spec, dict):
         t = field_spec.get("type", "string")
         if isinstance(t, list):
@@ -613,7 +621,7 @@ def _coerce_value(value: Any, field_type: str) -> tuple[Any, bool]:
 
 def validate_structured_response(
     raw: dict[str, Any],
-    schema: dict[str, Any],
+    schema: dict[str, Any] | bool,
 ) -> ValidatedResponse:
     """Validate and normalise an LLM response dict against a schema.
 
@@ -626,6 +634,28 @@ def validate_structured_response(
             data={}, quality=0.0,
             incomplete=list(_get_properties(schema).keys()),
             raw={},
+        )
+
+    if schema is False:
+        return ValidatedResponse(
+            data={},
+            quality=0.0,
+            incomplete=["$schema:false"],
+            raw=dict(raw),
+        )
+    if schema is True or (
+        isinstance(schema, dict)
+        and "properties" not in schema
+        and not is_raptor_descriptive_schema(schema)
+    ):
+        # References/combinators/enum/annotation-only roots are valid JSON
+        # Schema but this field-level validator cannot interpret them. The
+        # provider transport already enforces the schema; preserve its result
+        # instead of treating root keywords as response field names.
+        return ValidatedResponse(
+            data=dict(raw),
+            quality=1.0,
+            raw=dict(raw),
         )
 
     properties = _get_properties(schema)

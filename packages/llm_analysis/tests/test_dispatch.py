@@ -11,6 +11,11 @@ import pytest
 # packages/llm_analysis/tests/test_dispatch.py -> repo root
 sys.path.insert(0, str(Path(__file__).parents[3]))
 
+from core.llm.accounting import (  # noqa: E402
+    CostObservation,
+    RouteIdentity,
+    attach_cost_observation,
+)
 from packages.llm_analysis.dispatch import (
     DispatchTask, DispatchResult, dispatch_task, _format_elapsed,
     _classify_error, _breaker_should_open, _BREAKER_PROVEN_THRESHOLD,
@@ -734,6 +739,137 @@ class TestDispatchTaskIntegration:
         assert len(dispatch_calls) == 2
 
 
+class TestMixedDispatchOrdering:
+    """Completion order must not change result order or hide cancellation."""
+
+    class _DwellStderr:
+        def __init__(self, inner, calls):
+            self._inner = inner
+            self._calls = calls
+
+        def write(self, text):
+            if "All models hit auth" in text:
+                deadline = time.monotonic() + 10.0
+                while len(self._calls) < 5 and time.monotonic() < deadline:
+                    time.sleep(0.002)
+            return self._inner.write(text)
+
+        def flush(self):
+            return self._inner.flush()
+
+    def test_success_failure_timeout_straggler_and_cancel_keep_input_order(
+        self,
+    ):
+        findings = [_make_finding(f"f-{index}") for index in range(7)]
+        route = RouteIdentity("claudecode", "only-model")
+        calls: list[int] = []
+        caller_ident = threading.get_ident()
+        tracker = CostTracker(0)
+
+        def _success() -> DispatchResult:
+            observation = CostObservation.cli_reported(0.10, route=route)
+            return DispatchResult(
+                result={
+                    "is_true_positive": True,
+                    "is_exploitable": False,
+                    "exploitability_score": 0.1,
+                    "reasoning": "ok",
+                },
+                cost=0.10,
+                tokens=2,
+                model=route.model,
+                provider=route.provider,
+                cost_observation=observation,
+            )
+
+        def _paid_failure(
+            error: BaseException,
+            cost: float,
+            tokens_in: int,
+            tokens_out: int,
+        ) -> BaseException:
+            observation = CostObservation.cli_reported(cost, route=route)
+            attach_cost_observation(error, observation)
+            error.billed_cost_usd = cost  # type: ignore[attr-defined]
+            error.billed_tokens_in = tokens_in  # type: ignore[attr-defined]
+            error.billed_tokens_out = tokens_out  # type: ignore[attr-defined]
+            return error
+
+        def _caller_parked_in_executor_join() -> bool:
+            frame = sys._current_frames().get(caller_ident)
+            while frame is not None:
+                if frame.f_code.co_name == "join":
+                    return True
+                frame = frame.f_back
+            return False
+
+        def mixed(prompt, schema, system_prompt, temperature, model):
+            calls.append(len(calls) + 1)
+            call = calls[-1]
+            if call == 1:
+                return _success()
+            if call == 2:
+                raise _paid_failure(
+                    RuntimeError("ordinary failure"),
+                    0.25,
+                    10,
+                    5,
+                )
+            if call == 3:
+                raise _paid_failure(
+                    TimeoutError("timed out after partial response"),
+                    0.50,
+                    20,
+                    10,
+                )
+            if call == 4:
+                raise RuntimeError("Error 401 Unauthorized")
+            if call == 5:
+                deadline = time.monotonic() + 10.0
+                while (
+                    not _caller_parked_in_executor_join()
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.002)
+                return _success()
+            raise AssertionError("cancelled work unexpectedly dispatched")
+
+        old_stderr = sys.stderr
+        sys.stderr = self._DwellStderr(old_stderr, calls)
+        try:
+            results = dispatch_task(
+                task=AnalysisTask(),
+                items=findings,
+                dispatch_fn=mixed,
+                role_resolution={},
+                prior_results={},
+                cost_tracker=tracker,
+                max_parallel=1,
+            )
+        finally:
+            sys.stderr = old_stderr
+
+        assert calls == [1, 2, 3, 4, 5]
+        assert [result["finding_id"] for result in results] == [
+            finding["finding_id"] for finding in findings
+        ]
+        assert "error" not in results[0]
+        assert results[1]["error_type"] == "error"
+        assert results[2]["error_type"] == "timeout"
+        assert results[3]["error_type"] == "auth"
+        assert "error" not in results[4]
+        assert [result["error_type"] for result in results[5:]] == [
+            "cancelled",
+            "cancelled",
+        ]
+
+        summary = tracker.get_summary()
+        assert summary["failed_dispatches"] == 3
+        assert summary["total_cost"] == pytest.approx(0.95)
+        assert summary["total_tokens"] == 49
+        assert summary["cli_reported_calls"] == 4
+
+
 class TestCircuitBreakerEnforcement:
     """A dead model's pre-submitted futures must not keep dispatching."""
 
@@ -979,6 +1115,9 @@ class TestBreakerShouldOpen:
 
     def test_two_consecutive_failures_stay_closed(self):
         assert not _breaker_should_open(consec=2, completed=2)
+
+    def test_fast_path_requires_every_completion_to_be_a_failure(self):
+        assert not _breaker_should_open(consec=3, completed=4)
 
     def test_proven_model_rides_out_short_burst(self):
         # Prior successes (completed > consec) suspend the fast path.

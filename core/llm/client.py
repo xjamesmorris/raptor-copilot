@@ -1107,6 +1107,15 @@ def _is_response_shape_failure(error: Exception) -> bool:
     weights drift toward a model that is merely being refused or
     rate-limited).
     """
+    from core.llm.cc_adapter import CCRequestSchemaError
+    if any(
+        isinstance(item, CCRequestSchemaError)
+        for item in _exception_chain(error)
+    ):
+        # The CALLER supplied a schema the CLI rejected before the model
+        # generated anything. This is a request-contract defect, not evidence
+        # that the model emitted a malformed structured response.
+        return False
     if isinstance(error, SchemaUnknownFieldError):
         # Retryable (a bad sample, like malformed JSON) but still a
         # response-shape failure — record it explicitly.
@@ -1470,9 +1479,9 @@ def _pinned_llm_config(model_name: str) -> 'LLMConfig':
     """Build a minimal :class:`LLMConfig` for a caller-pinned model.
 
     Bypasses the auto-resolution path entirely — no thinking-model
-    scoring, no fallback chain.  Calls the inferred provider's builder
-    directly via ``_PROVIDER_BUILDERS``, so the resolver's lenient
-    "fall through to whatever provider IS configured" behaviour can't
+    scoring, no fallback chain. Exact configured entries win first;
+    otherwise a usable configured same-provider credential/route wins
+    before the inferred provider's environment builder. No path may
     substitute a different provider for the one the caller pinned.
 
     Provider inference: explicit ``provider/model`` syntax beats inference;
@@ -1487,7 +1496,10 @@ def _pinned_llm_config(model_name: str) -> 'LLMConfig':
     from core.llm.config import (
         _PROVIDER_BUILDERS,
         ModelConfig,
+        _config_for_model_from_candidates,
+        _entry_auth_resolvable,
         _get_configured_models,
+        _model_config_from_entry,
     )
 
     if model_name in _PROVIDER_BUILDERS:
@@ -1509,12 +1521,69 @@ def _pinned_llm_config(model_name: str) -> 'LLMConfig':
             exact_pinned=False,
         )
 
-    if "/" in model_name:
-        provider, model_name = model_name.split("/", 1)
-    else:
-        from core.security.llm_family import (
-            provider_of as _provider_of,
+    configured_entries = [
+        entry
+        for entry in _get_configured_models()
+        if isinstance(entry, dict)
+    ]
+    configured_pairs = [
+        (entry, _model_config_from_entry(entry))
+        for entry in configured_entries
+    ]
+    configured_candidates = [
+        configured for _entry, configured in configured_pairs
+    ]
+    from core.security.llm_family import (
+        bare_model_id as _bare_model_id,
+        explicit_provider_of as _explicit_provider_of,
+        provider_of as _provider_of,
+        routing_model_id as _routing_model_id,
+    )
+    requested_provider = _provider_of(model_name)
+    explicit_provider = _explicit_provider_of(model_name)
+    requested_bare = _bare_model_id(model_name)
+    for entry, configured in configured_pairs:
+        if explicit_provider and configured.provider != explicit_provider:
+            continue
+        entry_names = {
+            value
+            for value in (
+                entry.get("model"),
+                entry.get("_configured_model"),
+            )
+            if isinstance(value, str) and value
+        }
+        if model_name in entry_names or requested_bare in entry_names:
+            return LLMConfig.for_pinned_model(
+                replace(configured, role="code"),
+            )
+
+    # For a non-exact explicit route, configured same-provider
+    # credentials and endpoint fields outrank ambient env defaults.
+    # The model name changes; the route does not.
+    if requested_provider and any(
+        configured.provider == requested_provider
+        and _entry_auth_resolvable(configured)
+        for configured in configured_candidates
+    ):
+        configured_route = _config_for_model_from_candidates(
+            configured_candidates,
+            model_name,
         )
+        if _entry_auth_resolvable(configured_route):
+            return LLMConfig.for_pinned_model(
+                replace(configured_route, role="code"),
+            )
+
+    if "/" in model_name:
+        provider = requested_provider
+        if provider:
+            model_name = _routing_model_id(model_name)
+        else:
+            # Preserve the historical extension point for custom
+            # providers not known to RAPTOR's route vocabulary.
+            provider, model_name = model_name.split("/", 1)
+    else:
         from core.security.llm_family import (
             resolve_model_shorthand as _resolve_shorthand,
         )
@@ -1523,27 +1592,30 @@ def _pinned_llm_config(model_name: str) -> 'LLMConfig':
         # tolerates them — one stray string in the operator's
         # models.json must not turn every pinned-model construction
         # into an AttributeError.
-        configured = [
+        configured_names = [
             e.get("model", "")
-            for e in _get_configured_models()
-            if isinstance(e, dict) and e.get("model")
+            for e in configured_entries
+            if e.get("model")
         ]
-        resolved = _resolve_shorthand(model_name, configured)
+        resolved = _resolve_shorthand(model_name, configured_names)
         if resolved is not None:
             model_name = resolved
+            for configured in configured_candidates:
+                if configured.model_name == resolved:
+                    return LLMConfig.for_pinned_model(
+                        replace(configured, role="code"),
+                    )
         provider = _provider_of(model_name)
         if not provider:
             from core.security.llm_family import unknown_model_message
             raise ValueError(unknown_model_message(model_name))
 
-    # Credential discovery, in this order:
-    #   1. env-var-based provider builder (covers the common case)
-    #   2. operator's ``models.json`` — needed when keys aren't in env
-    #      (the previous version silently skipped this path and produced
-    #      auth failures when the operator's credentials lived only in
-    #      the config file)
-    from core.llm.model_data import resolve_model_limits
+    # No usable recognized-provider route was configured above.
+    # Fall back to the env-var provider builder, then retain the
+    # historical custom-provider extension through models.json.
+    from core.llm.model_data import resolve_model_costs, resolve_model_limits
     limits = resolve_model_limits(model_name) or {}
+    costs = resolve_model_costs(model_name)
     known_max_output = limits.get("max_output")
     max_tokens = known_max_output or 4096
     max_context = limits.get("max_context", 32000)
@@ -1551,19 +1623,12 @@ def _pinned_llm_config(model_name: str) -> 'LLMConfig':
     builder = _PROVIDER_BUILDERS.get(provider)
     base = builder() if builder is not None else None
     if base is None:
-        for entry in _get_configured_models():
-            # Same non-dict tolerance as the shorthand resolution above.
-            if not isinstance(entry, dict):
-                continue
-            if entry.get("provider") == provider and entry.get("api_key"):
-                base = ModelConfig(
-                    provider=provider,
-                    model_name=entry.get("model", model_name),
-                    api_key=entry["api_key"],
-                    api_base=entry.get("api_base"),
-                    max_tokens=max_tokens,
-                    max_context=max_context,
-                )
+        for _entry, configured in configured_pairs:
+            if (
+                configured.provider == provider
+                and _entry_auth_resolvable(configured)
+            ):
+                base = configured
                 break
     if base is None:
         primary = ModelConfig(
@@ -1571,19 +1636,21 @@ def _pinned_llm_config(model_name: str) -> 'LLMConfig':
             max_tokens=max_tokens, max_context=max_context,
         )
     else:
-        # The pinned model's own published output cap wins over the
-        # base config's value: ``max(base, pinned)`` sent the base
-        # model's larger limit on every call to a smaller-cap pinned
-        # model — a non-retryable 400, before the first retry. Only
-        # when the pinned model has NO published limit do we keep the
-        # old max() (the base's value was sized for this provider and
-        # beats the blind 4096 floor).
-        pinned_max = (
-            known_max_output if known_max_output
-            else max(base.max_tokens, max_tokens)
+        # Published limits win exactly. An unlisted model keeps the
+        # conservative request bounds above rather than inheriting a
+        # sibling model's advertised capacity. Likewise, catalogue
+        # absence means unknown price — never retain the base model's
+        # rate under a different model id.
+        primary = replace(
+            base,
+            model_name=model_name,
+            role="code",
+            max_tokens=max_tokens,
+            max_context=max_context,
+            cost_per_1k_tokens=(
+                base.cost_per_1k_tokens if costs else 0.0
+            ),
         )
-        primary = replace(base, model_name=model_name, role="code",
-                          max_tokens=pinned_max)
     return LLMConfig.for_pinned_model(primary)
 
 
@@ -3748,12 +3815,26 @@ class LLMClient:
     ) -> LLMAccountingUnavailableError | None:
         observation = cost_observation_from_exception(error)
         if observation is not None:
+            unknown_failure = observation.basis is CostBasis.UNKNOWN
             try:
                 settled = self._settle_observed_attempt(
                     attempt, observation,
                 )
             except LLMAccountingUnavailableError as policy_error:
+                if unknown_failure:
+                    self._record_unknown_failed_attempt(
+                        retained_reservation_estimate_usd=0.0,
+                    )
                 return policy_error
+            if unknown_failure:
+                # An UNKNOWN observation still proves a provider attempt
+                # happened, so keep its unknown_calls entry; because this is
+                # the failure settlement path it must ALSO increment the
+                # failed-attempt counter. Previously these calls appeared as
+                # unknown successes, hiding failed Claude CLI dispatches.
+                self._record_unknown_failed_attempt(
+                    retained_reservation_estimate_usd=0.0,
+                )
             if (
                 self._usd_budget_contract()
                 is UsdBudgetContract.AUTHORITATIVE_REQUIRED
@@ -5235,11 +5316,46 @@ class LLMClient:
                 if tier == "local (Ollama)":
                     error_msg += f"\n→ Check Ollama server: {_ollama_check_url()}"
                 elif tier == "claude CLI":
-                    error_msg += (
-                        "\n→ claude CLI transport — the cause is in the "
-                        "error above (timeout / per-call budget / CLI "
-                        "failure), not API keys. Verify `claude -p` works."
+                    from core.llm.cc_adapter import (
+                        CCMissingRootTypeError,
+                        CCRequestSchemaError,
                     )
+                    _error_chain = _exception_chain(last_error)
+                    _error_text = str(last_error).lower()
+                    _missing_root_type = any(
+                        isinstance(item, CCMissingRootTypeError)
+                        for item in _error_chain
+                    ) or (
+                        "input_schema.type: field required" in _error_text
+                        or 'strict mode: missing type "object"' in _error_text
+                    )
+                    _request_schema = any(
+                        isinstance(item, CCRequestSchemaError)
+                        for item in _error_chain
+                    ) or (
+                        "--json-schema is not a valid json schema"
+                        in _error_text
+                        or "strict mode: unknown keyword" in _error_text
+                    )
+                    if _missing_root_type:
+                        error_msg += (
+                            "\n→ claude CLI missing-root-type rejection — "
+                            "the JSON Schema was preserved as supplied, but "
+                            "this CLI requires type=\"object\" when object "
+                            "keywords such as properties/required are used."
+                        )
+                    elif _request_schema:
+                        error_msg += (
+                            "\n→ claude CLI request-schema rejection — "
+                            "the call failed before model generation; this "
+                            "is not a timeout or per-call budget failure."
+                        )
+                    else:
+                        error_msg += (
+                            "\n→ claude CLI transport — the cause is in the "
+                            "error above (timeout / per-call budget / CLI "
+                            "failure), not API keys. Verify `claude -p` works."
+                        )
                 else:
                     error_msg += "\n→ Check API keys and network connectivity"
             else:

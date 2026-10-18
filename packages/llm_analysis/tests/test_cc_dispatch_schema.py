@@ -83,6 +83,23 @@ class TestSchemaNormalisedForCCTransport:
         # No raw descriptive string survives as a property value.
         assert all(isinstance(v, dict) for v in props.values())
 
+    def test_keyword_named_punctuated_fields_stay_descriptive(
+        self, monkeypatch,
+    ):
+        descriptive = {
+            "items": "list. selected values",
+            "description": "string. explanation",
+            "type": "bool. verdict",
+            "title": "string. display title",
+        }
+        sent = self._invoke(monkeypatch, descriptive)
+        assert sent["type"] == "object"
+        assert sent["properties"]["items"]["type"] == "array"
+        assert sent["properties"]["description"]["type"] == "string"
+        assert sent["properties"]["type"]["type"] == "boolean"
+        assert sent["properties"]["title"]["type"] == "string"
+        assert sent["required"] == list(descriptive)
+
     def test_property_schema_gains_root_object_type(self, monkeypatch):
         proper = {
             "properties": {"verdict": {"type": "string"}},
@@ -91,6 +108,34 @@ class TestSchemaNormalisedForCCTransport:
         sent = self._invoke(monkeypatch, proper)
         assert sent == {**proper, "type": "object"}
         assert "type" not in proper
+
+    def test_nested_property_schema_gains_object_type(self, monkeypatch):
+        proper = {
+            "type": "array",
+            "items": {
+                "properties": {"verdict": {"type": "string"}},
+                "additionalProperties": False,
+            },
+        }
+        sent = self._invoke(monkeypatch, proper)
+        assert sent["type"] == "array"
+        assert sent["items"]["type"] == "object"
+        assert "type" not in proper["items"]
+
+    @pytest.mark.parametrize("proper", [
+        {"$ref": "#/$defs/result", "$defs": {"result": {"type": "object"}}},
+        {"allOf": [{"type": "object"}]},
+        {"anyOf": [{"type": "object"}]},
+        {"oneOf": [{"type": "object"}]},
+        {"enum": ["safe", "unsafe"]},
+        True,
+        False,
+    ])
+    def test_advanced_json_schema_roots_pass_through(
+        self, monkeypatch, proper,
+    ):
+        sent = self._invoke(monkeypatch, proper)
+        assert sent == proper
 
     def test_explicit_non_object_root_type_is_preserved(self, monkeypatch):
         explicit = {

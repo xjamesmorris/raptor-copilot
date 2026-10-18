@@ -30,8 +30,10 @@ from packages.llm_analysis.orchestrator import (
     _check_self_contradiction,
     _merge_results,
     _structural_grouping,
+    _summarize_dispatch_batch,
     orchestrate,
 )
+from packages.llm_analysis.dispatch import DispatchResult  # noqa: E402
 from packages.llm_analysis.prompts.schemas import FINDING_RESULT_SCHEMA
 from packages.llm_analysis.tasks import (
     AggregationTask,
@@ -606,6 +608,128 @@ class TestOrchestrate:
         assert by_id["f-002"]["cache_hit"] is True
         assert "cost_observation" not in by_id["f-002"]
 
+    def test_successful_fallback_retains_failed_primary_batch(
+        self, tmp_path,
+    ):
+        finding = _make_finding(
+            "f-001", "py/sql-injection", "db.py", 42,
+        )
+        report_path = tmp_path / "report.json"
+        report_path.write_text(json.dumps(_make_prep_report([finding])))
+        out_dir = tmp_path / "orch"
+        model = SimpleNamespace(
+            model_name="session-default",
+            provider="claudecode",
+        )
+        llm_config = SimpleNamespace(
+            primary_model=model,
+            fallback_models=[],
+            max_cost_per_scan=10.0,
+        )
+        role_resolution = {
+            "analysis_model": model,
+            "analysis_models": [model],
+            "code_model": None,
+            "exploit_model": None,
+            "consensus_models": [],
+            "judge_models": [],
+            "aggregate_models": [],
+            "fallback_models": [],
+        }
+
+        class _Client:
+            total_cost = 0.0
+            short_circuits = 0
+            scorecard = None
+
+            def generate_structured(self, **kwargs):
+                raise RuntimeError(
+                    "claude -p exited 1: strict mode: unknown keyword: "
+                    '"reasoning"',
+                )
+
+            def get_stats(self):
+                return {
+                    "total_cost": 0.0,
+                    "accounting": AccountingSummary().as_dict(),
+                    "providers": {},
+                }
+
+            def get_fired_models(self):
+                return []
+
+        fallback_payload = _make_cc_result(
+            "f-001", exploitable=False, score=0.1,
+        )
+        fallback_result = DispatchResult(
+            result=fallback_payload,
+            cost=0.0,
+            model="claude-opus-5-5",
+            provider="claudecode",
+            no_spend=True,
+        )
+        compatible = SimpleNamespace(compatible=True, error=None)
+
+        with patch(
+            "core.llm.config.resolve_model_roles",
+            return_value=role_resolution,
+        ), patch(
+            "core.llm.client.LLMClient",
+            return_value=_Client(),
+        ), patch(
+            "core.security.envelope_probe.probe_envelope_compatibility",
+            return_value=compatible,
+        ), patch(
+            "packages.llm_analysis.prefilter.make_prefilter_fn",
+            return_value=None,
+        ), patch(
+            "core.llm.cc_adapter.resolve_claude_cli",
+            return_value="/fake/claude",
+        ), patch(
+            "packages.llm_analysis.orchestrator.invoke_cc_simple",
+            return_value=fallback_result,
+        ), patch(
+            "packages.llm_analysis.orchestrator._structural_grouping",
+            return_value=[],
+        ), patch(
+            "packages.llm_analysis.orchestrator."
+            "_attach_calibrated_aggregation",
+            return_value={"failed": False, "total": 1},
+        ):
+            result = orchestrate(
+                prep_report_path=report_path,
+                repo_path=tmp_path,
+                out_dir=out_dir,
+                max_parallel=1,
+                no_exploits=True,
+                no_patches=True,
+                llm_config=llm_config,
+                dataflow_validation_enabled=False,
+            )
+
+        assert result["orchestration"]["mode"] == "cc_fallback"
+        assert result["orchestration"]["findings_analysed"] == 1
+        assert result["orchestration"]["findings_failed"] == 0
+        assert "error" not in result["results"][0]
+        batches = {
+            batch["phase"]: batch
+            for batch in result["orchestration"]["dispatch_batches"]
+        }
+        assert batches["analysis_primary"]["failed"] == 1
+        assert batches["analysis_primary"]["succeeded"] == 0
+        assert batches["analysis_claude_fallback"]["succeeded"] == 1
+        assert batches["analysis_claude_fallback"]["failed"] == 0
+        assert result["orchestration"]["dispatch_failures"] == 1
+        assert result["orchestration"]["failed_by_model"] == {
+            "session-default": {
+                "count": 1,
+                "first_error": (
+                    "claude -p exited 1: strict mode: unknown keyword: "
+                    '"reasoning"'
+                ),
+            },
+        }
+
     def test_external_policy_refusal_never_invokes_cc_fallback(
         self, tmp_path,
     ):
@@ -1123,6 +1247,39 @@ class TestStructuralGrouping:
 
 
 # ── CostTracker ──────────────────────────────────────────────────────
+
+def test_dispatch_batch_summary_keeps_mixed_success_failure_and_skip():
+    summary = _summarize_dispatch_batch(
+        "group_analysis",
+        [
+            {"finding_id": "g1", "content": "ok"},
+            {
+                "finding_id": "g2",
+                "analysed_by": "claude",
+                "error": "review failed",
+                "error_type": "request_schema",
+                "diagnostic_artifact": "diagnostics/failure.json",
+            },
+            {
+                "finding_id": "g3",
+                "analysed_by": "claude",
+                "error": "skipped (model circuit-broken)",
+                "error_type": "circuit_breaker",
+            },
+        ],
+        input_items=3,
+        phase="group_enrichment",
+    )
+
+    assert summary["status"] == "partial"
+    assert summary["succeeded"] == 1
+    assert summary["failed"] == 1
+    assert summary["not_run"] == 1
+    assert summary["complete"] is False
+    assert summary["error_types"] == {"request_schema": 1}
+    assert summary["failed_by_model"]["claude"]["count"] == 1
+    assert summary["artifacts"] == ["diagnostics/failure.json"]
+
 
 class TestCostTracker:
     @pytest.mark.parametrize("ceiling,serialized", [(float("inf"), None), (10.0, 10.0), (0.0, 0.0)])

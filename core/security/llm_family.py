@@ -106,6 +106,31 @@ _AGGREGATOR_PREFIXES: tuple[str, ...] = (
     "bedrock/",
 )
 
+# Canonical routing providers for explicit ``provider/model`` forms.
+# The qualifier is transport authority even when the opaque model name
+# implies another training family: ``ollama/gpt-oss:20b`` routes through
+# Ollama while ``family_of`` still reports OpenAI lineage. Keeping route
+# recognition separate from family detection prevents local models from
+# being silently redirected to cloud providers. Aliases canonicalise to
+# the provider spellings accepted by ``create_provider``.
+_EXPLICIT_ROUTE_PROVIDERS: dict[str, str] = {
+    "anthropic": "anthropic",
+    "openai": "openai",
+    "gemini": "gemini",
+    "google": "gemini",
+    "mistral": "mistral",
+    "mistralai": "mistral",
+    "ollama": "ollama",
+    "cohere": "cohere",
+    "bedrock": "bedrock",
+    "claudecode": "claudecode",
+    "claude-code": "claudecode",
+    "claude_code": "claudecode",
+    "claudecode-resumable": "claudecode-resumable",
+    "claude-code-resumable": "claudecode-resumable",
+    "claude_code_resumable": "claudecode-resumable",
+}
+
 
 # AWS Bedrock model identifiers use a different shape from the
 # `provider/model` form: a regional inference-profile prefix
@@ -180,6 +205,7 @@ _FAMILY_TO_PROVIDER: dict[Family, str] = {
 _BARE_STRIP_HEADS: frozenset[str] = (
     frozenset(_FAMILY_TO_PROVIDER.values())
     | frozenset(stem for stem, _ in _PROVIDER_STEMS)
+    | frozenset(_EXPLICIT_ROUTE_PROVIDERS)
 )
 
 
@@ -201,13 +227,22 @@ def provider_of(model_id: str) -> str:
     auth selection, and dispatcher routing pick the Bedrock path).
 
     Order:
-      1. Bedrock-shaped IDs (``<region>.<provider>.<model>``) →
+      1. Explicit known routing-provider qualifiers (for example
+         ``ollama/gpt-oss:20b`` or
+         ``claudecode/<backend-model>``) → that provider, regardless
+         of the opaque model's underlying family.
+      2. Bedrock-shaped IDs (``<region>.<provider>.<model>``) →
          ``"bedrock"`` — every Bedrock prefix combination resolves
          the same way regardless of underlying model family.
-      2. Otherwise fall back to :func:`family_of` → provider mapping,
+      3. Otherwise fall back to :func:`family_of` → provider mapping,
          preserving the existing direct-API behaviour.
     """
     needle = model_id.lower()
+    if "/" in needle:
+        head, _rest = needle.split("/", 1)
+        explicit_route = _EXPLICIT_ROUTE_PROVIDERS.get(head)
+        if explicit_route:
+            return explicit_route
     # Same iterated peel as family_of so chained shapes like
     # ``together/us.anthropic.claude-opus-4-7`` resolve to
     # ``"bedrock"`` routing (the model is Bedrock-routed even when
@@ -322,13 +357,12 @@ def unknown_model_message(model_id: str) -> str:
 
 
 def routing_model_id(model_id: str) -> str:
-    """Return the identifier to put on the wire: aggregator/route
-    prefixes peeled, provider segments KEPT.
+    """Return the identifier to put on the wire.
 
-    Distinct from :func:`bare_model_id`: Bedrock model ids require the
-    vendor-dotted form (``anthropic.claude-…``) — handing the SDK a
-    fully-bared name 403s. Use bare_model_id for MATCHING against
-    configured entries, routing_model_id for the outgoing model name.
+    Aggregator and slash-delimited route prefixes are peeled. Bedrock's
+    vendor-DOTTED segment is kept (``anthropic.claude-…``) because the
+    Bedrock SDK requires it. Use :func:`bare_model_id` for matching
+    configured entries and this helper for the outgoing model name.
     """
     needle = model_id
     for _ in range(4):
@@ -340,6 +374,10 @@ def routing_model_id(model_id: str) -> str:
                 break
         if not peeled:
             break
+    if "/" in needle:
+        head, rest = needle.split("/", 1)
+        if head.lower() in _BARE_STRIP_HEADS:
+            needle = rest
     return needle
 
 
@@ -398,6 +436,20 @@ def bare_model_id(model_id: str) -> str:
         if head.lower() in _BARE_STRIP_HEADS:
             needle = rest
     return needle
+
+
+def explicit_provider_of(model_id: str) -> str:
+    """Return the provider only when ``model_id`` explicitly names a route.
+
+    Bare family-shaped names such as ``claude-rhyolite`` intentionally
+    return ``""``: an exact configured entry may route that opaque name
+    through Claude Code or another provider. Slash-qualified routes,
+    aggregator-qualified routes, and Bedrock-shaped dotted IDs return
+    the same canonical provider as :func:`provider_of`.
+    """
+    if bare_model_id(model_id) == model_id:
+        return ""
+    return provider_of(model_id)
 
 
 def family_of(model_id: str) -> Family:

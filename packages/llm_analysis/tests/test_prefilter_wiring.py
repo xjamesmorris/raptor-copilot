@@ -480,6 +480,37 @@ def test_make_prefilter_fn_distinct_findings_independent(llm):
     assert prov.call_count == 2
 
 
+def test_make_prefilter_fn_preserves_failed_enrichment_record(llm):
+    from core.llm.cc_adapter import CCRequestSchemaError
+    from packages.llm_analysis.orchestrator import CostTracker
+    from packages.llm_analysis.prefilter import make_prefilter_fn
+
+    client, prov = llm
+    prov.responder = lambda *args: (_ for _ in ()).throw(
+        CCRequestSchemaError(
+            "claude -p exited 1: strict mode: unknown keyword: "
+            '"reasoning"',
+            error_kind="request_schema",
+            diagnostic={"stderr": "unknown keyword: reasoning"},
+        )
+    )
+    tracker = CostTracker()
+    hook = make_prefilter_fn(
+        client,
+        pending_claims={},
+        cost_tracker=tracker,
+    )
+
+    assert hook(_finding()) is None
+    records = hook.dispatch_results()
+    assert len(records) == 1
+    assert records[0]["finding_id"] == "f1"
+    assert records[0]["analysed_by"] == "haiku-stub"
+    assert records[0]["error_type"] == "request_schema"
+    assert "unknown keyword" in records[0]["error"]
+    assert tracker.get_summary()["failed_dispatches"] == 1
+
+
 # ---------------------------------------------------------------------------
 # Severity vocabulary + abstention adjudication
 # ---------------------------------------------------------------------------
