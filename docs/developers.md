@@ -20,12 +20,60 @@ explicitly on Linux and resolved to a directly identifiable native
 executable. The backend-neutral host/session contract in
 `core/startup/host.py` keeps frontend selection, installed executable
 presence, verified session ownership, and headless provider usability as
-separate facts. Native decision assets remain in `.claude/`, `tiers/`,
-and `CLAUDE.md`. The split is deliberate: the Python layer runs
-standalone in CI, the decision layer drives it interactively.
+separate facts. Native decision assets live in `.claude/`, `tiers/`,
+`plugins/agents/`, and `CLAUDE.md`. The split is deliberate: the Python
+layer runs standalone in CI, the decision layer drives it interactively.
 When you add a capability, the mechanical part goes in Python and the
 judgement part goes in a skill or command file — never the other way
 round.
+
+## Decision-asset discovery contract
+
+`.claude/commands` and `.claude/skills` are authoritative for both
+frontends. Keep command stems disjoint from frontend-normalized skill names
+(skill frontmatter names have whitespace replaced with `-`). Claude can hide
+a same-name slash command, and Copilot projects commands and skills into the
+same `skill list --json` namespace, where one row shadows the other.
+
+Custom agents have a split presentation with one source of truth:
+
+- `plugins/agents/agents/*.md` is authoritative and is loaded only into
+  Claude by `bin/raptor` as the `raptor-agents` plugin. Every definition
+  explicitly declares `model: inherit`; do not remove it. Claude Code
+  2.1.301 otherwise permits ambient `CLAUDE_CODE_SUBAGENT_MODEL` or
+  `ANTHROPIC_MODEL` selection to change a subagent away from the session
+  model. Plain `claude` does not auto-load this plugin; the launcher also
+  establishes the trusted `RAPTOR_DIR`/project identity required by its
+  security-hook dispatcher.
+- `.github/agents/*.md` is the generated Copilot projection. It is identical
+  in name, description, tools, skills, hooks, and instruction body, with only
+  `model: inherit` removed because Copilot rejects that custom-agent value.
+  Never edit projected files directly.
+
+After an authoritative edit, run
+`python3 .github/scripts/project_agent_projection.py --write`. The default
+check and `--json` inventory are side-effect-free. Projection and
+feature-ledger tests reject missing, duplicate, disabled, warning-producing,
+or semantically divergent entries.
+
+Sensitive Claude-agent tool restrictions live in
+`plugins/agents/hooks/hooks.json`, not agent frontmatter. Its fail-closed
+dispatcher keys policy on Claude's plugin-scoped `agent_type`, invokes the
+existing focused validators without a shell, and leaves the main session,
+built-ins, other plugins, and known unrestricted RAPTOR agents unchanged.
+Copilot does not execute this Claude plugin hook; `.github/agents` parity is
+prompt/tool metadata parity only, never a claim that the five restricted
+agents have the same mechanical URL/Bash/write boundary there.
+
+There are two upstream observation limits in Copilot CLI 1.0.100-1. Skills,
+plugins, and instructions have native JSON list commands, but custom agents
+do not; the repository's projection `--json` report is deterministic local
+evidence, while a fresh `/agent` or `/env` UI capture is still required for
+live host acceptance. Remote-agent-index lookup failures and the bundled
+`computer-use` plugin-directory warning originate outside this repository,
+so RAPTOR records them but does not suppress or reinterpret them. Claude's
+complete slash-command inventory is likewise exposed by the live init event,
+so deterministic layout parity does not replace a bounded live rerun.
 
 Reviewers and automated agents evaluating the staged Copilot work should use
 the [Copilot integration patch map](copilot-patch-map.md) to distinguish
@@ -181,9 +229,11 @@ contributors, one line each:
 - **ruff** (PR-blocking) — `F401`/`F811`/`F821`/`F841` over changed
   Python files; config in `pyproject.toml`.
 - **command-metadata** (PR-blocking,
-  `.github/scripts/check_command_metadata.py`) — every
-  `.claude/commands/*.md` needs a parseable `dispatch:` field whose
-  target exists on disk.
+  `.github/scripts/check_command_metadata.py` and
+  `.github/scripts/project_agent_projection.py`) — command dispatch
+  metadata must resolve, the generated Copilot agents must match the
+  authoritative Claude plugin definitions, and the plugin-level
+  identity-hook registry/configuration must stay closed.
 - **env-docs** (PR gate + daily sweep, `.github/scripts/check_env_docs.py`) — extracts
   every environment variable the tree reads or writes; an undocumented
   operator-facing variable fails, and so does a stale entry in

@@ -104,7 +104,8 @@ frontmatter field pointing at the CLI entry point. The entry point goes in
 
 Beyond the test suite and lint (which run on every PR — including
 `check_command_metadata.py`, which requires every `.claude/commands/*.md`
-to carry a parseable `dispatch:` field whose target exists on disk), the
+to carry a parseable `dispatch:` field whose target exists on disk, and
+`project_agent_projection.py`, which rejects Claude/Copilot agent drift), the
 repo-invariant detectors are PR gates too: the `repo-invariants` job in
 `.github/workflows/lint.yml` runs them on every pull request, push to
 `main`, and merge-queue entry, and

@@ -36,6 +36,17 @@ def test_lint_workflow_uses_ruff_config_instead_of_inline_rule_flags() -> None:
     assert workflow.count("ruff check --output-format=github") == 2
 
 
+def test_command_metadata_job_checks_agent_projection() -> None:
+    workflow = _read(".github/workflows/lint.yml")
+    block = workflow.split("\n  command-metadata:", 1)[1].split(
+        "\n  # Repo-invariant", 1
+    )[0]
+
+    assert "check_command_metadata.py" in block
+    assert "project_agent_projection.py" in block
+    assert "pyyaml==" in block
+
+
 def test_ruff_tree_is_exempt_from_the_run_dedup() -> None:
     """The pre_check dedup matches prior successful "Lint" runs at
     the same (or PR-linked) SHA — but PR-event runs execute ruff-pr
@@ -253,6 +264,7 @@ def test_documented_control_paths_exist() -> None:
         ".github/workflows/nightly-self-test.yml",
         ".github/workflows/ubuntu26-canary.yml",
         ".github/scripts/check_command_metadata.py",
+        ".github/scripts/project_agent_projection.py",
         ".github/scripts/check_miswiring.py",
         ".github/scripts/check_env_docs.py",
         ".github/scripts/check_vocab_lists.py",

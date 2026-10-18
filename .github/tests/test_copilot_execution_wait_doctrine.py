@@ -8,6 +8,7 @@ tests explicitly fence out that stronger attribution.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
@@ -59,6 +60,20 @@ def test_frontend_precedence_and_narrow_bash_exception_are_explicit() -> None:
         "This repository does not create a broader exception",
         "if the active frontend instructions do not expose that exception, "
         "use `execution_subagent`",
+        "call count is a hard acceptance bound",
+        "Tool allowlists grant capabilities; they do not enforce invocation "
+        "counts",
+        "evaluate each shell command independently",
+        "One logical child operation consumes at most one "
+        "`execution_subagent` call",
+        "stop before exceeding the cap",
+        "do not claim that repository instructions can control upstream "
+        "scheduling",
+        "`execution_subagent` is a built-in managed agent",
+        "repository setting was ignored",
+        "Usage output is authoritative for the observed managed-child model",
+        "distinct from the parent frontend `--model` and RAPTOR "
+        "finding-analysis model controls",
     )
     for phrase in required:
         assert phrase in flat_contract
@@ -66,6 +81,16 @@ def test_frontend_precedence_and_narrow_bash_exception_are_explicit() -> None:
     assert flat_contract.index(required[1]) < flat_contract.index(required[2])
     assert "timeoutSeconds" not in flat_contract
     assert "timeout 180" not in flat_contract
+
+
+def test_repo_copilot_settings_do_not_claim_managed_child_control() -> None:
+    settings = json.loads(_read(".github/copilot/settings.json"))
+    assert settings == {
+        "model": "gpt-6-astra",
+        "effortLevel": "max",
+        "contextTier": "long_context",
+    }
+    assert "subagents" not in settings
 
 
 def test_wait_doctrine_uses_explicit_observation_not_telemetry_inference() -> None:
@@ -182,3 +207,56 @@ def test_readme_labels_observations_and_attribution_limits() -> None:
     )
     for phrase in forbidden_overclaims:
         assert phrase not in readme
+
+
+def test_readme_pins_credit_floor_and_child_model_boundary() -> None:
+    readme = _flat(_read("README-Copilot.md"))
+    required = (
+        "minimum `--max-ai-credits` value of **30**",
+        "RAPTOR does not invent a smaller credit budget",
+        "One call may therefore cross the configured limit",
+        "built-in managed agent",
+        "did not pin this built-in managed agent",
+        "usage output showed GPT-5.6 Luna instead",
+        "not a per-call model field",
+        "Usage output is authoritative",
+        "do not require it to match a requested child model",
+        "Parent Copilot session",
+        "Copilot managed execution child",
+        "RAPTOR finding analysis",
+    )
+    for phrase in required:
+        assert phrase in readme
+    assert "gpt-5.4-mini" not in readme
+    assert "model mismatch fails" not in readme
+
+
+def test_bounded_acceptance_documents_prompt_allowlist_and_verification() -> None:
+    bounded = _flat(
+        _section(
+            _read("README-Copilot.md"),
+            "### Bounded one-child acceptance",
+            "### Observed incident evidence and limits",
+        )
+    )
+    required = (
+        "--allow-tool=view",
+        "--allow-tool=shell(libexec/raptor-run-lifecycle:*)",
+        "--allow-tool=execution_subagent",
+        "--deny-tool=write",
+        "--deny-tool=edit",
+        "each enumerated lifecycle command is a separate exact direct-shell "
+        "call",
+        "`execution_subagent` is reserved for the one logical child operation",
+        "stop before a second child call",
+        "not a mechanical call counter",
+        "does not control Copilot's upstream scheduler",
+        "exactly one unique `execution_subagent` call",
+        "record the effective managed-child model",
+        "repository configuration cannot pin it",
+        "observed child-model difference does not",
+    )
+    for phrase in required:
+        assert phrase in bounded
+    assert "--allow-all-tools" in bounded
+    assert "Do not add `--allow-all-tools` or `--yolo`" in bounded

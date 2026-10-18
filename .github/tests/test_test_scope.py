@@ -894,9 +894,12 @@ class TestOnRealRepo:
         assert result["ci_lint"]["run"]
 
     @pytest.mark.parametrize("changed", [
+        ".github/copilot/settings.json",
+        ".gitignore",
         ".github/workflows/lint.yml",
         "CLAUDE.md",
         ".claude/commands/scan.md",
+        "plugins/agents/hooks/hooks.json",
         # ci_lint tests pin README's self-check section,
         # README-Copilot's execution-wait doctrine, and pyproject's exact
         # ruff select list; a breaking edit to any of them would merge

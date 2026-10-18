@@ -115,13 +115,18 @@ from any directory -- it resolves the RAPTOR installation, remembers the
 directory you launched from (so commands like `/scan` default to it), runs the
 pre-flight trust and project checks, loads the coverage-tracking plugin, and
 sanitises the environment before handing off to the selected frontend. It also
-takes an optional target path and flags like `--project`, `--continue`, and
-`--model` -- see `raptor --help`.
+takes an optional target path and flags like `--project`, `--continue`,
+Copilot's exact-session `--resume ID`, and `--model` -- see
+`raptor --help`.
 
-Running plain `claude` or `copilot` from inside the repo directory also loads
-RAPTOR's compatible instructions, commands, skills, and agents, but skips
-launcher pre-flight checks, strong session/project binding, and automatic
-coverage-plugin loading.
+Running plain `copilot` from inside the repo loads RAPTOR's compatible
+instructions, commands, skills, and generated `.github/agents` projection,
+but skips launcher pre-flight checks, strong session/project binding, and
+automatic coverage-plugin loading. Plain `claude` loads the repository
+instructions, commands, and skills, but **not** the `raptor-agents` plugin:
+RAPTOR's Claude agents and their identity-gated security hooks are
+launcher-only. Start them through `bin/raptor` rather than adding the plugin
+manually without the launcher's trusted environment.
 
 **Important:** RAPTOR loads its decision assets from the repo directory. If you
 run a frontend directly from another directory, you get a plain frontend
@@ -564,14 +569,15 @@ RAPTOR is two layers.
 
 The **Python execution layer** (`raptor.py`, `packages/`, `core/`, `engine/`) handles the heavy lifting: running Semgrep and CodeQL, managing subprocesses, parsing SARIF, deduplicating findings, dispatching LLM API calls, tracking costs, writing output files. It does not make decisions. It executes.
 
-The **Claude Code decision layer** (`.claude/`, `tiers/`, `CLAUDE.md`) makes the calls: which findings to prioritise, how to interpret results, what the attack scenario is, whether the exploit is realistic. Implemented as Claude Code skills, commands, and agents that load progressively.
+The **interactive decision layer** (`.claude/`, `plugins/agents/`, `tiers/`, `CLAUDE.md`) makes the calls: which findings to prioritise, how to interpret results, what the attack scenario is, whether the exploit is realistic. Implemented as skills, commands, and agents that load progressively in Claude Code or Copilot CLI.
 
 ```
 CLAUDE.md              always loaded -- bootstrap, routing, security rules
 .claude/commands/      slash commands (/agentic, /scan, /validate, etc.)
 .claude/skills/        methodology detail, loaded on demand
 tiers/                 adversarial thinking, recovery, expert personas
-.claude/agents/        specialist sub-agents (offsec, crash analysis, forensics)
+plugins/agents/agents/ authoritative Claude agents (`model: inherit`)
+.github/agents/        generated Copilot projection
 ```
 
 The split means you can run the Python layer from a CI pipeline (`python3 raptor.py scan --repo ...`) and get structured SARIF output without Claude Code, or run it interactively with the full agentic workflow.

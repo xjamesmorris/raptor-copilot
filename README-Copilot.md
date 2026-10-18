@@ -20,8 +20,10 @@ source .venv/bin/activate
 ./bin/raptor --frontend copilot --model gpt-6-astra \
   --reasoning-effort=max --context=long_context
 
-# Start against a target, or resume the latest session
+# Start against a target, resume an exact session, or use Copilot's global
+# latest-session selection
 ./bin/raptor --frontend copilot /path/to/code
+./bin/raptor --frontend copilot --resume <session-id-or-name>
 ./bin/raptor --frontend copilot --continue
 
 # Explicitly grant Copilot all permissions for this launch only
@@ -32,6 +34,13 @@ source .venv/bin/activate
 Use `./bin/raptor` to avoid accidentally selecting another checkout on PATH.
 Keep `=value` for the reasoning/context flags; separate values would be
 interpreted as target arguments by RAPTOR's passthrough parser.
+
+Prefer `--resume <session-id-or-name>` (or `--resume=<...>`) for bounded
+automation. RAPTOR maps it to Copilot's exact `--session-id` surface, preserves
+the value, and starts no `/raptor` turn. It cannot be combined with
+`--continue` or a target. Bare `--continue` intentionally retains Copilot's
+native global-recent-session behavior; `RAPTOR_REGISTRY_HOME` isolates
+RAPTOR's project/run ownership but does not redefine Copilot's global history.
 
 `--yolo` is an explicit Copilot frontend permission choice. RAPTOR passes it
 through unchanged only when the operator supplies it; RAPTOR never enables it
@@ -63,8 +72,32 @@ For ordinary development without starting RAPTOR's `/raptor` workflow, run
 `copilot` from this checkout. Direct launch skips RAPTOR's preflight checks,
 session/project binding, and automatic coverage-plugin loading.
 
+Copilot loads RAPTOR's agents from the generated `.github/agents/`
+projection. The authoritative definitions live in
+`plugins/agents/agents/` for Claude Code and retain explicit
+`model: inherit`; the projection is instruction-identical but omits that one
+Copilot-incompatible field. Regenerate and verify it with:
+
+```bash
+python3 .github/scripts/project_agent_projection.py --write
+python3 .github/scripts/project_agent_projection.py --json
+```
+
+The JSON command is side-effect-free and must report 18 agents with empty
+`errors` and `warnings`. Copilot CLI 1.0.100-1 has no native JSON custom-agent
+list, so `/agent` or `/env` remains the live UI acceptance surface.
+
+The projection does **not** provide Claude plugin-hook parity. Copilot custom
+agents do not execute `plugins/agents/hooks/hooks.json`; the five
+identity-gated URL/Bash/write restrictions documented in
+`docs/agent-security.md` are Claude-launcher guarantees only. Copilot retains
+the same agent prompts and tool grants, but do not describe those hook
+restrictions as mechanically enforced on this frontend.
+
 New Copilot sessions here default to **GPT-6 Astra, max reasoning, long
-context**, stored only in `.github/copilot/settings.json`. To reapply:
+context**, stored only in `.github/copilot/settings.json`. The repository does
+not set a model for Copilot's built-in managed `execution_subagent`. To
+reapply the parent defaults:
 
 ```bash
 copilot config --repo model gpt-6-astra
@@ -113,24 +146,75 @@ provider credentials or wire-model routing, or invent capability, token-limit,
 or cost metadata for an unknown model. Parent frontend, child-agent, and
 RAPTOR analysis model controls remain separate as described below.
 
+### Copilot session credit floor
+
+The installed Copilot CLI used for MVP-10 acceptance, 1.0.100-1, documents and
+enforces a minimum `--max-ai-credits` value of **30**. The launcher recognizes
+both `--max-ai-credits 30` and `--max-ai-credits=30`, rejects unambiguously
+decimal values below 30 before frontend execution, and otherwise preserves the
+native argument for Copilot to validate. RAPTOR does not invent a smaller
+credit budget or reinterpret this parent-conversation limit as a child-model or
+finding-analysis limit.
+
+The limit is conversation-wide, and Copilot learns a model call's usage only
+after that call returns. One call may therefore cross the configured limit
+before Copilot blocks a later call. Use the supported floor for bounded smoke
+runs and measure actual usage from `--usage-output-file`; do not describe 30 as
+a guarantee that the session will consume 30 credits.
+
+## MVP-10 live parity acceptance
+
+Bounded live acceptance completed on October 17, 2026 (October 18 UTC) with
+Claude Code 2.1.301 and Copilot CLI 1.0.100-1. The composite runs verified:
+
+- all 39 commands and all 18 custom agents under both frontends, plus all 52
+  Copilot project command/skill entries;
+- exact project and session binding, same-session continuation, and explicit
+  Copilot resume without injected name or initial prompt;
+- one canonical read-coverage record per source read, exact realpaths, and
+  owner-only `0600` manifest and JSON artifacts;
+- Completed, Failed, Cancelled, and direct SessionEnd orphan-cleanup states;
+- project status, coverage, provenance, findings, and report artifacts;
+- separate parent, managed-child, and RAPTOR finding-analysis model controls;
+  and
+- unchanged fixtures, source files, and tracked worktree content.
+
+Raw transcripts, usage, machine identity, and session evidence remain local
+under ignored `out/mvp10-parity-*` and `.mvp10-state/` paths; they are not
+commit artifacts.
+
+The acceptance has three explicit boundaries:
+
+1. Live `--yolo` was not exercised; deterministic native-argv tests cover its
+   explicit Copilot-only passthrough.
+2. Copilot's built-in managed `execution_subagent` ignored a repository model
+   request and selected GPT-5.6 Luna. Usage output is authoritative; this is
+   an upstream limitation rather than a repository parity failure.
+3. The five security-sensitive custom-agent WebFetch/Bash/Write policies are
+   enforced by the Claude launcher plugin. Copilot custom agents do not run
+   Claude plugin hooks, so those restrictions are not Copilot guarantees.
+
 ## The three model controls
 
 | Layer | Configuration |
 |---|---|
 | Parent Copilot session | Repository defaults above, `--model`, or `/model` |
-| Copilot child agents | `/subagents`; separate model, effort, and context settings |
+| Copilot managed execution child | Upstream-managed; observe the effective model in usage output |
 | RAPTOR finding analysis | `/agentic --model MODEL` and `~/.config/raptor/models.json` |
 
 An execution subagent using Luna does not mean the parent or RAPTOR's analysis
-model changed. Subagent overrides and global settings are intentionally
-unchanged. To opt the execution subagent into parent inheritance for this
-repository:
+model changed. In the 1.0.100-1 live acceptance, a repository
+`subagents.agents.execution-subagent.model` request for GPT-5.4 Mini did not
+pin this built-in managed agent: usage output showed GPT-5.6 Luna instead.
+The observed `execution_subagent` tool-call arguments also contain `query`,
+`description`, and `mode`, not a per-call model field. Prompt prose and that
+repository key therefore are not exact model controls for this managed agent.
 
-```bash
-copilot config --repo subagents.agents.execution-subagent.model inherit
-copilot config --repo subagents.agents.execution-subagent.effortLevel inherit
-copilot config --repo subagents.agents.execution-subagent.contextTier inherit
-```
+Usage output is authoritative for the model Copilot actually selected. Record
+that observed model, but do not require it to match a requested child model or
+present a difference as an acceptance failure. An explicit parent `--model`
+remains parent-only, and neither parent nor managed-child selection configures
+RAPTOR finding analysis.
 
 RAPTOR analysis requires a configured provider or its Claude Code fallback.
 Selecting the Copilot frontend does not enable a headless Copilot provider.
@@ -162,6 +246,34 @@ where possible. Terminal validation remains on `execution_subagent` unless one
 exact command independently satisfies the same direct-shell exception.
 Dispatched children skip RAPTOR's operator-facing startup banner, so they
 never shell out merely to read `.startup-output`.
+
+### Bounded one-child acceptance
+
+For an acceptance turn that authorizes exactly one logical child operation,
+keep the parent tool surface narrow:
+
+```text
+--allow-tool=view
+--allow-tool=shell(libexec/raptor-run-lifecycle:*)
+--allow-tool=execution_subagent
+--deny-tool=write
+--deny-tool=edit
+```
+
+Do not add `--allow-all-tools` or `--yolo`. In the acceptance prompt, state
+that each enumerated lifecycle command is a separate exact direct-shell call
+under the complete-unfiltered-stdout exception, and that
+`execution_subagent` is reserved for the one logical child operation. Also
+state: **if higher-priority routing cannot satisfy that one-call cap, stop
+before a second child call and report the acceptance blocked**.
+
+This prompt plus allowlist narrows repository-owned routing but is not a
+mechanical call counter and does not control Copilot's upstream scheduler.
+Acceptance must inspect persisted tool events and require exactly one unique
+`execution_subagent` call. It must also inspect usage output and record the
+effective managed-child model because prompt prose and repository configuration
+cannot pin it on 1.0.100-1. Any extra child call fails the live acceptance;
+an observed child-model difference does not.
 
 ### Observed incident evidence and limits
 

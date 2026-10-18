@@ -44,6 +44,26 @@ must remain unfiltered. This repository does not create a broader exception;
 if the active frontend instructions do not expose that exception, use
 `execution_subagent`.
 
+A caller-authored `execution_subagent` call count is a hard acceptance bound.
+Tool allowlists grant capabilities; they do not enforce invocation counts.
+When a bounded acceptance enumerates separate exact shell commands and reserves
+one logical child operation, evaluate each shell command independently under
+the direct-`bash` exception instead of reclassifying the whole checklist as one
+multi-command shell sequence. One logical child operation consumes at most one
+`execution_subagent` call: never split it into multiple children or silently
+fan out surrounding shell steps through additional children. If
+higher-priority frontend routing cannot satisfy both the requested operation
+and its child-call cap, stop before exceeding the cap and report the acceptance
+as blocked; do not claim that repository instructions can control upstream
+scheduling.
+
+In Copilot CLI 1.0.100-1, `execution_subagent` is a built-in managed agent.
+Do not claim that prompt prose or
+`subagents.agents.execution-subagent.model` pins its model: live evidence
+showed that repository setting was ignored. Usage output is authoritative for
+the observed managed-child model. Keep that upstream-selected child distinct
+from the parent frontend `--model` and RAPTOR finding-analysis model controls.
+
 When the direct-`bash` exception applies, use `mode="sync"`, a stable
 `shellId`, and an `initial_wait` suitable for observing startup. `initial_wait`
 is only an observation window; never add a `timeout` wrapper or present it as a

@@ -219,14 +219,12 @@ jobs:
           ruff check --output-format=github \
             .
 
-  # Slash-command metadata: enforces every .claude/commands/*.md has a
-  # parseable ``dispatch:`` frontmatter (target exists on disk) and that
-  # commands.md's hardcoded exclusion list matches the frontmatter
-  # ``exclude_from_listing: true`` flags. Catches renamed libexec paths,
-  # missing dispatch fields on new commands, and alias-list drift at PR
-  # time — see CLAUDE.md SLASH-COMMAND DISPATCH for the design.
-  #
-  # Pure stdlib Python; no setup beyond checkout.
+  # Decision-layer metadata: validates slash-command dispatch metadata and
+  # the generated Copilot custom-agent projection plus the Claude plugin's
+  # identity-gated hook registry/configuration. Catches renamed libexec paths,
+  # alias-list drift, missing/duplicate agents, projection drift,
+  # frontend-incompatible model metadata, and unenforced sensitive-agent
+  # policies at PR time.
   command-metadata:
     needs: pre_check
     if: needs.pre_check.outputs.should_skip != 'true'
@@ -239,8 +237,13 @@ jobs:
           # Belt-and-braces: no step in this job needs git credentials.
           persist-credentials: false
 
-      - name: Lint slash-command metadata
-        run: python3 .github/scripts/check_command_metadata.py
+      - name: Install metadata parser
+        run: python3 -m pip install "$(grep -oE 'pyyaml==[0-9.]+' pyproject.toml)"
+
+      - name: Lint decision-layer metadata
+        run: |
+          python3 .github/scripts/check_command_metadata.py
+          python3 .github/scripts/project_agent_projection.py
 
   # Repo-invariant detectors as a PR gate. Every detector below also
   # runs in the daily scheduled sweep (miswiring-scan.yml, kept as

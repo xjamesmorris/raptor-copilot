@@ -386,9 +386,11 @@ Arguments:
 
 Options:
   -c, --continue     Resume last RAPTOR session
+  -r, --resume ID    Resume an exact Copilot session (not with --continue)
   --frontend HOST    Interactive frontend: claude (default) or copilot
                      (Copilot requires a native Linux executable)
   -m, --model MODEL  Choose the frontend model
+  --max-ai-credits N Copilot session limit (installed CLI minimum: 30)
   -p, --project NAME Set the active project
   --yolo             Copilot all-permissions opt-in; passed through unchanged
                      (never enabled by RAPTOR or stored as project trust)
@@ -602,6 +604,27 @@ STARTUP_ARGS=("--caller-dir" "$RAPTOR_CALLER_DIR")
 FRONTEND_ARGS=()
 FRONTEND_MODEL=""
 CONTINUE_SESSION=0
+COPILOT_SESSION_MODE=""
+_COPILOT_MIN_AI_CREDITS=30
+_validate_copilot_ai_credits() {
+    local value="$1"
+    local whole
+
+    # Preserve native parsing for spellings the CLI may support now or later.
+    # The launcher owns only the installed CLI's documented decimal floor.
+    if [[ "$value" =~ ^([0-9]+)([.][0-9]+)?$ ]]; then
+        whole="${BASH_REMATCH[1]}"
+        while [[ ${#whole} -gt 1 && "$whole" == 0* ]]; do
+            whole="${whole#0}"
+        done
+        if (( ${#whole} < 2 )) \
+                || (( ${#whole} == 2
+                    && 10#$whole < _COPILOT_MIN_AI_CREDITS )); then
+            echo "raptor: Copilot --max-ai-credits requires at least ${_COPILOT_MIN_AI_CREDITS}; smaller limits are unsupported by the installed CLI" >&2
+            return 1
+        fi
+    fi
+}
 if [[ "$FRONTEND" == "copilot" ]]; then
     # Pin the executable whose device/inode was captured in the strong host
     # claim instead of allowing an auto-update handoff during launch.
@@ -632,9 +655,85 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -c|--continue)
+            if [[ "$FRONTEND" == "copilot"
+                    && "$COPILOT_SESSION_MODE" == "resume" ]]; then
+                echo "raptor: --continue cannot be used with --resume" >&2
+                exit 1
+            fi
             FRONTEND_ARGS+=("--continue")
             CONTINUE_SESSION=1
+            if [[ "$FRONTEND" == "copilot" ]]; then
+                COPILOT_SESSION_MODE="continue"
+            fi
             INITIAL_PROMPT=""
+            shift
+            ;;
+        -r|--resume)
+            if [[ "$FRONTEND" != "copilot" ]]; then
+                # Preserve Claude's existing native passthrough semantics.
+                FRONTEND_ARGS+=("$1")
+                shift
+                continue
+            fi
+            [[ $# -ge 2 ]] || {
+                echo "raptor: $1 requires a session id or name" >&2
+                exit 1
+            }
+            _resume_value="$2"
+            if [[ -z "$_resume_value" || "$_resume_value" == -* ]]; then
+                echo "raptor: $1 requires a value before the next option" >&2
+                exit 1
+            fi
+            if (LC_ALL=C; [[ "$_resume_value" == *[[:cntrl:]]* ]]); then
+                echo "raptor: $1 value contains control bytes" >&2
+                exit 1
+            fi
+            if [[ -n "$COPILOT_SESSION_MODE" ]]; then
+                if [[ "$COPILOT_SESSION_MODE" == "continue" ]]; then
+                    echo "raptor: --resume cannot be used with --continue" >&2
+                else
+                    echo "raptor: --resume may be specified only once" >&2
+                fi
+                exit 1
+            fi
+            # Copilot's exact-session CLI surface is --session-id. Keep
+            # --resume distinct from --session-id=<new UUID>, which creates
+            # and names a new session with the initial RAPTOR prompt.
+            FRONTEND_ARGS+=("--session-id=$_resume_value")
+            COPILOT_SESSION_MODE="resume"
+            CONTINUE_SESSION=1
+            INITIAL_PROMPT=""
+            unset _resume_value
+            shift 2
+            ;;
+        --resume=*)
+            if [[ "$FRONTEND" != "copilot" ]]; then
+                FRONTEND_ARGS+=("$1")
+                shift
+                continue
+            fi
+            _resume_value="${1#--resume=}"
+            if [[ -z "$_resume_value" ]]; then
+                echo "raptor: --resume= requires a session id or name" >&2
+                exit 1
+            fi
+            if (LC_ALL=C; [[ "$_resume_value" == *[[:cntrl:]]* ]]); then
+                echo "raptor: --resume= value contains control bytes" >&2
+                exit 1
+            fi
+            if [[ -n "$COPILOT_SESSION_MODE" ]]; then
+                if [[ "$COPILOT_SESSION_MODE" == "continue" ]]; then
+                    echo "raptor: --resume cannot be used with --continue" >&2
+                else
+                    echo "raptor: --resume may be specified only once" >&2
+                fi
+                exit 1
+            fi
+            FRONTEND_ARGS+=("--session-id=$_resume_value")
+            COPILOT_SESSION_MODE="resume"
+            CONTINUE_SESSION=1
+            INITIAL_PROMPT=""
+            unset _resume_value
             shift
             ;;
         -m|--model)
@@ -670,6 +769,41 @@ while [[ $# -gt 0 ]]; do
             FRONTEND_ARGS+=("$1")
             shift
             ;;
+        --max-ai-credits)
+            if [[ "$FRONTEND" == "copilot" ]]; then
+                [[ $# -ge 2 ]] || {
+                    echo "raptor: --max-ai-credits requires a value" >&2
+                    exit 1
+                }
+                if [[ -z "$2" || "$2" == -* ]]; then
+                    echo "raptor: --max-ai-credits requires a value before the next option" >&2
+                    exit 1
+                fi
+                if ! _validate_copilot_ai_credits "$2"; then
+                    exit 1
+                fi
+                FRONTEND_ARGS+=("$1" "$2")
+                shift 2
+            else
+                FRONTEND_ARGS+=("$1")
+                shift
+            fi
+            ;;
+        --max-ai-credits=*)
+            if [[ "$FRONTEND" == "copilot" ]]; then
+                _credits_value="${1#--max-ai-credits=}"
+                if [[ -z "$_credits_value" ]]; then
+                    echo "raptor: --max-ai-credits= requires a non-empty value" >&2
+                    exit 1
+                fi
+                if ! _validate_copilot_ai_credits "$_credits_value"; then
+                    exit 1
+                fi
+                unset _credits_value
+            fi
+            FRONTEND_ARGS+=("$1")
+            shift
+            ;;
         -v|--verbose)
             if [[ "$FRONTEND" == "copilot" ]]; then
                 FRONTEND_ARGS+=("--log-level" "debug")
@@ -699,10 +833,16 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+if [[ "$FRONTEND" == "copilot"
+        && "$COPILOT_SESSION_MODE" == "resume"
+        && -n "$TARGET" ]]; then
+    echo "raptor: --resume cannot be combined with a target" >&2
+    exit 1
+fi
 if [[ "$FRONTEND" == "copilot" && "$CONTINUE_SESSION" -eq 0 ]]; then
     FRONTEND_ARGS+=("--name" "RAPTOR")
 fi
-unset CONTINUE_SESSION
+unset CONTINUE_SESSION COPILOT_SESSION_MODE
 export RAPTOR_FRONTEND="$FRONTEND"
 if [[ -n "$FRONTEND_MODEL" ]]; then
     export RAPTOR_FRONTEND_MODEL="$FRONTEND_MODEL"
@@ -1100,6 +1240,13 @@ PLUGIN_ARGS=()
 if [ -d "$RAPTOR_DIR/plugins/coverage" ]; then
     PLUGIN_ARGS+=(--plugin-dir "$RAPTOR_DIR/plugins/coverage")
 fi
+# Claude owns the authoritative custom-agent definitions so their explicit
+# `model: inherit` metadata cannot be weakened by ambient model variables.
+# Copilot loads the generated, model-free `.github/agents` projection instead.
+if [[ "$FRONTEND" == "claude"
+        && -f "$RAPTOR_DIR/plugins/agents/.claude-plugin/plugin.json" ]]; then
+    PLUGIN_ARGS+=(--plugin-dir "$RAPTOR_DIR/plugins/agents")
+fi
 
 # `env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS` at the exec
 # boundary: defence-in-depth in case something re-set them after the
@@ -1117,18 +1264,30 @@ if [[ -n "${ANTHROPIC_MODEL:-}" && -z "${CLAUDE_CODE_SUBAGENT_MODEL:-}" ]]; then
 fi
 
 # RAPTOR_FRONTEND_EXEC_BEGIN
+_frontend_env_unsets=(-u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS)
+if [[ "$FRONTEND" == "copilot" ]]; then
+    # A launch nested inside Copilot inherits the parent's identity markers.
+    # The selected native process must establish its own session instead.
+    _frontend_env_unsets+=(
+        -u COPILOT_AGENT_SESSION_ID
+        -u COPILOT_CLI
+        -u COPILOT_CLI_BINARY_VERSION
+        -u COPILOT_CLI_RESOLVED_DIST_DIR
+        -u COPILOT_LOADER_PID
+    )
+fi
 if [[ -n "$INITIAL_PROMPT" ]]; then
     if [[ "$FRONTEND" == "copilot" ]]; then
-        exec env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS \
+        exec env "${_frontend_env_unsets[@]}" \
             "$FRONTEND_EXECUTABLE" "${PLUGIN_ARGS[@]}" \
             "${FRONTEND_ARGS[@]}" -i "$INITIAL_PROMPT"
     else
-        exec env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS \
+        exec env "${_frontend_env_unsets[@]}" \
             "$FRONTEND_EXECUTABLE" "${PLUGIN_ARGS[@]}" \
             "${FRONTEND_ARGS[@]}" "$INITIAL_PROMPT"
     fi
 else
-    exec env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS \
+    exec env "${_frontend_env_unsets[@]}" \
         "$FRONTEND_EXECUTABLE" "${PLUGIN_ARGS[@]}" \
         "${FRONTEND_ARGS[@]}"
 fi

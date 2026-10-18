@@ -24,12 +24,12 @@ does the mechanical work: running Semgrep and CodeQL, managing subprocesses,
 parsing SARIF, deduplicating findings, dispatching LLM API calls, tracking
 costs, writing output files.  It does not make judgement calls.
 
-The **interactive decision layer** (`.claude/`, `tiers/`, `CLAUDE.md`) makes
-the calls: which findings to prioritise, how to interpret results, what the
-attack scenario is, whether the exploit is realistic. It runs in Claude Code
-by default or GitHub Copilot CLI on native Linux. Skills, commands, and agents
-load progressively so the context window only carries the expertise the
-current step needs.
+The **interactive decision layer** (`.claude/`, `plugins/agents/`, `tiers/`,
+`CLAUDE.md`) makes the calls: which findings to prioritise, how to interpret
+results, what the attack scenario is, whether the exploit is realistic. It
+runs in Claude Code by default or GitHub Copilot CLI on native Linux. Skills,
+commands, and agents load progressively so the context window only carries
+the expertise the current step needs.
 
 ```
 Claude Code or Copilot CLI session
@@ -37,7 +37,8 @@ Claude Code or Copilot CLI session
 ├── .claude/commands/      slash commands (/agentic, /scan, /validate, ...)
 ├── .claude/skills/        methodology detail (loaded on demand)
 ├── tiers/                 adversarial thinking, recovery, expert personas
-└── .claude/agents/        specialist sub-agents (crash analysis, forensics, ...)
+├── plugins/agents/agents/ authoritative Claude agents (`model: inherit`)
+└── .github/agents/        generated Copilot projection of those agents
 
 Python layer
 ├── raptor.py              unified launcher / CLI entry point
@@ -268,13 +269,22 @@ The coverage plugin (`plugins/coverage/`) records which source files the LLM
 reads during analysis via a `PostToolUse` hook.  It runs automatically when a
 run is active and has no run-side effect otherwise (the async hook
 still fires per Read and exits early when no run is active).
-The hook is a thin Claude-profile shim over the shared Python ingestion path in
-`core.coverage.track_read`; the unregistered Copilot hook profile is
-parse-only and cannot write coverage. A credentialed hook resolves the
-current verified Claude session owner and writes only when exactly one owned
-running run is eligible. Multiple concurrent runs are deliberately ambiguous
-and receive no attribution. The pre-series `.active` lookup remains only when
-both session credential variables are absent.
+The hook is a thin entry shim over the shared Python ingestion path in
+`core.coverage.track_read`. The verified session owner selects a fixed
+frontend profile: Claude `Read`/`tool_input.file_path` and Copilot
+`view`/`toolArgs.path` both normalize to the canonical
+`Read`/`tool_input.file_path` contract before attribution. The historical
+Copilot candidate profile remains parse-only. Native camelCase registrations
+and PascalCase plugin registrations use different field spellings. The
+owner-selected live profile normalizes either complete spelling and
+deterministically coalesces duplicate aliases only when session, tool, and
+path meanings agree; incomplete or conflicting mixtures are rejected. The
+fixed hook registration supplies any omitted event kind. A credentialed hook
+writes only when exactly one run owned by the matching frontend session is
+eligible.
+Multiple concurrent runs are deliberately ambiguous and receive no
+attribution. The pre-series `.active` lookup remains Claude-only and is used
+only when both session credential variables are absent.
 
 For this coverage policy, an **absent** run `target_path` means unfiltered
 attribution (needed by targetless commands such as `cve-diff`/`cve-env`). Once

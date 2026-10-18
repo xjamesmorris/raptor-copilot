@@ -202,8 +202,11 @@ TIERS: dict[str, dict] = {
         "extra_triggers": [
             ".github/scripts",
             ".github/workflows",
+            ".github/copilot/settings.json",
+            ".gitignore",
             "CLAUDE.md",
             ".claude",
+            "plugins/agents",
             "README.md",
             "README-Copilot.md",
             "pyproject.toml",

@@ -897,6 +897,8 @@ def test_default_and_explicit_claude_argv_match_contract(tmp_path):
     expected = (
         "--plugin-dir",
         str(workspace.root / "plugins" / "coverage"),
+        "--plugin-dir",
+        str(workspace.root / "plugins" / "agents"),
         "-n",
         "RAPTOR",
         "--model",
@@ -1079,6 +1081,210 @@ def test_native_copilot_continuation_orderings_are_unambiguous(
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
 @pytest.mark.parametrize(
+    ("launcher_args", "frontend_args"),
+    (
+        (
+            (
+                "--frontend",
+                "copilot",
+                "--project",
+                "probe",
+                "--model",
+                _UNLISTED_MODEL,
+                "--resume",
+                "33333333-3333-4333-8333-333333333333",
+            ),
+            (
+                "--model",
+                _UNLISTED_MODEL,
+                "--session-id=33333333-3333-4333-8333-333333333333",
+            ),
+        ),
+        (
+            (
+                "--resume=MVP 10 exact session",
+                f"--model={_UNLISTED_MODEL}",
+                "--project=probe",
+                "--frontend=copilot",
+            ),
+            (
+                "--session-id=MVP 10 exact session",
+                f"--model={_UNLISTED_MODEL}",
+            ),
+        ),
+        (
+            (
+                "-r",
+                "task-name",
+                "--frontend=copilot",
+                "--project",
+                "probe",
+                "--model",
+                _UNLISTED_MODEL,
+            ),
+            (
+                "--session-id=task-name",
+                "--model",
+                _UNLISTED_MODEL,
+            ),
+        ),
+    ),
+    ids=("separated-id", "equals-exact-name", "short-name"),
+)
+def test_native_copilot_explicit_resume_orderings_are_exact_and_isolated(
+    tmp_path,
+    launcher_args,
+    frontend_args,
+):
+    workspace, launcher, capture, env = _native_frontend_argv_harness(
+        tmp_path,
+        "copilot",
+    )
+    manager, _ = _create_probe_project(workspace)
+
+    result = _run_native_frontend(
+        launcher,
+        workspace,
+        env,
+        launcher_args,
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    argv, fields = _read_native_frontend_capture(capture)
+    assert argv == [
+        str(workspace.bin_dir / "copilot"),
+        "--plugin-dir",
+        str(workspace.root / "plugins" / "coverage"),
+        "--no-auto-update",
+        *frontend_args,
+    ]
+    assert fields["env.RAPTOR_FRONTEND_MODEL"] == _UNLISTED_MODEL
+    assert "--continue" not in argv
+    assert "--name" not in argv
+    assert "-i" not in argv
+    assert not any(arg.startswith("/raptor") for arg in argv)
+    _assert_probe_project_bound(workspace, manager)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
+@pytest.mark.parametrize(
+    ("resume_args", "message"),
+    (
+        (("--resume",), "--resume requires a session id or name"),
+        (("-r",), "-r requires a session id or name"),
+        (("--resume=",), "--resume= requires a session id or name"),
+        (
+            ("--resume", "--model", "gpt-5-mini"),
+            "--resume requires a value before the next option",
+        ),
+        (
+            ("--continue", "--resume", "session-1"),
+            "--resume cannot be used with --continue",
+        ),
+        (
+            ("--resume", "session-1", "--continue"),
+            "--continue cannot be used with --resume",
+        ),
+        (
+            ("--resume", "session-1", "--resume=session-2"),
+            "--resume may be specified only once",
+        ),
+        (
+            ("--resume", "session-1", "target"),
+            "--resume cannot be combined with a target",
+        ),
+    ),
+    ids=(
+        "missing-long",
+        "missing-short",
+        "empty-equals",
+        "before-option",
+        "continue-first",
+        "resume-first",
+        "duplicate",
+        "target",
+    ),
+)
+def test_native_copilot_rejects_ambiguous_resume_before_exec(
+    tmp_path,
+    resume_args,
+    message,
+):
+    workspace, launcher, capture, env = _native_frontend_argv_harness(
+        tmp_path,
+        "copilot",
+    )
+
+    result = _run_native_frontend(
+        launcher,
+        workspace,
+        env,
+        ("--frontend", "copilot", *resume_args),
+    )
+
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert message in result.stderr
+    assert not capture.exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
+def test_native_copilot_exec_scrubs_inherited_session_markers(tmp_path):
+    workspace, launcher, capture, env = _native_frontend_argv_harness(
+        tmp_path,
+        "copilot",
+    )
+    for name in (
+        "COPILOT_AGENT_SESSION_ID",
+        "COPILOT_CLI",
+        "COPILOT_CLI_BINARY_VERSION",
+        "COPILOT_CLI_RESOLVED_DIST_DIR",
+        "COPILOT_LOADER_PID",
+    ):
+        env[name] = f"parent-{name.lower()}"
+
+    result = _run_native_frontend(
+        launcher,
+        workspace,
+        env,
+        ("--frontend", "copilot", "--resume=exact-session"),
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    argv, fields = _read_native_frontend_capture(capture)
+    assert "--session-id=exact-session" in argv
+    for name in (
+        "COPILOT_AGENT_SESSION_ID",
+        "COPILOT_CLI",
+        "COPILOT_CLI_BINARY_VERSION",
+        "COPILOT_CLI_RESOLVED_DIST_DIR",
+        "COPILOT_LOADER_PID",
+    ):
+        assert fields[f"env.{name}"] == "<unset>"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
+def test_native_claude_resume_passthrough_is_unchanged(tmp_path):
+    workspace, launcher, capture, env = _native_frontend_argv_harness(
+        tmp_path,
+        "claude",
+    )
+
+    result = _run_native_frontend(
+        launcher,
+        workspace,
+        env,
+        ("--frontend", "claude", "--resume=claude-session"),
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    argv, _ = _read_native_frontend_capture(capture)
+    assert "--resume=claude-session" in argv
+    assert argv[-1] == "/raptor"
+    assert "--session-id=claude-session" not in argv
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
+@pytest.mark.parametrize(
     ("launcher_args", "frontend_args", "model_label"),
     (
         (
@@ -1134,6 +1340,8 @@ def test_native_claude_yolo_stays_on_claude_argv(
         str(workspace.bin_dir / "claude"),
         "--plugin-dir",
         str(workspace.root / "plugins" / "coverage"),
+        "--plugin-dir",
+        str(workspace.root / "plugins" / "agents"),
         "-n",
         "RAPTOR",
         *frontend_args,
@@ -1225,6 +1433,116 @@ def test_native_copilot_forwards_every_nonempty_model_spelling_exactly(
     assert fields["env.RAPTOR_FRONTEND_MODEL"] == model
     assert argv[-2:] == ["-i", "/raptor"]
     assert "--yolo" not in argv
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
+@pytest.mark.parametrize(
+    "credit_args",
+    (
+        ("--max-ai-credits", "30"),
+        ("--max-ai-credits", "30.5"),
+        ("--max-ai-credits=30",),
+        ("--max-ai-credits=30.5",),
+    ),
+    ids=("floor-separated", "decimal-separated", "floor-equals", "decimal-equals"),
+)
+def test_native_copilot_forwards_supported_credit_limit_exactly(
+    tmp_path,
+    credit_args,
+):
+    workspace, launcher, capture, env = _native_frontend_argv_harness(
+        tmp_path,
+        "copilot",
+    )
+
+    result = _run_native_frontend(
+        launcher,
+        workspace,
+        env,
+        ("--frontend", "copilot", *credit_args),
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    argv, _ = _read_native_frontend_capture(capture)
+    if len(credit_args) == 1:
+        assert credit_args[0] in argv
+    else:
+        credit_index = argv.index("--max-ai-credits")
+        assert argv[credit_index + 1] == credit_args[1]
+    assert argv[-2:] == ["-i", "/raptor"]
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
+@pytest.mark.parametrize(
+    "credit_args",
+    (
+        ("--max-ai-credits", "1"),
+        ("--max-ai-credits", "29.999"),
+        ("--max-ai-credits=1.0",),
+        ("--max-ai-credits=29",),
+    ),
+    ids=("one-separated", "decimal-separated", "one-equals", "below-equals"),
+)
+def test_native_copilot_rejects_credit_limit_below_installed_floor(
+    tmp_path,
+    credit_args,
+):
+    workspace, launcher, capture, env = _native_frontend_argv_harness(
+        tmp_path,
+        "copilot",
+    )
+
+    result = _run_native_frontend(
+        launcher,
+        workspace,
+        env,
+        ("--frontend", "copilot", *credit_args),
+    )
+
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert (
+        "Copilot --max-ai-credits requires at least 30; smaller limits are "
+        "unsupported by the installed CLI"
+    ) in result.stderr
+    assert not capture.exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
+@pytest.mark.parametrize(
+    ("credit_args", "message"),
+    (
+        (("--max-ai-credits",), "--max-ai-credits requires a value"),
+        (
+            ("--max-ai-credits", "--yolo"),
+            "--max-ai-credits requires a value before the next option",
+        ),
+        (
+            ("--max-ai-credits=",),
+            "--max-ai-credits= requires a non-empty value",
+        ),
+    ),
+    ids=("missing", "before-option", "empty-equals"),
+)
+def test_native_copilot_rejects_missing_credit_limit_before_exec(
+    tmp_path,
+    credit_args,
+    message,
+):
+    workspace, launcher, capture, env = _native_frontend_argv_harness(
+        tmp_path,
+        "copilot",
+    )
+
+    result = _run_native_frontend(
+        launcher,
+        workspace,
+        env,
+        ("--frontend", "copilot", *credit_args),
+    )
+
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert message in result.stderr
+    assert not capture.exists()
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
