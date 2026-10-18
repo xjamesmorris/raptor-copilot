@@ -19,6 +19,7 @@ gets the coverage for free:
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 from pathlib import Path
@@ -53,6 +54,69 @@ def test_degraded_untrusted_consent_is_allowlisted_but_stripped():
     assert "RAPTOR_ALLOW_DEGRADED_UNTRUSTED" in (
         RaptorConfig.SAFE_ENV_ALLOWLIST
     )
+
+
+def test_explicit_worker_dispatch_can_preserve_disable_consent(
+    monkeypatch,
+    tmp_path,
+):
+    """Only the dedicated RAPTOR-worker kwarg restores the nonce.
+
+    keep_trust_markers alone deliberately remains insufficient: sandbox
+    disable consent is separate authority.
+    """
+    from core.sandbox import context, state
+    from core.sandbox.disable_consent import NONCE_ENV_VAR
+
+    monkeypatch.setattr(state, "_cli_sandbox_profile", "none")
+    monkeypatch.setattr(state, "_cli_sandbox_disabled", True)
+    monkeypatch.setattr(
+        state,
+        "_cli_sandbox_disable_consent",
+        "nonce",
+    )
+    nonce = "ab" * 16
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "CLAUDECODE": "1",
+        NONCE_ENV_VAR: nonce,
+    }
+    command = [
+        "/usr/bin/python3",
+        "-c",
+        (
+            "import json, os; "
+            "print(json.dumps({"
+            f"'nonce': os.environ.get({NONCE_ENV_VAR!r}), "
+            "'cc': os.environ.get('CLAUDECODE')}))"
+        ),
+    ]
+
+    stripped = context.run(
+        command,
+        output=str(tmp_path),
+        env=env,
+        env_caller_filtered=True,
+        keep_trust_markers_for_dispatch=True,
+        capture_output=True,
+        text=True,
+    )
+    assert stripped.returncode == 0, stripped.stderr
+    assert json.loads(stripped.stdout)["nonce"] is None
+
+    preserved = context.run(
+        command,
+        output=str(tmp_path),
+        env=env,
+        env_caller_filtered=True,
+        keep_trust_markers_for_dispatch=True,
+        keep_disable_consent_for_dispatch=True,
+        capture_output=True,
+        text=True,
+    )
+    assert preserved.returncode == 0, preserved.stderr
+    payload = json.loads(preserved.stdout)
+    assert payload == {"nonce": nonce, "cc": "1"}
 
 
 def test_seatbelt_shim_tuple_in_sync():

@@ -27,10 +27,10 @@ from typing import Any, TYPE_CHECKING
 
 from core.cve import EpssClient, KevClient
 from core.json import JsonCache
-from core.progress import HackerProgressBar
 
 from . import sca_cache_root, default_client
 from . import suppressions as _suppressions
+from .diagnostics import DeadlineHttpClient, ScaDeadline, ScaProgress
 from .discovery import find_manifests
 from .rows import FindingRow
 from .findings import build_vuln_findings, write_findings_json
@@ -226,17 +226,62 @@ class RunOptions:
                                                 # ``--impact-analysis``.
     enable_progress: bool = True                 # multi-stage TTY
                                                 # progress display via
-                                                # ``HackerProgressBar``.
+                                                # ``ScaProgress``.
                                                 # Auto-disables on non-
                                                 # TTY stderr (pipes / CI
                                                 # logs / file redirect).
                                                 # ``--no-progress``
                                                 # forces off explicitly.
+    deadline_seconds: float | None = None       # propagated child budget;
+                                                # bounds each HTTP request
+                                                # and is checked at every
+                                                # phase boundary.
+    diagnostics_path: Path | None = None        # private phase receipt.
+                                                # Defaults to
+                                                # <output>/diagnostics.json.
+    analysis_mode: str = "deep"                 # receipt label only:
+                                                # mechanical or deep.
+    request_timeout_seconds: float = 30.0       # one network call may not
+                                                # consume the whole run
+                                                # deadline.
     sbom_input: Path | None = None            # CycloneDX SBOM to
                                                 # import as the dep list
                                                 # in place of discovery
                                                 # + parser dispatch.
                                                 # ``--sbom <path>``.
+
+    def __post_init__(self) -> None:
+        if self.analysis_mode not in {"mechanical", "deep"}:
+            raise ValueError(
+                "analysis_mode must be 'mechanical' or 'deep'")
+        if self.analysis_mode == "mechanical":
+            enabled_deep_gates = [
+                name
+                for name, enabled in (
+                    ("enable_llm_review", self.enable_llm_review),
+                    ("enable_triage", self.enable_triage),
+                    ("review_maintainers", self.review_maintainers),
+                    ("review_slopsquats", self.review_slopsquats),
+                    ("enable_llm_inline_installs",
+                     self.enable_llm_inline_installs),
+                    ("enable_impact_analysis",
+                     self.enable_impact_analysis),
+                )
+                if enabled
+            ]
+            if enabled_deep_gates:
+                raise ValueError(
+                    "mechanical SCA forbids deep/LLM gates: "
+                    + ", ".join(enabled_deep_gates)
+                    + "; use analysis_mode='deep' or disable every "
+                      "listed gate"
+                )
+        if (self.deadline_seconds is not None
+                and self.deadline_seconds <= 0):
+            raise ValueError("deadline_seconds must be greater than zero")
+        if self.request_timeout_seconds <= 0:
+            raise ValueError(
+                "request_timeout_seconds must be greater than zero")
 
 
 @dataclass
@@ -319,12 +364,19 @@ def run_sca(
 
     if cache is None:
         cache = JsonCache(root=options.cache_root or sca_cache_root())
+    deadline = ScaDeadline.from_seconds(options.deadline_seconds)
     if http is None:
         # Pass the target so default_client can augment the
         # allowlist with Dockerfile-derived container-registry
         # hosts (B9 base-image scanning needs e.g. docker.io,
         # ghcr.io which aren't in the static SCA_ALLOWED_HOSTS).
         http = default_client(target=target, offline=options.offline)
+    if deadline is not None:
+        http = DeadlineHttpClient(
+            http,
+            deadline,
+            per_request_total_timeout=options.request_timeout_seconds,
+        )
 
     # Apply --no-cache by zeroing TTLs at every client level. This
     # avoids special-casing every caller; a TTL of 0 forces a refetch
@@ -339,9 +391,13 @@ def run_sca(
     # Multi-stage TTY progress display. Auto-disables on non-TTY
     # stderr (pipes / CI logs / file redirect); ``--no-progress``
     # forces off explicitly.
-    progress = HackerProgressBar(
+    progress = ScaProgress(
         target=str(target),
+        output_dir=output_dir,
+        diagnostics_path=options.diagnostics_path,
         disabled=(None if options.enable_progress else True),
+        mode=options.analysis_mode,
+        deadline=deadline,
     )
 
     # 1. Discover + parse + join. Per-parser opts are toggled via

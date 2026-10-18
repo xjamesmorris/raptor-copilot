@@ -3841,6 +3841,12 @@ def sandbox(block_network=_UNSET, target: str | None = None, output: str | None 
         # silently preserved the markers for untrusted code.
         keep_trust_markers_for_dispatch = kwargs.pop(
             "keep_trust_markers_for_dispatch", False)
+        # RAPTOR worker-spine analogue for the independently consent-gated
+        # sandbox disable. Generic/target-bound children must never inherit
+        # this authority; one explicit dispatch call site may preserve a
+        # nonce that its parent already accepted and exported.
+        keep_disable_consent_for_dispatch = kwargs.pop(
+            "keep_disable_consent_for_dispatch", False)
         # ``env_caller_filtered``: opt-in assertion from the caller
         # that the env dict was constructed from a get_safe_env-
         # equivalent base AND that any DANGEROUS_ENV_VARS present
@@ -4830,6 +4836,11 @@ def sandbox(block_network=_UNSET, target: str | None = None, output: str | None 
                 if k not in _RC.TARGET_ENV_STRIP_SET
                 and k != "_RAPTOR_KEEP_TRUST_MARKERS"
             }
+        if keep_disable_consent_for_dispatch:
+            from .disable_consent import NONCE_ENV_VAR as _DISABLE_NONCE
+            _nonce = kwargs["env"].get(_DISABLE_NONCE)
+            if _nonce is not None:
+                _env_for_target[_DISABLE_NONCE] = _nonce
         if _ENV_RESTORE_KEY in _env_for_target:
             # RAPTOR-minted quarantine payload key (see
             # _env_quarantine) — only ever set by run() itself on the

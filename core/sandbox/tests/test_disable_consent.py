@@ -701,7 +701,10 @@ class TestEnvPolicy:
     def test_spine_propagation_sites_present(self):
         """The two spine parents forward consent explicitly: raptor.py
         (argv forwarder, verbatim pass-through) and raptor_agentic.py
-        (consent holder, guarded export at both gate-hitting spawns).
+        (consent holder, guarded export at its direct scanner spawns);
+        the sandboxed SCA dispatch performs the same guarded export and
+        uses the dedicated context kwarg that preserves it only for that
+        RAPTOR-owned child.
         Source pin — the wiring lives inside main() spawn plumbing
         that has no seam for in-process invocation."""
         entry = (REPO_ROOT / "raptor.py").read_text(encoding="utf-8")
@@ -711,6 +714,10 @@ class TestEnvPolicy:
             encoding="utf-8")
         assert "_export_disable_consent(scanner_env)" in agentic
         assert "_export_disable_consent(codeql_env)" in agentic
+        sca_agent = (REPO_ROOT / "packages" / "sca" / "agent.py"
+                     ).read_text(encoding="utf-8")
+        assert "export_disable_consent(child_env)" in sca_agent
+        assert "keep_disable_consent_for_dispatch=True" in sca_agent
 
     def test_mint_script_exists_and_mints_valid_consent(
             self, monkeypatch, tmp_path):

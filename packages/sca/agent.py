@@ -19,7 +19,10 @@ SCA as a sandboxed subprocess rather than in-process:
     to a separate ``raptor-sca`` repo; post-merge SCA lives in-tree.
   - :func:`run_sca_subprocess` — launch the agent under
     ``core.sandbox.run`` with egress restricted to
-    :data:`packages.sca.SCA_ALLOWED_HOSTS`.
+    :data:`packages.sca.SCA_ALLOWED_HOSTS`. This helper is the agentic
+    mechanical lane: it disables LLM review/triage and propagates a child
+    deadline shorter than the parent timeout. The separate deep ``--sca``
+    phase retains LLM review and triage.
 
 When ``--sandbox`` is passed to the script form, the analysis runs
 inside a sandbox context with egress proxy enabled — the
@@ -51,7 +54,14 @@ if TYPE_CHECKING:
 # the merge into RAPTOR.)
 sys.path.insert(0, os.environ["RAPTOR_DIR"])
 
+from packages.sca.diagnostics import (
+    finalize_sca_diagnostic,
+    read_sca_diagnostic,
+)
+
 logger = logging.getLogger(__name__)
+
+DEFAULT_SCA_SUBPROCESS_TIMEOUT = 600
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +132,8 @@ def run_sca_subprocess(
     *,
     sandbox_args: Sequence[str] = (),
     env: dict | None = None,
-    timeout: int = 600,
+    timeout: int | None = DEFAULT_SCA_SUBPROCESS_TIMEOUT,
+    cancel_fd: int | None = None,
 ) -> tuple:
     """Run the SCA agent as a sandboxed subprocess.
 
@@ -131,9 +142,16 @@ def run_sca_subprocess(
     with :data:`packages.sca.SCA_ALLOWED_HOSTS` as the hostname
     allowlist. Landlock confines writes to ``output_dir``.
 
-    Returns ``(returncode, stdout, stderr)``.
+    Returns ``(returncode, stdout, stderr)``. Timeout/deadline exits use
+    ``124``; caller cancellation uses ``130``. The sandbox owns process-tree
+    teardown for all three terminal paths.
     """
     from core.config import RaptorConfig
+    from core.sandbox import SandboxCancelled, SandboxSetupError
+    from core.sandbox.disable_consent import (
+        NONCE_ENV_VAR,
+        export_disable_consent,
+    )
     from core.sandbox import run as sandbox_run
 
     # Ensure output_dir exists before Landlock setup — the sandbox
@@ -146,8 +164,21 @@ def run_sca_subprocess(
         sys.executable, str(agent_path),
         "--repo", str(target),
         "--out", str(output_dir),
-        *sandbox_args,
+        # Hidden provenance bit: agentic workers must re-run the shared
+        # disable-consent gate; only direct SCA CLI compatibility uses the
+        # trusted library profile-none path.
+        "--agentic-worker",
+        # This is the always-on MECHANICAL SCA phase. Deep review/triage
+        # belongs exclusively to /agentic --sca; letting the child
+        # auto-detect Claude Code here made one 600-second LLM call consume
+        # the mechanical phase's entire 600-second parent budget.
+        "--skip-review",
+        "--skip-triage",
     ]
+    child_deadline = _child_deadline_seconds(timeout)
+    if child_deadline is not None:
+        cmd.extend(["--deadline-seconds", str(child_deadline)])
+    cmd.extend(sandbox_args)
 
     # The child's import chain (core.coverage.schema → core.logging →
     # RaptorLogger → ensure_directories) writes structured audit logs
@@ -159,6 +190,14 @@ def run_sca_subprocess(
     from packages.sca import sca_cache_root as _sca_cache_root
     cache_dir = _sca_cache_root()
     cache_dir.mkdir(parents=True, exist_ok=True)
+    child_env = dict(
+        env if env is not None else RaptorConfig.get_safe_env()
+    )
+    # --sandbox none / --no-sandbox is consent-gated again in the child.
+    # Export only an already-accepted parent grant; this helper cannot mint
+    # authority and is a no-op for ordinary sandboxed runs.
+    child_env.pop(NONCE_ENV_VAR, None)
+    export_disable_consent(child_env)
 
     try:
         result = sandbox_run(
@@ -170,33 +209,125 @@ def run_sca_subprocess(
             target=str(target),
             output=str(output_dir),
             writable_paths=[str(log_dir), str(cache_dir)],
-            env=env if env is not None else RaptorConfig.get_safe_env(),
+            env=child_env,
             env_caller_filtered=True,
             # ``cmd`` runs RAPTOR's OWN SCA agent — a trusted in-tree
             # dispatch, NOT untrusted target code.  Without this the
             # sandbox's TARGET_ENV_STRIP_SET strips RAPTOR_DIR and the
             # child KeyErrors at import.
             keep_trust_markers_for_dispatch=True,
+            # Separate explicit authority: the SCA child re-parses
+            # --sandbox none / --no-sandbox, so an already-accepted parent
+            # consent must survive this RAPTOR-owned dispatch only.
+            keep_disable_consent_for_dispatch=True,
             capture_output=True,
             text=True,
-            timeout=timeout,
+            timeout=(timeout or None),
+            cancel_fd=cancel_fd,
         )
     except subprocess.TimeoutExpired as exc:
-        # Surface as a non-zero exit code with a structured stderr
-        # message. Stdout from the partial run (if any) is
-        # preserved so the caller's parsing layer can salvage what
-        # landed.
-        partial_stdout = (
-            exc.stdout.decode("utf-8", errors="replace")
-            if isinstance(exc.stdout, (bytes, bytearray))
-            else (exc.stdout or "")
+        partial_stdout = _decode_partial_stream(exc.stdout)
+        partial_stderr = _decode_partial_stream(exc.stderr)
+        message = f"sca-agent timed out after {timeout}s"
+        stderr = _append_diagnostic_line(partial_stderr, message)
+        finalize_sca_diagnostic(
+            output_dir,
+            disposition="failed",
+            reason=message,
+            returncode=124,
+            timed_out=True,
+            stderr=stderr,
+            mode="mechanical",
         )
         return (
-            -1,
+            124,
             partial_stdout,
-            f"sca-agent timed out after {timeout}s",
+            stderr,
+        )
+    except SandboxCancelled as exc:
+        partial_stdout = _decode_partial_stream(exc.output)
+        partial_stderr = _decode_partial_stream(exc.stderr)
+        message = "sca-agent cancelled"
+        stderr = _append_diagnostic_line(partial_stderr, message)
+        finalize_sca_diagnostic(
+            output_dir,
+            disposition="failed",
+            reason=message,
+            returncode=130,
+            cancelled=True,
+            stderr=stderr,
+            mode="mechanical",
+        )
+        return 130, partial_stdout, stderr
+    except SandboxSetupError as exc:
+        finalize_sca_diagnostic(
+            output_dir,
+            disposition="failed",
+            reason=f"SandboxSetupError: {exc}",
+            mode="mechanical",
+        )
+        raise
+    except KeyboardInterrupt:
+        finalize_sca_diagnostic(
+            output_dir,
+            disposition="failed",
+            reason="sca-agent interrupted by operator",
+            returncode=130,
+            interrupted=True,
+            mode="mechanical",
+        )
+        raise
+    except Exception as exc:
+        finalize_sca_diagnostic(
+            output_dir,
+            disposition="failed",
+            reason=f"{type(exc).__name__}: {exc}",
+            mode="mechanical",
+        )
+        raise
+    if result.returncode == 0:
+        finalize_sca_diagnostic(
+            output_dir,
+            disposition="success",
+            returncode=0,
+            mode="mechanical",
+        )
+    else:
+        child_diagnostic = read_sca_diagnostic(output_dir)
+        reason = child_diagnostic.get("reason")
+        if not isinstance(reason, str) or not reason:
+            reason = _decode_partial_stream(result.stderr)
+        finalize_sca_diagnostic(
+            output_dir,
+            disposition="failed",
+            reason=reason,
+            returncode=result.returncode,
+            stderr=result.stderr,
+            mode="mechanical",
         )
     return result.returncode, result.stdout, result.stderr
+
+
+def _child_deadline_seconds(
+    timeout: int | float | None,
+) -> float | None:
+    """Leave parent-side time to persist diagnostics and reap the tree."""
+    if timeout is None or float(timeout) <= 0:
+        return None
+    timeout = float(timeout)
+    grace = min(15.0, max(0.1, timeout * 0.05))
+    return round(max(0.1, timeout - grace), 3)
+
+
+def _decode_partial_stream(value: object) -> str:
+    if isinstance(value, (bytes, bytearray)):
+        return value.decode("utf-8", errors="replace")
+    return str(value or "")
+
+
+def _append_diagnostic_line(stderr: str, message: str) -> str:
+    stderr = stderr.rstrip()
+    return f"{stderr}\n{message}" if stderr else message
 
 
 def _compose_proxy_hosts(target: Path) -> list:
@@ -218,6 +349,33 @@ def _compose_proxy_hosts(target: Path) -> list:
 # Subprocess entry point — when invoked as `python3 packages/sca/agent.py …`
 # ---------------------------------------------------------------------------
 
+def _normalise_direct_sandbox_argv(argv) -> list[str]:
+    """Apply the direct-SCA ``--no-sandbox`` compatibility override.
+
+    The shared sandbox parser correctly makes the two disable/profile
+    spellings mutually exclusive. The historical direct SCA surface predates
+    that parser and documents ``--no-sandbox`` as the winning escape hatch,
+    so remove any profile spelling before strict parsing. Unknown options are
+    untouched and still fail at argparse.
+    """
+    values = list(sys.argv[1:] if argv is None else argv)
+    if "--no-sandbox" not in values:
+        return values
+    normalized: list[str] = []
+    index = 0
+    while index < len(values):
+        value = values[index]
+        if value == "--sandbox":
+            index += 2
+            continue
+        if value.startswith("--sandbox="):
+            index += 1
+            continue
+        normalized.append(value)
+        index += 1
+    return normalized
+
+
 def main(argv=None) -> int:
     # Escaping-console chokepoint: this is the sandboxed subprocess
     # entry (its own process). Wired via core.logging directly — the
@@ -228,40 +386,79 @@ def main(argv=None) -> int:
     # parent-visible stderr with a plain formatter.
     from core.logging import configure_cli_logging
     configure_cli_logging(logging.WARNING)
-    from core.sandbox import PROFILES as _SANDBOX_PROFILES
+    from core.sandbox import add_cli_args, apply_cli_args
     from packages.sca.api import analyse
     ap = argparse.ArgumentParser(description="RAPTOR SCA agent")
     ap.add_argument("--repo", required=True, help="Target project root")
     ap.add_argument("--out", required=True, help="Output directory")
     ap.add_argument("--offline", action="store_true")
     ap.add_argument("--no-cache", action="store_true")
+    ap.add_argument(
+        "--skip-review",
+        action="store_true",
+        help="Disable deep LLM behavioural review",
+    )
+    ap.add_argument(
+        "--skip-triage",
+        action="store_true",
+        help="Disable deep LLM triage",
+    )
+    ap.add_argument(
+        "--deadline-seconds",
+        type=float,
+        default=None,
+        help="Internal deadline shorter than the parent process timeout",
+    )
+    ap.add_argument(
+        "--agentic-worker",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     ap.add_argument("--sarif-dirs", nargs="*",
                     help="Sibling SARIF directories for cross-tool linking")
-    # Dynamic choices from the profile registry — a hardcoded subset
-    # silently excluded 'strict', the profile the threat model
-    # recommends for exactly this workload (LLM analysis over hostile
-    # dependency manifests).
-    ap.add_argument("--sandbox", choices=sorted(_SANDBOX_PROFILES),
-                    default=None,
-                    help="Sandbox profile (default: use egress proxy only)")
-    ap.add_argument("--no-sandbox", action="store_true",
-                    help="Disable all sandbox isolation")
-    ap.add_argument("--audit", action="store_true")
-    ap.add_argument("--audit-verbose", action="store_true")
-    # ``parse_known_args`` rather than ``parse_args``: SCA is invoked
-    # by raptor.py / ``/agentic --sca`` / future wrappers that pass
-    # the standard RAPTOR run-lifecycle flag set (``--max-cost``,
-    # ``--no-exploits``, ``--no-patches``, etc.). Pre-fix any unknown
-    # flag triggered a SystemExit, breaking the wrapper invocation
-    # path. Wrappers' own argparse already consumes their flags
-    # before forwarding; SCA only needs to silently ignore any that
-    # leak through.
-    args, _unknown = ap.parse_known_args(argv)
+    # This is the complete, explicitly-supported wrapper passthrough
+    # surface. In particular it includes --sandbox-floor, which
+    # /agentic forwards to every scanner worker. Anything else is a
+    # direct-agent typo or wrapper contract drift and must fail at
+    # argparse instead of disappearing silently.
+    add_cli_args(ap)
+    args = ap.parse_args(_normalise_direct_sandbox_argv(argv))
+    direct_disable = bool(
+        args.no_sandbox or args.sandbox == "none"
+    )
+    direct_compat_disable = direct_disable and not args.agentic_worker
+    if direct_compat_disable:
+        # Scoped trusted-library compatibility: SCA runs RAPTOR's parser
+        # over data; it does not execute target build/install code. Keep
+        # every other entry point's disable-consent gate intact, and keep
+        # agentic workers on the shared gate below.
+        if (
+            args.audit
+            or args.audit_verbose
+            or args.audit_budget is not None
+            or args.sandbox_floor is not None
+            or args.sandbox_readable_paths
+            or args.sandbox_tool_paths
+        ):
+            ap.error(
+                "direct SCA sandbox disable is incompatible with audit, "
+                "floor, readable-path, tool-path, and audit-budget options"
+            )
+    else:
+        apply_cli_args(args, ap)
 
     sarif_dirs = [Path(p) for p in args.sarif_dirs] if args.sarif_dirs else None
     target = Path(args.repo).resolve()
     output_dir = Path(args.out).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    if not direct_compat_disable:
+        from core.project.trust import apply_project_sandbox_floor
+        apply_project_sandbox_floor(
+            args,
+            banner=False,
+            target_path=target,
+            run_dir=output_dir,
+        )
 
     use_sandbox = args.sandbox is not None and not args.no_sandbox
 
@@ -275,6 +472,14 @@ def main(argv=None) -> int:
             profile=args.sandbox,
             audit=args.audit,
             audit_verbose=args.audit_verbose,
+            enable_llm_review=not args.skip_review,
+            enable_triage=not args.skip_triage,
+            deadline_seconds=args.deadline_seconds,
+            analysis_mode=(
+                "mechanical"
+                if args.skip_review and args.skip_triage
+                else "deep"
+            ),
         )
     else:
         result = analyse(
@@ -283,15 +488,29 @@ def main(argv=None) -> int:
             offline=args.offline,
             no_cache=args.no_cache,
             sarif_dirs=sarif_dirs,
+            enable_llm_review=not args.skip_review,
+            enable_triage=not args.skip_triage,
+            deadline_seconds=args.deadline_seconds,
+            analysis_mode=(
+                "mechanical"
+                if args.skip_review and args.skip_triage
+                else "deep"
+            ),
         )
 
     print(json.dumps(result))
-    return 0 if result.get("status") == "ok" else 1
+    if result.get("status") == "ok":
+        return 0
+    return 124 if result.get("timed_out") is True else 1
 
 
 def _run_sandboxed(
     *, target, output_dir, offline, no_cache, sarif_dirs, profile,
     audit: bool = False, audit_verbose: bool = False,
+    enable_llm_review: bool = True,
+    enable_triage: bool = True,
+    deadline_seconds: float | None = None,
+    analysis_mode: str = "deep",
 ):
     """Run analyse() inside a sandbox context.
 
@@ -335,6 +554,10 @@ def _run_sandboxed(
         return _analyse(
             target=target, output_dir=output_dir,
             offline=offline, no_cache=no_cache, sarif_dirs=sarif_dirs,
+            enable_llm_review=enable_llm_review,
+            enable_triage=enable_triage,
+            deadline_seconds=deadline_seconds,
+            analysis_mode=analysis_mode,
         )
 
 
