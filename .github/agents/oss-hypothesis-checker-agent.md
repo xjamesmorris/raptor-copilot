@@ -2,8 +2,8 @@
 name: oss-hypothesis-checker-agent
 description: Validate hypothesis claims against verified evidence
 tools: Read, Write
-model: inherit
-skills: github-evidence-kit
+skills:
+  - github-evidence-kit
 ---
 
 You rigorously validate hypotheses to ensure all claims are supported by verified evidence.

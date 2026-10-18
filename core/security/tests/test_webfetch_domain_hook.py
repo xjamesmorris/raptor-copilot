@@ -5,17 +5,18 @@ narrowing behind the WebFetch-capable agents' network posture. Three
 modes are pinned here:
 
   * static hostname allowlist (b4: oss github / wayback agents)
-  * ``--https-any`` (b4: ioc-extractor)
-  * ``--anchor-file`` (crash-report-fetcher): https + same registrable
-    domain as the operator-supplied URL, extra hosts as logged
-    operator-visible additions, fail-closed on a missing/invalid
-    anchor.
+  * ``--https-any`` (generic helper mode; no RAPTOR agent uses it)
+  * ``--anchor-file`` (crash-report-fetcher and IOC extractor): https +
+    same registrable domain as the operator-supplied URL, extra hosts as
+    logged operator-visible additions, fail-closed on missing, malformed,
+    symlinked, or otherwise unsafe anchors.
 
 The hook is exercised as a subprocess with the real PreToolUse stdin
 contract (JSON with tool_input.url; exit 0 allow / exit 2 block).
 """
 
 import json
+import runpy
 import subprocess
 import sys
 import unittest
@@ -24,6 +25,11 @@ from tempfile import TemporaryDirectory
 
 _REPO = Path(__file__).resolve().parents[3]
 _HOOK = _REPO / ".claude" / "hooks" / "webfetch-domain-allowlist.py"
+_DISPATCHER = (
+    _REPO / "plugins" / "agents" / "libexec" / "raptor-agent-hook-dispatch"
+)
+_POLICIES = runpy.run_path(str(_DISPATCHER))["_POLICIES"]
+_ANCHOR_HELPER = runpy.run_path(str(_REPO / "libexec" / "raptor-fetch-anchor"))
 
 
 def _run_hook(args, url=None, stdin=None):
@@ -165,7 +171,7 @@ class TestAnchorFileMode(unittest.TestCase):
                 ["--anchor-file", str(Path(tmp) / "absent.anchor")],
                 "https://trac.ffmpeg.org/ticket/1")
             self.assertEqual(rc, 2)
-            self.assertIn("missing or unreadable", err)
+            self.assertIn("missing, unreadable, or unsafe", err)
 
     def test_empty_anchor_file_blocked_fail_closed(self):
         with TemporaryDirectory() as tmp:
@@ -183,6 +189,53 @@ class TestAnchorFileMode(unittest.TestCase):
             self.assertEqual(rc, 2)
             self.assertIn("valid https URL", err)
 
+    def test_symlink_anchor_blocked_fail_closed(self):
+        with TemporaryDirectory() as tmp:
+            target = self._anchor(tmp, "https://vendor.example/report")
+            link = Path(tmp) / "linked.anchor"
+            link.symlink_to(target)
+            rc, err = _run_hook(
+                ["--anchor-file", str(link)],
+                "https://vendor.example/attachment",
+            )
+            self.assertEqual(rc, 2)
+            self.assertIn("symlink", err)
+
+    def test_relative_anchor_path_blocked_fail_closed(self):
+        rc, err = _run_hook(
+            ["--anchor-file", "relative.anchor"],
+            "https://vendor.example/report",
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn("absolute", err)
+
+    def test_hostile_extra_host_blocked_fail_closed(self):
+        with TemporaryDirectory() as tmp:
+            anchor = self._anchor(
+                tmp,
+                "https://vendor.example/report",
+                "evil.example/path",
+            )
+            rc, err = _run_hook(
+                ["--anchor-file", str(anchor)],
+                "https://vendor.example/attachment",
+            )
+            self.assertEqual(rc, 2)
+            self.assertIn("invalid extra hostname", err)
+
+    def test_credential_bearing_anchor_blocked_fail_closed(self):
+        with TemporaryDirectory() as tmp:
+            anchor = self._anchor(
+                tmp,
+                "https://operator@vendor.example/report",
+            )
+            rc, err = _run_hook(
+                ["--anchor-file", str(anchor)],
+                "https://vendor.example/report",
+            )
+            self.assertEqual(rc, 2)
+            self.assertIn("valid https URL", err)
+
     def test_bare_hostname_anchor_accepted(self):
         with TemporaryDirectory() as tmp:
             anchor = self._anchor(tmp, "trac.ffmpeg.org")
@@ -197,28 +250,73 @@ class TestAnchorFileMode(unittest.TestCase):
 
 
 class TestFetcherAgentWiring(unittest.TestCase):
-    """The crash-report-fetcher frontmatter must wire this hook in
-    anchor-file mode — the enforcement lives there, not in prose."""
+    """The plugin dispatcher must wire the fetcher policy."""
 
-    def test_fetcher_frontmatter_wires_anchor_mode(self):
-        agent = (_REPO / ".claude" / "agents"
-                 / "crash-report-fetcher-agent.md").read_text(
-                     encoding="utf-8")
-        self.assertIn("webfetch-domain-allowlist.py", agent)
-        self.assertIn("--anchor-file", agent)
+    def test_fetcher_plugin_policy_wires_anchor_mode(self):
+        script, args = _POLICIES[
+            "raptor-agents:crash-report-fetcher"
+        ]["WebFetch"]
+        self.assertEqual(script, "webfetch-domain-allowlist.py")
+        self.assertEqual(args[0], "--anchor-file")
         # Session-scoped: a single repo-global anchor was
         # last-writer-wins across concurrent investigations.
         self.assertIn(
-            ".claude/run/crash-report-fetcher-{session}.anchor", agent)
+            ".claude/run/crash-report-fetcher-{session}.anchor",
+            args[1],
+        )
 
-    def test_fetcher_frontmatter_wires_write_allowlist(self):
+    def test_fetcher_plugin_policy_wires_write_allowlist(self):
         """The fetcher's Write grant is narrowed to its single
         artifact — prose alone let a steered fetcher rewrite the very
         anchor that constrains its WebFetch."""
-        agent = (_REPO / ".claude" / "agents"
-                 / "crash-report-fetcher-agent.md").read_text(
-                     encoding="utf-8")
-        self.assertIn("write-path-allowlist.py bug-report.json", agent)
+        policy = _POLICIES["raptor-agents:crash-report-fetcher"]
+        self.assertEqual(
+            policy["Write"],
+            ("write-path-allowlist.py", ("bug-report.json",)),
+        )
+
+    def test_ioc_plugin_policy_wires_fixed_operator_anchor(self):
+        script, args = _POLICIES[
+            "raptor-agents:oss-investigator-ioc-extractor-agent"
+        ]["WebFetch"]
+        self.assertEqual(script, "webfetch-domain-allowlist.py")
+        self.assertEqual(args, (
+            "--anchor-file",
+            "{raptor_dir}/.claude/run/oss-ioc-extractor.anchor",
+        ))
+
+    def test_ioc_orchestration_uses_hardened_anchor_helper(self):
+        skill = (
+            _REPO
+            / ".claude"
+            / "skills"
+            / "oss-forensics"
+            / "orchestration"
+            / "SKILL.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "libexec/raptor-fetch-anchor --ioc write "
+            "<vendor-report-url>",
+            skill,
+        )
+        self.assertIn("never\nwrite that path directly", skill)
+
+    def test_ioc_anchor_helper_path_and_url_validation(self):
+        anchor = _ANCHOR_HELPER["_anchor_path"](ioc=True)
+        validate = _ANCHOR_HELPER["_valid_https_url"]
+
+        self.assertEqual(
+            anchor,
+            _REPO / ".claude" / "run" / "oss-ioc-extractor.anchor",
+        )
+        self.assertTrue(validate("https://vendor.example/report"))
+        for hostile in (
+            "http://vendor.example/report",
+            "https://user@vendor.example/report",
+            "https://vendor.example:bad/report",
+            "https://vendor.example/report\nhttps://evil.example",
+        ):
+            self.assertFalse(validate(hostile), hostile)
 
     def test_session_placeholder_resolves_from_env(self):
         """{session} in --anchor-file resolves via RAPTOR_SESSION_PID,
@@ -251,17 +349,17 @@ class TestFetcherAgentWiring(unittest.TestCase):
             self.assertEqual(proc.returncode, 2)
 
     def test_log_lines_escape_control_bytes(self):
-        """A hostile URL with an interior newline must not forge audit
-        rows in the decision log."""
+        """A hostile URL with an interior newline is denied before logging."""
         with TemporaryDirectory() as td:
             anchor = Path(td) / "a.anchor"
             anchor.write_text("https://tracker.example.org/t/1\n")
-            _run_hook(["--anchor-file", str(anchor)],
-                      "https://tracker.example.org/x?d=a\nforged\tallow")
-            log = (Path(td) / "a.anchor.log").read_text(encoding="utf-8")
-            lines = [ln for ln in log.splitlines() if ln.strip()]
-            self.assertEqual(len(lines), 1, log)
-            self.assertIn("\\x0a", lines[0])
+            rc, err = _run_hook(
+                ["--anchor-file", str(anchor)],
+                "https://tracker.example.org/x?d=a\nforged\tallow",
+            )
+            self.assertEqual(rc, 2)
+            self.assertIn("control", err)
+            self.assertFalse((Path(td) / "a.anchor.log").exists())
 
 
 if __name__ == "__main__":

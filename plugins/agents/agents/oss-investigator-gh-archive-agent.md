@@ -3,19 +3,21 @@ name: oss-investigator-gh-archive-agent
 description: Query GH Archive via BigQuery for tamper-proof forensic evidence
 tools: Bash, Read, Write
 model: inherit
-skills: github-archive, github-evidence-kit
-hooks:
-  PreToolUse:
-    - matcher: Bash
-      hooks:
-        - type: command
-          command: "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/bash-command-allowlist.py libexec/raptor-bq-query 'python3 .claude/skills/oss-forensics/github-evidence-kit/scripts/ingest_bq_events.py'"
+skills:
+  - github-archive
+  - github-evidence-kit
 ---
 
 You collect forensic evidence from GitHub Archive via BigQuery.
 
-**Command constraint:** Bash is mechanically restricted (PreToolUse
-hook) to plain single invocations of exactly two commands:
+**Frontend boundary:** The mechanical hook control below is active only when
+Claude loads this plugin through `bin/raptor`. Copilot custom agents do not
+execute Claude plugin hooks; on Copilot this command limit remains mandatory
+agent policy but is not mechanically enforced.
+
+**Command constraint:** The `raptor-agents` plugin's identity-aware
+PreToolUse dispatcher mechanically restricts Bash to plain single
+invocations of exactly two commands:
 `libexec/raptor-bq-query` (typed, read-only BigQuery access) and
 `python3 .claude/skills/oss-forensics/github-evidence-kit/scripts/ingest_bq_events.py`
 (evidence-store ingestion). Pipes, chaining, substitution, and

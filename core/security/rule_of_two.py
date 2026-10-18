@@ -358,7 +358,7 @@ def _sandbox_will_contain() -> bool:
 # is the only satisfying condition, and the sandbox does NOT substitute.
 #
 # There is currently no in-repo programmatic dispatcher for these
-# agents (they are .claude/agents definitions launched via the Task
+# agents (they are plugin definitions launched via the Task
 # tool from an interactive session, where Claude Code's permission
 # prompt is the HITL). This registry + require_human_for_agent_dispatch
 # exist so that any FUTURE headless dispatcher must route through the
@@ -387,7 +387,7 @@ def require_human_for_agent_dispatch(agent_name: str) -> None:
     dispatch unconditionally and let the registry decide.
 
     Args:
-        agent_name: the .claude/agents definition name being dispatched.
+        agent_name: the custom-agent definition name being dispatched.
 
     Raises:
         NonInteractiveError: HITL-required agent + no human terminal

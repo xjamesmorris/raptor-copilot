@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""PreToolUse hook: enforce a per-agent Write/Edit path allowlist.
+"""PreToolUse policy helper: enforce a Write/Edit path allowlist.
 
-Wired via the ``hooks:`` frontmatter of individual agent definitions
-(.claude/agents/*.md) so the restriction is scoped to one agent, not
-the whole session — the same per-agent narrowing pattern as
-webfetch-domain-allowlist.py and bash-command-allowlist.py.
+The ``raptor-agents`` plugin's trusted identity dispatcher invokes this
+helper only for scoped agents with a file-write policy. Agent frontmatter
+prose and hooks are not the enforcement boundary.
 
 Why it exists: an agent whose prose says "Write exactly ONE artifact"
 still holds an unrestricted Write grant, and for agents that read
@@ -13,14 +12,9 @@ designated prompt-injection victim) that grant is an escape hatch —
 a steered agent can rewrite the very anchor file that mechanically
 constrains its own WebFetch. Prose is not a boundary; this hook is.
 
-Usage (in agent frontmatter):
+Direct usage:
 
-    hooks:
-      PreToolUse:
-        - matcher: Write
-          hooks:
-            - type: command
-              command: "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/write-path-allowlist.py bug-report.json"
+    write-path-allowlist.py bug-report.json
 
 Arguments are the allowed file BASENAMES. A write is allowed only
 when the target path's final component exactly matches one of them
@@ -28,7 +22,7 @@ and no path component is ``..``. Everything else — most importantly
 anything under ``.claude/`` (hooks, anchors, settings, agent
 definitions) — is blocked.
 
-Contract (Claude Code PreToolUse hooks):
+Contract (Claude Code PreToolUse payload forwarded by the dispatcher):
   stdin  — JSON with ``tool_name`` and ``tool_input`` (``file_path``).
   exit 0 — allow the call.
   exit 2 — block the call; stderr is fed back to the agent.

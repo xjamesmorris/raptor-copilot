@@ -40,8 +40,10 @@ storage and SAGE, rather than stopping at each agent definition.
 
 ### Tool lists
 
-Agent definitions under `.claude/agents/` declare the tools needed for their
-job. An agent without `WebFetch` cannot use that tool. Roles concerned only with
+Authoritative agent definitions under `plugins/agents/agents/` declare the
+tools needed for their job. Claude loads them through the `raptor-agents`
+plugin; `.github/agents/` is the mechanically checked Copilot projection. An
+agent without `WebFetch` cannot use that tool. Roles concerned only with
 reasoning over collected evidence are generally limited to Read and Write.
 
 Tool names are a coarse boundary. Bash can start other programmes, including
@@ -49,20 +51,49 @@ network clients, unless the command is narrowed by a hook or the process is
 contained by the sandbox. The presence of a short tool list should not be read
 as proof of process-level isolation.
 
+### Plugin-level identity dispatch
+
+Claude Code 2.1.301 does not apply the `hooks:` blocks embedded in agent
+frontmatter when those agents are loaded from a plugin. RAPTOR therefore does
+not treat agent frontmatter as a hook boundary. The `raptor-agents` plugin
+registers one `PreToolUse` handler in `plugins/agents/hooks/hooks.json`; it
+runs in exec form with `onFailure: block`.
+
+The dispatcher reads Claude's trusted hook payload fields, especially the
+plugin-scoped `agent_type` (`raptor-agents:<name>`) and `agent_id`. Known
+restricted agents route to the existing focused URL, command, or write-path
+validator with the original JSON on stdin and policy values as argv entries —
+never through shell interpolation. Unknown RAPTOR-scoped identities,
+an `agent_id` without an `agent_type`, invalid identity values, malformed
+events, missing framework roots, and validator failures deny the tool call.
+`agent_type` is the policy key; `agent_id` is validated when Claude supplies
+it for a subagent. A main session with neither field, built-in agents, other
+plugins, and known RAPTOR agents without a sensitive-tool policy return no
+decision and continue through normal permissions.
+
+This enforcement is a **Claude-launcher guarantee**. GitHub Copilot CLI loads
+the generated `.github/agents` definitions but does not execute Claude plugin
+hooks, so these five URL/Bash/write restrictions are not mechanically
+equivalent on Copilot. The projection preserves agent instructions and tool
+grants, not the Claude hook boundary; documentation and acceptance reports
+must not claim cross-frontend hook parity.
+
 ### Network access
 
-Agents that use `WebFetch` have a `PreToolUse` hook. The hook checks every URL
-before the request is made and fails closed when its input cannot be parsed.
-HTTPS is required in every mode.
+Restricted agents that use `WebFetch` are routed by the plugin hook to the
+URL policy helper. It checks every URL before the request is made and fails
+closed when its input cannot be parsed. HTTPS is required in every mode.
 
 Most networked investigators have fixed host allowlists. The crash-report
 fetcher derives its boundary from the bug-tracker URL supplied by the operator.
 It records each allow or deny decision beside the anchor file. Additional
 attachment hosts have to be added visibly to that file.
 
-The IOC extractor is deliberately broader because vendor reports can live on
-arbitrary sites. Its hook permits any HTTPS host. This protects the transport
-scheme, but it is not a domain allowlist and should not be described as one.
+The IOC extractor uses the same operator-provenance pattern as the crash
+fetcher: orchestration rewrites a fixed anchor from the operator-supplied
+vendor report URL immediately before dispatch, and WebFetch stays within that
+registrable domain. A stale, missing, malformed, symlinked, or non-regular
+anchor fails closed.
 
 A hostname allowlist controls the connection made by the sandbox. It cannot
 control a second request made by the allowed service. Package repositories and

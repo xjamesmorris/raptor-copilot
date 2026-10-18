@@ -1,7 +1,8 @@
 """Robustness tests for the per-agent Write path-allowlist hook.
 
-`.claude/hooks/write-path-allowlist.py` narrows an agent's Write grant
-to named artifact basenames. Motivating case: the crash-report-fetcher
+`.claude/hooks/write-path-allowlist.py` is selected by the plugin-level
+identity dispatcher to narrow an agent's Write grant to named artifact
+basenames. Motivating case: the crash-report-fetcher
 reads hostile tracker pages while its WebFetch is constrained by an
 anchor file — with an UNRESTRICTED Write grant, a steered fetcher
 could append an exfil host to that anchor and the domain hook would

@@ -42,11 +42,11 @@ REPO = Path(__file__).resolve().parents[2]
 # Instruction files whose fenced examples drive builds/runs of the
 # untrusted crash-analysis target.
 _CRASH_LANES = (
-    ".claude/agents/crash-analysis-agent.md",
-    ".claude/agents/function-trace-generator-agent.md",
-    ".claude/agents/crash-analyzer-agent.md",
-    ".claude/agents/crash-analyzer-checker-agent.md",
-    ".claude/agents/coverage-analysis-generator-agent.md",
+    "plugins/agents/agents/crash-analysis-agent.md",
+    "plugins/agents/agents/function-trace-generator-agent.md",
+    "plugins/agents/agents/crash-analyzer-agent.md",
+    "plugins/agents/agents/crash-analyzer-checker-agent.md",
+    "plugins/agents/agents/coverage-analysis-generator-agent.md",
     ".claude/skills/crash-analysis/function-tracing/SKILL.md",
     ".claude/skills/crash-analysis/gcov-coverage/SKILL.md",
     ".claude/skills/crash-analysis/rr-debugger/SKILL.md",
@@ -55,11 +55,11 @@ _CRASH_LANES = (
 # Lanes that instruct a rebuild / preprocess / execution of the
 # untrusted tree and must therefore name the sandbox wrapper.
 _MUST_NAME_SANDBOX = (
-    ".claude/agents/crash-analysis-agent.md",
-    ".claude/agents/function-trace-generator-agent.md",
-    ".claude/agents/crash-analyzer-agent.md",
-    ".claude/agents/crash-analyzer-checker-agent.md",
-    ".claude/agents/coverage-analysis-generator-agent.md",
+    "plugins/agents/agents/crash-analysis-agent.md",
+    "plugins/agents/agents/function-trace-generator-agent.md",
+    "plugins/agents/agents/crash-analyzer-agent.md",
+    "plugins/agents/agents/crash-analyzer-checker-agent.md",
+    "plugins/agents/agents/coverage-analysis-generator-agent.md",
     ".claude/skills/crash-analysis/function-tracing/SKILL.md",
     ".claude/skills/crash-analysis/gcov-coverage/SKILL.md",
 )

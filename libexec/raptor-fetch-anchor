@@ -1,28 +1,25 @@
 #!/usr/bin/env python3
 # ruff: noqa: RUF100, I001
 # (preamble protection; see .github/tests/test_libexec_marker_coverage.py)
-"""Manage the crash-report-fetcher's session-scoped WebFetch anchor.
+"""Manage operator-provenance WebFetch anchors.
 
 Usage:
-  raptor-fetch-anchor write <bug-tracker-url>
-  raptor-fetch-anchor append <hostname>
-  raptor-fetch-anchor path
+  raptor-fetch-anchor [--ioc] write <https-url>
+  raptor-fetch-anchor [--ioc] append <hostname>
+  raptor-fetch-anchor [--ioc] path
 
-The anchor pins the fetcher agent's WebFetch to the bug tracker's
-registrable domain (PreToolUse hook). It is SESSION-SCOPED —
-``.claude/run/crash-report-fetcher-<session>.anchor``, where
-``<session>`` is this launcher session's RAPTOR_SESSION_PID
-(``default`` outside the launcher) — because a single repo-global
-path was last-writer-wins across concurrent investigations: run B's
-write re-pinned run A's fetcher mid-run, and A's appended attachment
-hosts became fetchable by B. The hook resolves the same placeholder
-from the same inherited environment, so writer and enforcer always
-agree on the path. The URL/hostname arrive as argv DATA.
+The default anchor pins the crash-report fetcher's WebFetch to the bug
+tracker's registrable domain. It is session-scoped at
+``.claude/run/crash-report-fetcher-<session>.anchor``. ``--ioc`` selects the
+fixed ``.claude/run/oss-ioc-extractor.anchor``; orchestration rewrites it from
+the operator-supplied vendor URL immediately before dispatch.
 
-``append`` is the consent-gated extra-host addition (see the
-crash-analysis agent's instruction: may-ask-gated, non-interactive
-fallback records the denial without extending).
+URL/hostname values arrive as argv data. All file opens are relative to a
+no-follow directory fd. Existing symlinks, non-regular files, hard links,
+foreign-owned files, and unsafe parent directories are refused before
+truncate or append.
 """
+
 import sys
 from pathlib import Path
 
@@ -42,58 +39,237 @@ if not (os.environ.get("CLAUDECODE")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import core.startup.process_init  # noqa: E402,F401
+import re  # noqa: E402
+import stat  # noqa: E402
+from urllib.parse import urlsplit  # noqa: E402
 
 
-def _anchor_path() -> Path:
-    session = os.environ.get("RAPTOR_SESSION_PID", "").strip() or "default"
+_HOST_LABEL_RE = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$"
+)
+
+
+def _valid_hostname(host: str) -> bool:
+    return (
+        bool(host)
+        and len(host) <= 253
+        and all(_HOST_LABEL_RE.fullmatch(label) for label in host.split("."))
+    )
+
+
+def _valid_https_url(url: str) -> bool:
+    if url != url.strip() or not url.isprintable():
+        return False
+    try:
+        parts = urlsplit(url)
+        _ = parts.port
+    except ValueError:
+        return False
+    host = (parts.hostname or "").lower().rstrip(".")
+    return (
+        parts.scheme.lower() == "https"
+        and _valid_hostname(host)
+        and parts.username is None
+        and parts.password is None
+    )
+
+
+def _anchor_path(*, ioc: bool) -> Path:
     root = Path(__file__).resolve().parents[1]
+    if ioc:
+        return root / ".claude" / "run" / "oss-ioc-extractor.anchor"
+    session = os.environ.get("RAPTOR_SESSION_PID", "").strip() or "default"
     return root / ".claude" / "run" / f"crash-report-fetcher-{session}.anchor"
 
 
+def _open_run_dir(root: Path) -> tuple[int | None, str | None]:
+    claude_dir = root / ".claude"
+    try:
+        claude_info = claude_dir.lstat()
+    except OSError:
+        return None, ".claude directory is missing or unreadable"
+    if (
+        not stat.S_ISDIR(claude_info.st_mode)
+        or stat.S_ISLNK(claude_info.st_mode)
+    ):
+        return None, ".claude must be a real directory"
+
+    run_dir = claude_dir / "run"
+    try:
+        os.mkdir(run_dir, 0o700)
+    except FileExistsError:
+        pass
+    except OSError:
+        return None, ".claude/run could not be created"
+
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    odirectory = getattr(os, "O_DIRECTORY", None)
+    if nofollow is None or odirectory is None:
+        return None, "platform cannot enforce no-follow anchor writes"
+    flags = os.O_RDONLY | nofollow | odirectory
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    try:
+        directory_fd = os.open(run_dir, flags)
+    except OSError:
+        return None, ".claude/run is missing, unreadable, or unsafe"
+    try:
+        info = os.fstat(directory_fd)
+        if not stat.S_ISDIR(info.st_mode):
+            os.close(directory_fd)
+            return None, ".claude/run is not a directory"
+        if hasattr(os, "getuid") and info.st_uid != os.getuid():
+            os.close(directory_fd)
+            return None, ".claude/run is not owned by the current user"
+    except OSError:
+        os.close(directory_fd)
+        return None, ".claude/run validation failed"
+    return directory_fd, None
+
+
+def _open_anchor_fd(
+    anchor: Path,
+    *,
+    append: bool,
+) -> tuple[int | None, int | None, str | None]:
+    root = Path(__file__).resolve().parents[1]
+    directory_fd, error = _open_run_dir(root)
+    if error is not None or directory_fd is None:
+        return None, None, error
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        os.close(directory_fd)
+        return None, None, "platform cannot enforce no-follow anchor writes"
+    flags = os.O_WRONLY | nofollow | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    flags |= os.O_APPEND if append else os.O_CREAT
+    try:
+        fd = os.open(anchor.name, flags, 0o600, dir_fd=directory_fd)
+    except OSError:
+        os.close(directory_fd)
+        return None, None, "anchor is missing, occupied, or unsafe"
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            os.close(fd)
+            os.close(directory_fd)
+            return None, None, "anchor must be a single-link regular file"
+        if hasattr(os, "getuid") and info.st_uid != os.getuid():
+            os.close(fd)
+            os.close(directory_fd)
+            return None, None, "anchor is not owned by the current user"
+        os.fchmod(fd, 0o600)
+    except OSError:
+        os.close(fd)
+        os.close(directory_fd)
+        return None, None, "anchor validation failed"
+    return fd, directory_fd, None
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError("short anchor write")
+        view = view[written:]
+
+
+def _write_anchor(anchor: Path, url: str) -> str | None:
+    fd, directory_fd, error = _open_anchor_fd(anchor, append=False)
+    if error is not None or fd is None or directory_fd is None:
+        return error
+    try:
+        os.ftruncate(fd, 0)
+        _write_all(fd, (url + "\n").encode("utf-8"))
+        os.fsync(fd)
+    except OSError:
+        return "anchor write failed"
+    finally:
+        os.close(fd)
+        os.close(directory_fd)
+    return None
+
+
+def _append_anchor(anchor: Path, host: str) -> str | None:
+    fd, directory_fd, error = _open_anchor_fd(anchor, append=True)
+    if error is not None or fd is None or directory_fd is None:
+        return error
+    try:
+        _write_all(fd, (host + "\n").encode("utf-8"))
+        os.fsync(fd)
+    except OSError:
+        return "anchor append failed"
+    finally:
+        os.close(fd)
+        os.close(directory_fd)
+    return None
+
+
 def main() -> int:
-    if len(sys.argv) < 2:
-        print("Usage: raptor-fetch-anchor write <url> | append <hostname> "
-              "| path", file=sys.stderr)
+    args = sys.argv[1:]
+    ioc = bool(args and args[0] == "--ioc")
+    if ioc:
+        args = args[1:]
+    if not args:
+        print(
+            "Usage: raptor-fetch-anchor [--ioc] write <https-url> | "
+            "append <hostname> | path",
+            file=sys.stderr,
+        )
         return 1
-    cmd = sys.argv[1]
-    anchor = _anchor_path()
+    cmd = args[0]
+    anchor = _anchor_path(ioc=ioc)
 
     if cmd == "path":
+        if len(args) != 1:
+            print(
+                "Usage: raptor-fetch-anchor [--ioc] path",
+                file=sys.stderr,
+            )
+            return 1
         print(anchor)
         return 0
 
     if cmd == "write":
-        if len(sys.argv) != 3:
-            print("Usage: raptor-fetch-anchor write <bug-tracker-url>",
-                  file=sys.stderr)
+        if len(args) != 2:
+            print(
+                "Usage: raptor-fetch-anchor [--ioc] write <https-url>",
+                file=sys.stderr,
+            )
             return 1
-        url = sys.argv[2]
-        if not url.startswith("https://"):
-            print("raptor-fetch-anchor: anchor URL must be https://",
-                  file=sys.stderr)
+        url = args[1]
+        if not _valid_https_url(url):
+            print(
+                "raptor-fetch-anchor: anchor URL must be a valid "
+                "credential-free https:// URL",
+                file=sys.stderr,
+            )
             return 1
-        anchor.parent.mkdir(parents=True, exist_ok=True)
-        anchor.write_text(url + "\n", encoding="utf-8")
+        error = _write_anchor(anchor, url)
+        if error is not None:
+            print(f"raptor-fetch-anchor: {error}; refusing", file=sys.stderr)
+            return 1
         print(anchor)
         return 0
 
     if cmd == "append":
-        if len(sys.argv) != 3:
-            print("Usage: raptor-fetch-anchor append <hostname>",
-                  file=sys.stderr)
+        if len(args) != 2:
+            print(
+                "Usage: raptor-fetch-anchor [--ioc] append <hostname>",
+                file=sys.stderr,
+            )
             return 1
-        host = sys.argv[2].strip().lower()
-        if (not host or "/" in host or ":" in host or host.startswith("-")
-                or any(ord(c) < 0x21 or ord(c) == 0x7F for c in host)):
-            print(f"raptor-fetch-anchor: not a bare hostname: {host!r}",
-                  file=sys.stderr)
+        host = args[1].strip().lower()
+        if not _valid_hostname(host):
+            print(
+                f"raptor-fetch-anchor: not a bare hostname: {host!r}",
+                file=sys.stderr,
+            )
             return 1
-        if not anchor.is_file():
-            print(f"raptor-fetch-anchor: no anchor at {anchor} — write "
-                  "the bug-tracker URL first", file=sys.stderr)
+        error = _append_anchor(anchor, host)
+        if error is not None:
+            print(f"raptor-fetch-anchor: {error}; refusing", file=sys.stderr)
             return 1
-        with anchor.open("a", encoding="utf-8") as fh:
-            fh.write(host + "\n")
         print(anchor)
         return 0
 

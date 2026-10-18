@@ -2,8 +2,8 @@
 
 HITL-required agents (``core.security.rule_of_two.HITL_REQUIRED_AGENTS``)
 span all three Rule-of-Two legs and must never be dispatched headlessly.
-Today no programmatic dispatcher exists — the agents are .claude/agents
-definitions launched via the Task tool from an interactive session,
+Today no programmatic dispatcher exists — the agents are plugin definitions
+launched via the Task tool from an interactive session,
 where Claude Code's permission prompt is the human in the loop. This
 suite keeps it that way by construction: it walks the programmatic
 surface (``libexec/``, ``core/``, ``packages/``, ``raptor.py``) and
@@ -25,7 +25,7 @@ from core.security.rule_of_two import HITL_REQUIRED_AGENTS
 _REPO = Path(__file__).resolve().parents[3]
 
 # Directories that make up the programmatic (potentially headless)
-# dispatch surface. .claude/agents and docs are prompts/documentation,
+# dispatch surface. Agent definitions and docs are prompts/documentation,
 # not dispatchers, and are intentionally out of scope.
 _SCAN_DIRS = ("libexec", "core", "packages")
 _SCAN_FILES = ("raptor.py",)
@@ -96,7 +96,13 @@ class TestRegistrySelfConsistency(unittest.TestCase):
 
     def test_every_registered_agent_definition_exists(self):
         for name in HITL_REQUIRED_AGENTS:
-            path = _REPO / ".claude" / "agents" / f"{name}.md"
+            path = (
+                _REPO
+                / "plugins"
+                / "agents"
+                / "agents"
+                / f"{name}.md"
+            )
             self.assertTrue(
                 path.is_file(),
                 f"HITL_REQUIRED_AGENTS names '{name}' but "

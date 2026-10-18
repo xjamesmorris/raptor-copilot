@@ -1,0 +1,19 @@
+{
+  "description": "Fail-closed tool restrictions for RAPTOR plugin agents",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "WebFetch|Bash|Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/libexec/raptor-agent-hook-dispatch",
+            "args": [],
+            "timeout": 10,
+            "onFailure": "block"
+          }
+        ]
+      }
+    ]
+  }
+}

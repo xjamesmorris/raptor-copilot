@@ -1,28 +1,35 @@
-"""Workflow-consistency tests over the .claude/agents frontmatter.
+"""Workflow-consistency tests over agent grants and plugin hook policy.
 
-The agent .md files are prompts, but their frontmatter is the enforced
-capability surface (tool grants, per-agent PreToolUse hooks). These
-tests pin the Rule-of-Two decisions documented in docs/security.md so
-a frontmatter edit cannot silently re-grow a severed leg:
+The authoritative agent frontmatter owns tool grants. Claude's supported
+plugin-level PreToolUse dispatcher owns per-agent URL/command/write
+restrictions. These tests pin the Rule-of-Two decisions documented in
+docs/security.md so metadata or policy edits cannot silently re-grow a
+severed leg:
 
   * crash-analysis pipeline: only the fetcher touches the network;
     orchestrator, analyzer, checker, and generators carry no
     WebFetch/WebSearch.
-  * the fetcher is fetch-only (Read, Write, WebFetch) with the
-    domain-allowlist hook wired.
+  * the fetcher is fetch-only (Read, Write, WebFetch) with dispatcher
+    policies for both URL and write-path validation.
   * every WebFetch grant in the agent set is paired with the
-    PreToolUse domain hook or is an explicitly listed exception.
+    plugin policy or is an explicitly listed exception.
 """
 
+import runpy
 import unittest
 from pathlib import Path
 
 import yaml
 
 _REPO = Path(__file__).resolve().parents[3]
-_AGENTS_DIR = _REPO / ".claude" / "agents"
+_AGENTS_DIR = _REPO / "plugins" / "agents" / "agents"
+_DISPATCHER = (
+    _REPO / "plugins" / "agents" / "libexec" / "raptor-agent-hook-dispatch"
+)
+_DISPATCH = runpy.run_path(str(_DISPATCHER))
+_POLICIES = _DISPATCH["_POLICIES"]
 
-# Agents whose WebFetch is deliberately NOT hook-gated. offsec-specialist
+# Agents whose WebFetch is deliberately NOT plugin-policy-gated. offsec-specialist
 # is the inherent all-tools / needs-HITL exception (docs/security.md).
 _WEBFETCH_HOOK_EXEMPT = {"offsec-specialist"}
 
@@ -36,18 +43,10 @@ def _frontmatter(path):
     block = text[4:].split("\n---", 1)[0]
     try:
         data = yaml.safe_load(block)
-    except yaml.YAMLError:
-        # Some agent descriptions embed prose that is not valid YAML
-        # (offsec-specialist's multi-line example transcript). Fall
-        # back to extracting the single-line keys this suite reasons
-        # about; such an agent then reads as having no hooks, which is
-        # the conservative direction for the assertions below.
-        data = {}
-        for line in block.splitlines():
-            for key in ("name", "tools"):
-                prefix = f"{key}:"
-                if line.startswith(prefix):
-                    data[key] = line[len(prefix):].strip()
+    except yaml.YAMLError as exc:
+        raise AssertionError(
+            f"{path.name}: malformed agent frontmatter: {exc}"
+        ) from exc
     if not isinstance(data, dict):
         raise TypeError(f"{path.name}: frontmatter is not a mapping")
     return data
@@ -58,26 +57,6 @@ def _tools(front):
     if raw is None:
         return None  # all-tools default
     return {t.strip() for t in str(raw).split(",") if t.strip()}
-
-
-def _pretooluse_hook_commands(front, matcher):
-    commands = []
-    hooks = front.get("hooks")
-    if not isinstance(hooks, dict):
-        return commands
-    for entry in hooks.get("PreToolUse") or []:
-        if not isinstance(entry, dict):
-            continue
-        if entry.get("matcher") != matcher:
-            continue
-        for hook in entry.get("hooks") or []:
-            if isinstance(hook, dict) and hook.get("type") == "command":
-                commands.append(str(hook.get("command", "")))
-    return commands
-
-
-def _webfetch_hook_commands(front):
-    return _pretooluse_hook_commands(front, "WebFetch")
 
 
 def _load_all():
@@ -117,12 +96,16 @@ class TestCrashPipelinePins(unittest.TestCase):
         self.assertEqual(_tools(front), {"Read", "Write", "WebFetch"})
 
     def test_fetcher_webfetch_is_anchor_gated(self):
-        front = self.agents["crash-report-fetcher"]
-        commands = _webfetch_hook_commands(front)
-        self.assertTrue(commands, "fetcher must wire the WebFetch hook")
-        self.assertTrue(
-            any("webfetch-domain-allowlist.py" in c
-                and "--anchor-file" in c for c in commands))
+        policy = _POLICIES["raptor-agents:crash-report-fetcher"]
+        script, args = policy["WebFetch"]
+        self.assertEqual(script, "webfetch-domain-allowlist.py")
+        self.assertEqual(args[0], "--anchor-file")
+        self.assertIn("crash-report-fetcher-{session}.anchor", args[1])
+        self.assertEqual(
+            policy["Write"],
+            ("write-path-allowlist.py", ("bug-report.json",)),
+        )
+        self.assertEqual(policy["Edit"], policy["Write"])
 
     def test_hook_script_exists_and_is_executable_python(self):
         hook = _REPO / ".claude" / "hooks" / "webfetch-domain-allowlist.py"
@@ -143,29 +126,26 @@ class TestGHArchiveAgentPins(unittest.TestCase):
         self.assertEqual(_tools(self.front), {"Bash", "Read", "Write"})
 
     def test_bash_allowlist_hook_is_wired(self):
-        commands = _pretooluse_hook_commands(self.front, "Bash")
-        self.assertTrue(commands, "gh-archive agent must wire the Bash "
-                                  "command-allowlist hook")
-        joined = " ".join(commands)
-        self.assertIn("bash-command-allowlist.py", joined)
-        self.assertIn("libexec/raptor-bq-query", joined)
-        self.assertIn("ingest_bq_events.py", joined)
+        script, prefixes = _POLICIES[
+            "raptor-agents:oss-investigator-gh-archive-agent"
+        ]["Bash"]
+        self.assertEqual(script, "bash-command-allowlist.py")
+        self.assertIn("libexec/raptor-bq-query", prefixes)
+        self.assertTrue(
+            any("ingest_bq_events.py" in prefix for prefix in prefixes)
+        )
 
     def test_hook_allows_only_the_two_typed_commands(self):
         # The allowlist must not quietly grow a broad interpreter grant
         # (a bare "python3"/"bash" prefix would be arbitrary exec).
-        import shlex
-        commands = _pretooluse_hook_commands(self.front, "Bash")
-        self.assertEqual(len(commands), 1)
-        argv = shlex.split(commands[0])
-        prefixes = argv[argv.index(next(
-            a for a in argv if a.endswith("bash-command-allowlist.py")
-        )) + 1:]
-        self.assertEqual(prefixes, [
+        _, prefixes = _POLICIES[
+            "raptor-agents:oss-investigator-gh-archive-agent"
+        ]["Bash"]
+        self.assertEqual(prefixes, (
             "libexec/raptor-bq-query",
             ("python3 .claude/skills/oss-forensics/github-evidence-kit/"
              "scripts/ingest_bq_events.py"),
-        ])
+        ))
 
     def test_hook_script_exists_and_is_executable_python(self):
         hook = _REPO / ".claude" / "hooks" / "bash-command-allowlist.py"
@@ -195,11 +175,24 @@ class TestWebFetchGrantsAreGated(unittest.TestCase):
                 tools,
                 f"{name}: all-tools default silently grants WebFetch — "
                 "pin an explicit tool list or add to the exempt set")
-            commands = _webfetch_hook_commands(front)
-            self.assertTrue(
-                any("webfetch-domain-allowlist.py" in c for c in commands),
-                f"{name}: WebFetch granted without the domain-allowlist "
-                "PreToolUse hook")
+            policy = _POLICIES.get(f"raptor-agents:{name}", {})
+            self.assertIn(
+                "WebFetch",
+                policy,
+                f"{name}: WebFetch granted without plugin URL policy",
+            )
+            self.assertEqual(
+                policy["WebFetch"][0],
+                "webfetch-domain-allowlist.py",
+            )
+
+    def test_agent_frontmatter_contains_no_ignored_hooks(self):
+        for name, front in _load_all().items():
+            self.assertNotIn(
+                "hooks",
+                front,
+                f"{name}: plugin agent frontmatter hooks are ignored",
+            )
 
 
 if __name__ == "__main__":

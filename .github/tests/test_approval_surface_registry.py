@@ -54,8 +54,11 @@ consent menu), not on one tool-name token: two live consent
 instructions spelled without the literal ``AskUserQuestion``
 (create-skill's persistent-skill confirm, exploit's next-steps fork)
 were invisible to a token-keyed walk. A NEW prompt surface anywhere
-in the tree fails this test until it is adjudicated into the
-registry.
+in the tracked tree fails this test until it is adjudicated into the
+registry. The authoritative and generated agent directories also join
+the universe directly before staging, because projection generation
+creates real frontend prompt surfaces before ``git ls-files`` can see
+their move destinations.
 Render-lane entries (``lane="render"``) feed a prompt that lives in
 another file and are pinned here without being enumerated.
 """
@@ -68,10 +71,15 @@ import subprocess
 import unittest
 from dataclasses import dataclass, field
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+_OWNED_AGENT_SURFACE_DIRS = (
+    "plugins/agents/agents",
+    ".github/agents",
+)
 
 _CONFIRM_OWNERS = {"typer", "click"}
 
@@ -427,12 +435,21 @@ REGISTRY: dict[str, Entry] = {
                      "gate with `libexec/raptor-may-ask` first",
                      "Non-interactive fallback",),
     ),
-    ".claude/agents/crash-analysis-agent.md": Entry(
+    "plugins/agents/agents/crash-analysis-agent.md": Entry(
         lane="instruction", status="clean",
         members=("M16-crash-fetch-host-consent",),
         note="denied-attachment-host consent quotes a hostname and "
              "denial excerpt derived from the hostile tracker page; "
              "non-interactive fallback keeps the denial",
+        wire_tokens=("with non-printables escaped",
+                     "Gate with `libexec/raptor-may-ask`",
+                     "Non-interactive fallback",),
+    ),
+    ".github/agents/crash-analysis-agent.md": Entry(
+        lane="instruction", status="clean",
+        members=("M16-crash-fetch-host-consent",),
+        note="generated Copilot projection of the adjudicated "
+             "raptor-agents plugin source",
         wire_tokens=("with non-printables escaped",
                      "Gate with `libexec/raptor-may-ask`",
                      "Non-interactive fallback",),
@@ -473,12 +490,17 @@ REGISTRY: dict[str, Entry] = {
              "input (the ambiguous name the operator themselves "
              "typed); no external content rendered",
     ),
-    ".claude/agents/oss-investigator-gh-archive-agent.md": Entry(
+    "plugins/agents/agents/oss-investigator-gh-archive-agent.md": Entry(
         lane="instruction", status="clean",
         note="doctrine-compliant mention only: the file states the "
              "dispatched subagent CANNOT ask and names the "
              "github-archive skill's non-interactive fallback it "
              "applies instead",
+    ),
+    ".github/agents/oss-investigator-gh-archive-agent.md": Entry(
+        lane="instruction", status="clean",
+        note="generated Copilot projection of the adjudicated "
+             "raptor-agents plugin source",
     ),
     "docs/environment.md": Entry(
         lane="instruction", status="clean",
@@ -495,11 +517,29 @@ REGISTRY: dict[str, Entry] = {
 
 
 def _git_files() -> list[str]:
+    """Return tracked files plus repository-owned agent projections.
+
+    Agent projection generation precedes staging during local development.
+    Limiting the pre-commit extension to the two mechanically paired agent
+    directories keeps arbitrary untracked files out of the approval census
+    while ensuring real Claude/Copilot prompt surfaces cannot appear stale
+    merely because their move/generation has not reached the git index yet.
+    """
     out = subprocess.run(
         ["git", "-C", str(REPO_ROOT), "ls-files"],
         capture_output=True, text=True, check=True,
     )
-    return out.stdout.splitlines()
+    files = set(out.stdout.splitlines())
+    for relative in _OWNED_AGENT_SURFACE_DIRS:
+        root = REPO_ROOT / relative
+        if not root.is_dir():
+            continue
+        files.update(
+            path.relative_to(REPO_ROOT).as_posix()
+            for path in root.glob("*.md")
+            if path.is_file()
+        )
+    return sorted(files)
 
 
 def _is_test_path(rel: str) -> bool:
@@ -781,6 +821,27 @@ class TestApprovalSurfaceRegistry(unittest.TestCase):
             rel for rel in REGISTRY if not (REPO_ROOT / rel).is_file()
         )
         self.assertFalse(gone, f"registry rows for missing files: {gone}")
+
+    def test_agent_projection_surfaces_join_precommit_universe(self):
+        """Generated/moved agents are reviewed before they are staged."""
+        empty_git_result = subprocess.CompletedProcess(
+            args=("git", "ls-files"),
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+        with mock.patch.object(
+            subprocess,
+            "run",
+            return_value=empty_git_result,
+        ):
+            observed = set(_git_files())
+        expected = {
+            path.relative_to(REPO_ROOT).as_posix()
+            for relative in _OWNED_AGENT_SURFACE_DIRS
+            for path in (REPO_ROOT / relative).glob("*.md")
+        }
+        self.assertEqual(observed, expected)
 
     def test_all_class_members_are_registered(self):
         covered = {

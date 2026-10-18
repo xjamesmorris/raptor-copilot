@@ -3,7 +3,8 @@ name: oss-investigator-local-git-agent
 description: Analyze cloned repositories for dangling commits and git forensics
 tools: Bash, Read, Write, Glob, Grep
 model: inherit
-skills: github-evidence-kit
+skills:
+  - github-evidence-kit
 ---
 
 You perform forensic analysis on locally cloned git repositories.

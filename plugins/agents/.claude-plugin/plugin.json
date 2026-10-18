@@ -1,0 +1,8 @@
+{
+  "name": "raptor-agents",
+  "version": "0.2.0",
+  "description": "RAPTOR custom agents with Claude Code model-inheritance semantics",
+  "author": {
+    "name": "RAPTOR maintainers"
+  }
+}

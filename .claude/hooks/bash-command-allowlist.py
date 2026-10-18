@@ -1,24 +1,16 @@
 #!/usr/bin/env python3
-"""PreToolUse hook: enforce a per-agent Bash command allowlist.
+"""PreToolUse policy helper: enforce a Bash command allowlist.
 
-Wired via the ``hooks:`` frontmatter of individual agent definitions
-(.claude/agents/*.md) so the restriction is scoped to one agent, not
-the whole session. The harness's declarative ``Bash(prefix *)``
-permission rules are settings-scope (session-wide) only, and the
-agent-frontmatter ``tools:`` field accepts bare tool names — qualified
-entries like ``Bash(libexec/raptor-bq-query *)`` are not resolvable
-there and would stop the agent from launching. Per-agent
-``PreToolUse`` hooks are the documented mechanism for per-agent tool
-narrowing (same pattern as webfetch-domain-allowlist.py).
+The ``raptor-agents`` plugin's trusted identity dispatcher invokes this
+helper only for scoped agents with a Bash policy. The harness's declarative
+``Bash(prefix *)`` permissions are session-wide, while the agent
+frontmatter ``tools:`` field accepts bare tool names, so the plugin-level
+hook is the mechanical per-agent narrowing boundary.
 
-Usage (in agent frontmatter):
+Direct usage:
 
-    hooks:
-      PreToolUse:
-        - matcher: Bash
-          hooks:
-            - type: command
-              command: "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/bash-command-allowlist.py libexec/raptor-bq-query 'python3 some/script.py'"
+    bash-command-allowlist.py libexec/raptor-bq-query \
+        "python3 some/script.py"
 
 Arguments are the allowed command prefixes. A command is allowed when,
 after leading-whitespace stripping, it equals a prefix or starts with
@@ -32,7 +24,7 @@ second command or substitute one inside an allowed invocation
 single invocations. Output capture belongs in the tool's own flags
 (e.g. ``raptor-bq-query --output rows.json``), not shell redirects.
 
-Contract (Claude Code PreToolUse hooks):
+Contract (Claude Code PreToolUse payload forwarded by the dispatcher):
   stdin  — JSON with ``tool_name`` and ``tool_input`` (``command`` key).
   exit 0 — allow the call.
   exit 2 — block the call; stderr is fed back to the agent.

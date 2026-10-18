@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+"""Dispatch plugin-level PreToolUse policy by trusted agent identity.
+
+Claude Code includes ``agent_type`` in hook payloads for subagents and
+sessions selected with ``--agent``. Plugin agents use the scoped spelling
+``raptor-agents:<frontmatter-name>``. This dispatcher is the sole plugin hook:
+it verifies that identity, then invokes RAPTOR's existing focused hook script
+with an argv list and the original JSON payload on stdin.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Final
+
+_PLUGIN_PREFIX: Final = "raptor-agents:"
+_MAX_PAYLOAD_BYTES: Final = 1024 * 1024
+_MATCHED_TOOLS: Final = frozenset({"WebFetch", "Bash", "Write", "Edit"})
+
+_KNOWN_RAPTOR_AGENTS: Final = frozenset(
+    {
+        "raptor-agents:audit-reviewer",
+        "raptor-agents:coverage-analyzer",
+        "raptor-agents:crash-analysis-agent",
+        "raptor-agents:crash-analysis-checker",
+        "raptor-agents:crash-analyzer",
+        "raptor-agents:crash-report-fetcher",
+        "raptor-agents:exploitability-validator-agent",
+        "raptor-agents:function-trace-generator",
+        "raptor-agents:offsec-specialist",
+        "raptor-agents:oss-evidence-verifier-agent",
+        "raptor-agents:oss-hypothesis-checker-agent",
+        "raptor-agents:oss-hypothesis-former-agent",
+        "raptor-agents:oss-investigator-gh-archive-agent",
+        "raptor-agents:oss-investigator-github-agent",
+        "raptor-agents:oss-investigator-ioc-extractor-agent",
+        "raptor-agents:oss-investigator-local-git-agent",
+        "raptor-agents:oss-investigator-wayback-agent",
+        "raptor-agents:oss-report-generator-agent",
+    }
+)
+
+# agent_type -> tool_name -> (existing hook script, argv)
+_POLICIES: Final = {
+    "raptor-agents:crash-report-fetcher": {
+        "WebFetch": (
+            "webfetch-domain-allowlist.py",
+            (
+                "--anchor-file",
+                "{raptor_dir}/.claude/run/"
+                "crash-report-fetcher-{session}.anchor",
+            ),
+        ),
+        "Write": ("write-path-allowlist.py", ("bug-report.json",)),
+        "Edit": ("write-path-allowlist.py", ("bug-report.json",)),
+    },
+    "raptor-agents:oss-investigator-github-agent": {
+        "WebFetch": (
+            "webfetch-domain-allowlist.py",
+            ("github.com", "api.github.com", "raw.githubusercontent.com"),
+        ),
+        "Bash": ("bash-command-allowlist.py", ("curl", "python3")),
+    },
+    "raptor-agents:oss-investigator-wayback-agent": {
+        "WebFetch": (
+            "webfetch-domain-allowlist.py",
+            ("web.archive.org", "archive.org"),
+        ),
+        "Bash": ("bash-command-allowlist.py", ("curl", "python3")),
+    },
+    "raptor-agents:oss-investigator-gh-archive-agent": {
+        "Bash": (
+            "bash-command-allowlist.py",
+            (
+                "libexec/raptor-bq-query",
+                "python3 .claude/skills/oss-forensics/"
+                "github-evidence-kit/scripts/ingest_bq_events.py",
+            ),
+        ),
+    },
+    "raptor-agents:oss-investigator-ioc-extractor-agent": {
+        "WebFetch": (
+            "webfetch-domain-allowlist.py",
+            (
+                "--anchor-file",
+                "{raptor_dir}/.claude/run/oss-ioc-extractor.anchor",
+            ),
+        ),
+    },
+}
+
+
+def _safe(value: object, *, limit: int = 300) -> str:
+    """Bound and escape payload-derived text before stderr display."""
+    text = value if isinstance(value, str) else repr(value)
+    rendered = "".join(
+        char
+        if 0x20 <= ord(char) < 0x7F
+        else f"\\x{ord(char):02x}"
+        for char in text
+    )
+    if len(rendered) > limit:
+        rendered = rendered[:limit] + "...<elided>"
+    return rendered
+
+
+def _deny(message: str) -> int:
+    sys.stderr.write(f"raptor-agent-hook-dispatch: {message}\n")
+    return 2
+
+
+def _valid_identity(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and value == value.strip()
+        and len(value) <= 256
+        and value.isprintable()
+    )
+
+
+def _read_payload() -> tuple[dict[str, object] | None, bytes, str | None]:
+    raw = sys.stdin.buffer.read(_MAX_PAYLOAD_BYTES + 1)
+    if len(raw) > _MAX_PAYLOAD_BYTES:
+        return None, raw, "hook payload exceeds the 1 MiB limit"
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, raw, "hook payload is not valid UTF-8 JSON"
+    if not isinstance(payload, dict):
+        return None, raw, "hook payload must be a JSON object"
+    return payload, raw, None
+
+
+def _trusted_raptor_root() -> tuple[Path | None, str | None]:
+    raw_root = os.environ.get("RAPTOR_DIR", "")
+    raw_project = os.environ.get("CLAUDE_PROJECT_DIR", "")
+    if not raw_root or not raw_project:
+        return None, (
+            "RAPTOR_DIR and CLAUDE_PROJECT_DIR are required; "
+            "launch plugin agents through bin/raptor"
+        )
+    try:
+        root = Path(raw_root).resolve(strict=True)
+        project = Path(raw_project).resolve(strict=True)
+    except OSError:
+        return None, "RAPTOR_DIR or CLAUDE_PROJECT_DIR is not resolvable"
+    if root != project:
+        return None, "RAPTOR_DIR does not match CLAUDE_PROJECT_DIR"
+    if not (root / "bin" / "raptor").is_file() or not (root / "core").is_dir():
+        return None, "RAPTOR_DIR does not identify a RAPTOR checkout"
+    return root, None
+
+
+def _run_policy(
+    *,
+    root: Path,
+    script_name: str,
+    args: tuple[str, ...],
+    raw_payload: bytes,
+) -> int:
+    hooks_dir = (root / ".claude" / "hooks").resolve()
+    script = (hooks_dir / script_name).resolve()
+    if script.parent != hooks_dir or not script.is_file():
+        return _deny(f"trusted hook script is unavailable: {_safe(script_name)}")
+
+    expanded_args = tuple(
+        value.replace("{raptor_dir}", str(root)) for value in args
+    )
+    try:
+        process = subprocess.run(
+            [sys.executable, str(script), *expanded_args],
+            input=raw_payload,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=8,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return _deny(f"trusted hook execution failed: {_safe(str(exc))}")
+    if process.returncode == 0:
+        return 0
+    reason = process.stderr or process.stdout
+    rendered = _safe(reason.decode("utf-8", "replace"))
+    if process.returncode != 2:
+        rendered = (
+            f"trusted hook exited {process.returncode}; "
+            f"{rendered or 'no diagnostic'}"
+        )
+    return _deny(rendered or "trusted hook denied the tool call")
+
+
+def main() -> int:
+    payload, raw_payload, error = _read_payload()
+    if error is not None or payload is None:
+        return _deny(error or "invalid hook payload")
+    if payload.get("hook_event_name") != "PreToolUse":
+        return _deny("unexpected hook event; expected PreToolUse")
+
+    agent_type = payload.get("agent_type")
+    agent_id = payload.get("agent_id")
+    if agent_type is None:
+        if agent_id is None:
+            # Main session with no selected custom agent. Plugin hooks merge
+            # globally, so this is intentionally outside agent policy.
+            return 0
+        return _deny("agent_id is present but agent_type is missing")
+    if not _valid_identity(agent_type):
+        return _deny("agent_type is missing or invalid")
+    if agent_id is not None and not _valid_identity(agent_id):
+        return _deny("agent_id is present but invalid")
+
+    if not agent_type.startswith(_PLUGIN_PREFIX):
+        # Built-in agents and agents from other plugins are unrelated.
+        return 0
+    if agent_type not in _KNOWN_RAPTOR_AGENTS:
+        return _deny(f"unknown RAPTOR agent identity {_safe(agent_type)!r}")
+
+    policy = _POLICIES.get(agent_type)
+    if policy is None:
+        # Known RAPTOR agents without sensitive-tool restrictions retain
+        # their declared tool surface unchanged.
+        return 0
+
+    tool_name = payload.get("tool_name")
+    if not isinstance(tool_name, str) or tool_name not in _MATCHED_TOOLS:
+        return _deny(f"missing or unexpected tool_name {_safe(tool_name)!r}")
+    rule = policy.get(tool_name)
+    if rule is None:
+        return 0
+
+    root, root_error = _trusted_raptor_root()
+    if root_error is not None or root is None:
+        return _deny(root_error or "cannot resolve trusted RAPTOR root")
+    script_name, args = rule
+    return _run_policy(
+        root=root,
+        script_name=script_name,
+        args=args,
+        raw_payload=raw_payload,
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
