@@ -3,10 +3,22 @@
 from __future__ import annotations
 
 import os
+import json
 
 import pytest
 
-from core.run.safe_io import safe_run_mkdir, UnsafeRunDirError
+from core.run.safe_io import (
+    ARTIFACT_REFERENCE_MAX_BYTES,
+    ARTIFACT_REFERENCE_MAX_COUNT,
+    ARTIFACT_REFERENCES_MAX_BYTES,
+    PRIVATE_TEXT_MAX_BYTES,
+    UnsafeRunDirError,
+    bound_artifact_references_in_record,
+    bounded_artifact_reference_fields,
+    safe_run_mkdir,
+    write_private_json,
+    write_private_text,
+)
 
 
 # ── Fresh-create behaviour ───────────────────────────────────────────────
@@ -175,3 +187,100 @@ def test_hostile_umask_still_yields_0o700():
             assert _stat.S_IMODE(os.lstat(d).st_mode) == 0o700
         finally:
             os.umask(old_umask)
+
+
+def test_private_json_is_mode_0600_and_refuses_symlink(tmp_path):
+    artifact = tmp_path / "receipt.json"
+    write_private_json(artifact, {"status": "failed"})
+    assert artifact.stat().st_mode & 0o777 == 0o600
+    assert json.loads(artifact.read_text(encoding="utf-8")) == {
+        "status": "failed",
+    }
+
+    target = tmp_path / "target.json"
+    target.write_text('{"untouched": true}\n', encoding="utf-8")
+    artifact.unlink()
+    artifact.symlink_to(target)
+    with pytest.raises(OSError):
+        write_private_json(artifact, {"status": "overwritten"})
+    assert target.read_text(encoding="utf-8") == '{"untouched": true}\n'
+
+
+def test_private_text_is_bounded_mode_0600_and_refuses_symlink(tmp_path):
+    artifact = tmp_path / "stderr.log"
+    write_private_text(artifact, "bounded diagnostic\n")
+    assert artifact.stat().st_mode & 0o777 == 0o600
+    assert artifact.read_text(encoding="utf-8") == "bounded diagnostic\n"
+
+    with pytest.raises(ValueError, match="byte budget"):
+        write_private_text(
+            artifact,
+            "x" * (PRIVATE_TEXT_MAX_BYTES + 1),
+        )
+    assert artifact.read_text(encoding="utf-8") == "bounded diagnostic\n"
+
+    target = tmp_path / "target.log"
+    target.write_text("untouched\n", encoding="utf-8")
+    artifact.unlink()
+    artifact.symlink_to(target)
+    with pytest.raises(OSError):
+        write_private_text(artifact, "overwritten\n")
+    assert target.read_text(encoding="utf-8") == "untouched\n"
+
+
+def test_artifact_references_are_sanitized_and_bounded():
+    secret = "glpat-AbCdEfGhIjKlMnOpQrStUvWx"
+    hostile = (
+        "out/\x1b]0;title\x07/\u202e/"
+        + secret
+        + "/"
+        + "x" * (ARTIFACT_REFERENCE_MAX_BYTES * 2)
+    )
+    fields = bounded_artifact_reference_fields(
+        [f"{hostile}-{index}" for index in range(
+            ARTIFACT_REFERENCE_MAX_COUNT + 10
+        )]
+    )
+    refs = fields["artifacts"]
+
+    assert len(refs) <= ARTIFACT_REFERENCE_MAX_COUNT
+    assert sum(
+        len(ref.encode("utf-8")) + (1 if index else 0)
+        for index, ref in enumerate(refs)
+    ) <= ARTIFACT_REFERENCES_MAX_BYTES
+    assert all(
+        len(ref.encode("utf-8")) <= ARTIFACT_REFERENCE_MAX_BYTES
+        for ref in refs
+    )
+    assert all("\x1b" not in ref and "\x07" not in ref for ref in refs)
+    assert all("\u202e" not in ref for ref in refs)
+    assert all(secret not in ref for ref in refs)
+    assert all("[REDACTED]" in ref for ref in refs)
+    assert fields["artifact"] == refs[0]
+    assert fields["artifact_references_truncated"] is True
+    assert fields["artifact_references_omitted"] > 0
+
+
+def test_nested_artifact_arrays_rebounded_and_prior_omissions_preserved():
+    record = {
+        "status": "completed",
+        "artifacts": ["top\x1b.sarif"],
+        "languages": {
+            "python": {
+                "artifacts": [
+                    f"nested-{index}-\u202e"
+                    for index in range(ARTIFACT_REFERENCE_MAX_COUNT + 4)
+                ],
+                "artifact_references_omitted": 3,
+            },
+        },
+    }
+
+    bounded = bound_artifact_references_in_record(record)
+
+    assert bounded["artifacts"] == ["top\\x1b.sarif"]
+    python = bounded["languages"]["python"]
+    assert len(python["artifacts"]) <= ARTIFACT_REFERENCE_MAX_COUNT
+    assert all("\u202e" not in ref for ref in python["artifacts"])
+    assert python["artifact_references_truncated"] is True
+    assert python["artifact_references_omitted"] >= 7
