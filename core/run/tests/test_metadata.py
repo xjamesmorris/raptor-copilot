@@ -1662,6 +1662,49 @@ class TestSessionIdentityStamp(unittest.TestCase):
             meta = load_json(out / RUN_METADATA_FILE)
             self.assertEqual(meta["session_id"], sid)
 
+    def test_start_run_records_copilot_session_id_without_claude_fallback(self):
+        import os
+        from unittest import mock
+
+        from core.run.metadata import RUN_METADATA_FILE, start_run
+        copilot_sid = "bbbbbbbb-1111-2222-3333-444444444444"
+        stale_claude_sid = "aaaaaaaa-1111-2222-3333-444444444444"
+        with TemporaryDirectory() as d, \
+                mock.patch("core.run.metadata._get_session_pid",
+                           return_value=os.getpid()), \
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "RAPTOR_FRONTEND": "copilot",
+                        "COPILOT_AGENT_SESSION_ID": copilot_sid,
+                        "CLAUDE_CODE_SESSION_ID": stale_claude_sid,
+                    },
+                ):
+            out = Path(d) / "run"
+            start_run(out, "scan")
+            meta = load_json(out / RUN_METADATA_FILE)
+            self.assertEqual(meta["session_id"], copilot_sid)
+
+    def test_start_run_ignores_malformed_copilot_session_id(self):
+        import os
+        from unittest import mock
+
+        from core.run.metadata import RUN_METADATA_FILE, start_run
+        with TemporaryDirectory() as d, \
+                mock.patch("core.run.metadata._get_session_pid",
+                           return_value=os.getpid()), \
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "RAPTOR_FRONTEND": "copilot",
+                        "COPILOT_AGENT_SESSION_ID": "hostile\nsession",
+                    },
+                ):
+            out = Path(d) / "run"
+            start_run(out, "scan")
+            meta = load_json(out / RUN_METADATA_FILE)
+            self.assertNotIn("session_id", meta)
+
     def test_start_run_ignores_malformed_session_id(self):
         import os
         from unittest import mock

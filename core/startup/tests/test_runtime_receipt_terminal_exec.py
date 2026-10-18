@@ -57,8 +57,11 @@ from core.testing.runtime_receipt_terminal import (
     make_owned_fake_terminal_capability,
 )
 
+# Reviewed metadata change: `_harness_session_id` now selects only the
+# frontend-specific, shape-validated session key. The stamp remains
+# owner-end evidence only and grants no receipt or run authority.
 _ACCEPTED_W1J_METADATA_SHA256 = (
-    "798068c724ac33fde467826747902e297ee7cf01fd5275b178e64c314ce79423"
+    "88a39a33316c2ffe2e2ac943af4bb6ec4e25de7f63dcd8ec64c44de2f3ccbada"
 )
 
 

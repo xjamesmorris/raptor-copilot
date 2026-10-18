@@ -22,6 +22,7 @@ from core.project import sessions
 from core.run import metadata as run_metadata
 from core.run.metadata import (
     RUN_METADATA_FILE,
+    STATUS_CANCELLED,
     STATUS_RUNNING,
     STATUS_COMPLETED,
     STATUS_FAILED,
@@ -355,6 +356,224 @@ class TestToolFailureFiltering(unittest.TestCase):
                 )
 
 
+class TestCopilotLifecycleEventAdapter(unittest.TestCase):
+    """Observed Copilot hook payloads normalize without widening trust."""
+
+    def test_exact_live_session_end_fields_are_canonicalized(self):
+        sid = "22222222-2222-4222-8222-222222222222"
+        payload = _hook_mod._read_hook_payload(
+            io.StringIO(
+                json.dumps(
+                    {
+                        "cwd": "/workspace/raptor",
+                        "sessionId": sid,
+                        "reason": "user_exit",
+                        "timestamp": 946782245678,
+                    }
+                )
+            ),
+            copilot=True,
+            event="session-end",
+        )
+
+        self.assertEqual(
+            payload,
+            {
+                "session_id": sid,
+                "reason": "user_exit",
+            },
+        )
+        self.assertEqual(
+            _hook_mod._session_end_payload(payload),
+            (sid, "user_exit"),
+        )
+
+    def test_pascalcase_command_hook_snake_fields_are_canonicalized(self):
+        sid = "22222222-2222-4222-8222-222222222222"
+        payload = _hook_mod._read_hook_payload(
+            io.StringIO(
+                json.dumps(
+                    {
+                        "hook_event_name": "SessionEnd",
+                        "session_id": sid,
+                        "timestamp": "2000-01-02T03:04:05.678Z",
+                        "cwd": "/workspace/raptor",
+                        "reason": "user_exit",
+                    }
+                )
+            ),
+            copilot=True,
+            event="session-end",
+        )
+
+        self.assertEqual(
+            payload,
+            {
+                "hook_event_name": "SessionEnd",
+                "session_id": sid,
+                "reason": "user_exit",
+            },
+        )
+        self.assertEqual(
+            _hook_mod._session_end_payload(payload),
+            (sid, "user_exit"),
+        )
+
+    def test_tool_failure_fields_are_canonicalized(self):
+        command = "libexec/raptor-run-lifecycle start scan"
+        payload = _hook_mod._read_hook_payload(
+            io.StringIO(
+                json.dumps(
+                    {
+                        "hookEventName": "postToolUseFailure",
+                        "toolName": "shell",
+                        "toolArgs": {"command": command},
+                    }
+                )
+            ),
+            copilot=True,
+            event="tool-failure",
+        )
+
+        self.assertEqual(payload["tool_name"], "Bash")
+        self.assertEqual(payload["tool_input"], {"command": command})
+        self.assertEqual(_hook_mod._tool_failure_command(payload), command)
+
+    def test_mixed_aliases_duplicate_keys_and_wrong_kind_fail_closed(self):
+        cases = (
+            json.dumps(
+                {
+                    "hookEventName": "sessionEnd",
+                    "sessionId": "aaaaaaaa-1111-2222-3333-444444444444",
+                    "session_id": "bbbbbbbb-1111-2222-3333-444444444444",
+                }
+            ),
+            (
+                '{"hookEventName":"sessionEnd",'
+                '"sessionId":"aaaaaaaa-1111-2222-3333-444444444444",'
+                '"sessionId":"bbbbbbbb-1111-2222-3333-444444444444"}'
+            ),
+            json.dumps(
+                {
+                    "hookEventName": "postToolUse",
+                    "sessionId": "aaaaaaaa-1111-2222-3333-444444444444",
+                }
+            ),
+            json.dumps(
+                {
+                    "hookEventName": "sessionEnd",
+                    "sessionId": "aaaaaaaa-1111-2222-3333-444444444444",
+                    "reason": {"hostile": True},
+                }
+            ),
+            json.dumps(
+                {
+                    "hook_event_name": "sessionEnd",
+                    "session_id": "aaaaaaaa-1111-2222-3333-444444444444",
+                }
+            ),
+            "[]",
+            "{not json",
+        )
+        for raw in cases:
+            with self.subTest(raw=raw[:80]):
+                self.assertIsNone(
+                    _hook_mod._read_hook_payload(
+                        io.StringIO(raw),
+                        copilot=True,
+                        event="session-end",
+                    )
+                )
+
+    def test_oversized_and_hostile_identifier_payloads_have_no_owner_proof(self):
+        oversized = json.dumps(
+            {
+                "hookEventName": "sessionEnd",
+                "padding": "x" * _hook_mod._MAX_HOOK_EVENT_BYTES,
+            }
+        )
+        self.assertIsNone(
+            _hook_mod._read_hook_payload(
+                io.StringIO(oversized),
+                copilot=True,
+                event="session-end",
+            )
+        )
+
+        payload = _hook_mod._read_hook_payload(
+            io.StringIO(
+                json.dumps(
+                    {
+                        "hookEventName": "sessionEnd",
+                        "sessionId": "owner\nforged",
+                    }
+                )
+            ),
+            copilot=True,
+            event="session-end",
+        )
+        self.assertIsNotNone(payload)
+        self.assertEqual(_hook_mod._session_end_payload(payload), (None, None))
+
+    def test_missing_or_malformed_reason_has_no_owner_proof(self):
+        sid = "aaaaaaaa-1111-2222-3333-444444444444"
+        missing = _hook_mod._read_hook_payload(
+            io.StringIO(
+                json.dumps(
+                    {
+                        "cwd": "/repo",
+                        "reason": "user_exit",
+                        "timestamp": 946782245678,
+                    }
+                )
+            ),
+            copilot=True,
+            event="session-end",
+        )
+        self.assertEqual(_hook_mod._session_end_payload(missing), (None, "user_exit"))
+
+        malformed = _hook_mod._read_hook_payload(
+            io.StringIO(
+                json.dumps(
+                    {
+                        "sessionId": sid,
+                        "reason": "exit\nforged",
+                    }
+                )
+            ),
+            copilot=True,
+            event="session-end",
+        )
+        self.assertIsNotNone(malformed)
+        self.assertEqual(_hook_mod._session_end_payload(malformed), (None, None))
+
+    def test_copilot_project_binding_requires_exact_pin_witness(self):
+        run = Path("/owned/project/run")
+        meta = {"project": "project-a"}
+        cases = (
+            ((None, "absent"), (True, "project-a", "argv"), False),
+            (("project-b", "bound"), (True, "project-b", "argv"), False),
+            (("project-a", "bound"), (False, None, None), False),
+            (("project-a", "bound"), (True, "project-b", "argv"), False),
+            (("project-a", "bound"), (True, "project-a", "argv"), True),
+        )
+        for binding, witness, expected in cases:
+            with self.subTest(binding=binding, witness=witness):
+                with patch(
+                    "core.project.sessions.ledger_pin_witness",
+                    return_value=witness,
+                ):
+                    self.assertIs(
+                        _hook_mod._copilot_run_matches_binding(
+                            run,
+                            meta,
+                            SESSION_PID,
+                            binding,
+                        ),
+                        expected,
+                    )
+
+
 class TestStopHook(unittest.TestCase):
     """Stop mode: complete or fail single-call runs with dead tool_pid."""
 
@@ -589,6 +808,318 @@ class TestSessionEndHook(unittest.TestCase):
                 _hook_mod.main()
             self.assertEqual(_status(run), STATUS_RUNNING)
 
+    def test_copilot_session_end_finalizes_only_matching_ledger_orphan(self):
+        sid = "22222222-2222-4222-8222-222222222222"
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            owned = _make_running_run(
+                repo / "project-a",
+                "owned-orphan",
+                "understand",
+            )
+            unledgered = _make_running_run(
+                repo / "project-a",
+                "unledgered-run",
+                "understand",
+            )
+            other_project = _make_running_run(
+                repo / "project-b",
+                "foreign-project",
+                "understand",
+            )
+            foreign = _make_running_run(
+                repo / "project-a",
+                "foreign-session",
+                "understand",
+                session_pid=88888,
+            )
+            failed = _make_running_run(
+                repo / "project-a",
+                "already-failed",
+                "understand",
+            )
+            completed = _make_running_run(
+                repo / "project-a",
+                "already-completed",
+                "understand",
+            )
+            cancelled = _make_running_run(
+                repo / "project-a",
+                "already-cancelled",
+                "understand",
+            )
+            project_by_run = {
+                owned: "project-a",
+                unledgered: "project-a",
+                other_project: "project-b",
+                foreign: "project-a",
+                failed: "project-a",
+                completed: "project-a",
+                cancelled: "project-a",
+            }
+            for run, project in project_by_run.items():
+                meta = load_json(run / RUN_METADATA_FILE)
+                meta["session_id"] = sid
+                meta["project"] = project
+                meta["project_source"] = "argv"
+                save_json(run / RUN_METADATA_FILE, meta)
+            failed_meta = load_json(failed / RUN_METADATA_FILE)
+            failed_meta["status"] = STATUS_FAILED
+            save_json(failed / RUN_METADATA_FILE, failed_meta)
+            completed_meta = load_json(completed / RUN_METADATA_FILE)
+            completed_meta["status"] = STATUS_COMPLETED
+            save_json(completed / RUN_METADATA_FILE, completed_meta)
+            cancelled_meta = load_json(cancelled / RUN_METADATA_FILE)
+            cancelled_meta["status"] = STATUS_CANCELLED
+            save_json(cancelled / RUN_METADATA_FILE, cancelled_meta)
+
+            claim = SessionHostClaim(
+                frontend=Frontend.COPILOT,
+                uid=os.geteuid(),
+                executable=repo / "copilot",
+                executable_device=10,
+                executable_inode=20,
+            )
+            ledger = [
+                {"run_dir": str(owned)},
+                {"run_dir": str(other_project)},
+                {"run_dir": str(foreign)},
+                {"run_dir": str(failed)},
+                {"run_dir": str(completed)},
+                {"run_dir": str(cancelled)},
+            ]
+            payload = json.dumps(
+                {
+                    "cwd": str(repo),
+                    "sessionId": sid,
+                    "reason": "user_exit",
+                    "timestamp": 946782245678,
+                }
+            )
+            before_failed = (failed / RUN_METADATA_FILE).read_bytes()
+            before_completed = (completed / RUN_METADATA_FILE).read_bytes()
+            before_cancelled = (cancelled / RUN_METADATA_FILE).read_bytes()
+
+            def pin_witness(run_dir, *, pid):
+                self.assertEqual(pid, SESSION_PID)
+                project = project_by_run.get(Path(run_dir))
+                if project is None:
+                    return False, None, None
+                return True, project, "argv"
+
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", repo),
+                patch("core.run.metadata._get_session_pid",
+                      return_value=SESSION_PID),
+                patch("core.run.metadata._session_alive_for_meta",
+                      return_value=True),
+                patch("core.project.sessions.session_host_claim",
+                      return_value=claim),
+                patch("core.project.sessions.session_binding",
+                      return_value=("project-a", "bound")),
+                patch("core.project.sessions.ledger_runs",
+                      return_value=ledger),
+                patch("core.project.sessions.ledger_pin_witness",
+                      side_effect=pin_witness),
+                patch("core.config.RaptorConfig.get_out_dir",
+                      return_value=repo),
+                _stdin(payload),
+            ):
+                sys.argv = ["hook", "session-end"]
+                _hook_mod.main()
+                first = (owned / RUN_METADATA_FILE).read_bytes()
+                first_meta = load_json(owned / RUN_METADATA_FILE)
+                self.assertEqual(first_meta["status"], STATUS_FAILED)
+                self.assertIn("end_timestamp", first_meta)
+                self.assertGreaterEqual(first_meta["duration_seconds"], 0)
+                self.assertIs(
+                    first_meta["extra"]["session_end_cleanup"],
+                    True,
+                )
+                self.assertEqual(
+                    first_meta["extra"]["session_end_reason"],
+                    "user_exit",
+                )
+                self.assertNotIn("abandon_sweep", first_meta["extra"])
+
+                # A duplicate SessionEnd is a no-op: no timing or status
+                # rewrite after the first exact terminal transition.
+                sys.stdin.seek(0)
+                _hook_mod.main()
+                self.assertEqual(
+                    (owned / RUN_METADATA_FILE).read_bytes(),
+                    first,
+                )
+
+            from core.run.metadata import complete_run
+
+            complete_run(owned)
+            self.assertEqual((owned / RUN_METADATA_FILE).read_bytes(), first)
+            self.assertEqual(_status(owned), STATUS_FAILED)
+            self.assertEqual(_status(unledgered), STATUS_RUNNING)
+            self.assertEqual(_status(other_project), STATUS_RUNNING)
+            self.assertEqual(_status(foreign), STATUS_RUNNING)
+            self.assertEqual(_status(failed), STATUS_FAILED)
+            self.assertEqual(_status(completed), STATUS_COMPLETED)
+            self.assertEqual(_status(cancelled), STATUS_CANCELLED)
+            self.assertEqual(
+                (failed / RUN_METADATA_FILE).read_bytes(),
+                before_failed,
+            )
+            self.assertEqual(
+                (completed / RUN_METADATA_FILE).read_bytes(),
+                before_completed,
+            )
+            self.assertEqual(
+                (cancelled / RUN_METADATA_FILE).read_bytes(),
+                before_cancelled,
+            )
+
+    def test_copilot_resume_reason_preserves_live_matching_orphan(self):
+        sid = "aaaaaaaa-1111-2222-3333-444444444444"
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            run = _make_running_run(
+                repo / "project-a",
+                "resume-orphan",
+                "understand",
+            )
+            meta = load_json(run / RUN_METADATA_FILE)
+            meta["session_id"] = sid
+            meta["session_start"] = "same-start"
+            meta["session_boot_id"] = "same-boot"
+            meta["project"] = "project-a"
+            meta["project_source"] = "argv"
+            save_json(run / RUN_METADATA_FILE, meta)
+            claim = SessionHostClaim(
+                frontend=Frontend.COPILOT,
+                uid=os.geteuid(),
+                executable=repo / "copilot",
+                executable_device=10,
+                executable_inode=20,
+            )
+            with (
+                patch.object(_hook_mod, "REPO_ROOT", repo),
+                patch("core.run.metadata._get_session_pid",
+                      return_value=SESSION_PID),
+                patch("core.run.metadata._metadata_owned_by_session",
+                      return_value=True),
+                patch("core.run.metadata._session_alive_for_meta",
+                      return_value=True),
+                patch("core.project.sessions.session_host_claim",
+                      return_value=claim),
+                patch("core.project.sessions.session_binding",
+                      return_value=("project-a", "bound")),
+                patch(
+                    "core.project.sessions.ledger_runs",
+                    return_value=[{"run_dir": str(run)}],
+                ),
+                patch(
+                    "core.project.sessions.ledger_pin_witness",
+                    return_value=(True, "project-a", "argv"),
+                ),
+                patch("core.config.RaptorConfig.get_out_dir",
+                      return_value=repo),
+                _stdin(
+                    json.dumps(
+                        {
+                            "hookEventName": "sessionEnd",
+                            "sessionId": sid,
+                            "reason": "resume",
+                        }
+                    )
+                ),
+            ):
+                sys.argv = ["hook", "session-end"]
+                _hook_mod.main()
+
+            self.assertEqual(_status(run), STATUS_RUNNING)
+
+    def test_copilot_missing_mixed_or_malformed_event_keeps_live_orphan(self):
+        sid = "aaaaaaaa-1111-2222-3333-444444444444"
+        payloads = (
+            {
+                "cwd": "/repo",
+                "reason": "user_exit",
+                "timestamp": 946782245678,
+            },
+            {
+                "sessionId": sid,
+                "session_id": sid,
+                "reason": "user_exit",
+            },
+            {
+                "sessionId": sid,
+                "reason": "user_exit\nforged",
+            },
+        )
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            run = _make_running_run(
+                repo / "project-a",
+                "malformed-event-orphan",
+                "understand",
+            )
+            meta = load_json(run / RUN_METADATA_FILE)
+            meta.update(
+                {
+                    "session_id": sid,
+                    "session_start": "same-start",
+                    "session_boot_id": "same-boot",
+                    "project": "project-a",
+                    "project_source": "argv",
+                }
+            )
+            save_json(run / RUN_METADATA_FILE, meta)
+            claim = SessionHostClaim(
+                frontend=Frontend.COPILOT,
+                uid=os.geteuid(),
+                executable=repo / "copilot",
+                executable_device=10,
+                executable_inode=20,
+            )
+            for payload in payloads:
+                with self.subTest(payload=payload):
+                    with (
+                        patch.object(_hook_mod, "REPO_ROOT", repo),
+                        patch(
+                            "core.run.metadata._get_session_pid",
+                            return_value=SESSION_PID,
+                        ),
+                        patch(
+                            "core.run.metadata._metadata_owned_by_session",
+                            return_value=True,
+                        ),
+                        patch(
+                            "core.run.metadata._session_alive_for_meta",
+                            return_value=True,
+                        ),
+                        patch(
+                            "core.project.sessions.session_host_claim",
+                            return_value=claim,
+                        ),
+                        patch(
+                            "core.project.sessions.session_binding",
+                            return_value=("project-a", "bound"),
+                        ),
+                        patch(
+                            "core.project.sessions.ledger_runs",
+                            return_value=[{"run_dir": str(run)}],
+                        ),
+                        patch(
+                            "core.project.sessions.ledger_pin_witness",
+                            return_value=(True, "project-a", "argv"),
+                        ),
+                        patch(
+                            "core.config.RaptorConfig.get_out_dir",
+                            return_value=repo,
+                        ),
+                        _stdin(json.dumps(payload)),
+                    ):
+                        sys.argv = ["hook", "session-end"]
+                        _hook_mod.main()
+                self.assertEqual(_status(run), STATUS_RUNNING)
+
     def test_stale_same_pid_host_record_cannot_finalize_run(self):
         """PID equality alone cannot let a recycled/mutated host act."""
         from core.project import sessions
@@ -643,6 +1174,12 @@ class TestSessionEndHook(unittest.TestCase):
                     }
                 )
                 save_json(run / RUN_METADATA_FILE, meta)
+                sessions.ledger_record_start(
+                    run,
+                    pid=SESSION_PID,
+                    pin_project=None,
+                    record_pin=True,
+                )
                 with (
                     patch.object(_hook_mod, "REPO_ROOT", repo),
                     patch(
@@ -667,8 +1204,8 @@ class TestSessionEndHook(unittest.TestCase):
                     _stdin(
                         json.dumps(
                             {
-                                "session_id": session_id,
-                                "hook_event_name": "SessionEnd",
+                                "sessionId": session_id,
+                                "hookEventName": "sessionEnd",
                             }
                         )
                     ),
@@ -721,6 +1258,12 @@ class TestSessionEndHook(unittest.TestCase):
                     encoding="utf-8",
                 )
                 run = _make_running_run(repo / "out", "scan-legacy", "scan", tool_pid=1)
+                sessions.ledger_record_start(
+                    run,
+                    pid=SESSION_PID,
+                    pin_project=None,
+                    record_pin=True,
+                )
                 with (
                     patch.object(_hook_mod, "REPO_ROOT", repo),
                     patch(
@@ -1110,7 +1653,7 @@ def test_t24_terminal_wrapper_race_rechecks_reserved_marker(
 def test_t24_lifecycle_scripts_remain_byte_identical() -> None:
     shim = REPO_ROOT / "libexec" / "raptor-run-lifecycle"
     assert hashlib.sha256(HOOK_SCRIPT.read_bytes()).hexdigest() == (
-        "229f6fe1d9a957c528f92ea5497411cc94cd096d6d164c3e8aa4806a7b158853"
+        "cdaa1d49dbef47982046fd4716b5b6537643bec4dbd6275120d5dee76b48fe6d"
     )
     assert hashlib.sha256(shim.read_bytes()).hexdigest() == (
         "7ef2d63e1fd8f218ef6c462b725058f89909181618b5ca6d7cf0c0b8ac9c42d9"
@@ -1389,7 +1932,8 @@ class TestSessionEndLivenessProof(unittest.TestCase):
                                         "hook_event_name": "SessionEnd"}))
                 self.assertEqual(_status(run), STATUS_FAILED)
                 meta = load_json(run / RUN_METADATA_FILE)
-                self.assertIs(meta["extra"]["abandon_sweep"], True)
+                self.assertIs(meta["extra"]["session_end_cleanup"], True)
+                self.assertNotIn("abandon_sweep", meta["extra"])
                 self.assertIsNone(stub.poll())  # owner never signalled
             finally:
                 self._reap_stub(stub)
