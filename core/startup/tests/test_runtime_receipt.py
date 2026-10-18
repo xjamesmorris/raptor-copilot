@@ -2159,6 +2159,14 @@ _BRIDGE_IMPORT_ALLOWLIST = {
                 "from-module",
             ),
             (
+                "process_read_event",
+                "core.project.sessions",
+                "<module>",
+                "",
+                False,
+                "from-module",
+            ),
+            (
                 "_owner_target",
                 "core.run.metadata",
                 "RUN_METADATA_FILE",
@@ -2247,6 +2255,7 @@ _TRACK_READ_SESSION_ATTRIBUTES = frozenset(
         ("_owner_target", "ENV_SESSION_TOKEN"),
         ("_owner_target", "ledger_runs"),
         ("_owner_target", "resolve_session_owner"),
+        ("process_read_event", "resolve_session_owner"),
     }
 )
 

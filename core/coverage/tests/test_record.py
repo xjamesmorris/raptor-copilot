@@ -551,6 +551,15 @@ class TestWriteAndLoad(unittest.TestCase):
             self.assertEqual(path.name, "coverage-semgrep.json")
             self.assertTrue(path.exists())
 
+    def test_read_record_is_owner_only(self):
+        with TemporaryDirectory() as d:
+            path = write_record(
+                Path(d),
+                {"tool": "read", "files_examined": ["/owned/a.py"]},
+                tool_name="read",
+            )
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
     def test_load_records_multiple(self):
         with TemporaryDirectory() as d:
             write_record(Path(d), {"tool": "semgrep"}, tool_name="semgrep")

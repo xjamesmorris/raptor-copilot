@@ -12,7 +12,7 @@ Tracks what each tool examined during analysis. Answers: "what code has been che
 
 Three layers:
 
-1. **Collection** — the coverage plugin hook (`plugins/coverage/`) appends file paths to `.reads-manifest` on every Read tool call. Per-tool records (`coverage-<tool>.json`) are written by scanners and the run lifecycle.
+1. **Collection** — the coverage plugin hook (`plugins/coverage/`) normalizes Claude `Read` and Copilot `view` events, then appends supported in-target source realpaths to `.reads-manifest`. Per-tool records (`coverage-<tool>.json`) are written by scanners and the run lifecycle.
 2. **Store** — `CoverageStore` (`core/coverage/store.py`) persists a unified `coverage.json` keyed by (file, line-interval, tool). Survives across runs. Updated at run completion via importers.
 3. **Reporting** — `render_coverage()` and `coverage_view()` join store state with per-run execution detail.
 

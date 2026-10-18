@@ -46,6 +46,8 @@ from core.startup.runtime_receipt.verify import parse_receipt, serialize_receipt
 from core.testing.host_events import (
     FixtureEvidenceLevel,
     copilot_candidate_read_event,
+    copilot_live_read_payload,
+    copilot_read_event,
 )
 from core.testing.runtime_receipt_fake import (
     RuntimeReceiptRunEnvironment as _ReceiptEnvironment,
@@ -100,6 +102,42 @@ def _owned_claude(tmp_path: Path, *, strong: bool):
         claim = (
             build_session_host_claim(Frontend.CLAUDE, executable) if strong else None
         )
+        recorded = sessions.record_session(
+            sessions.NONE_SENTINEL,
+            pid=process.pid,
+            token=token,
+            host_claim=claim,
+        )
+        assert recorded == process.pid
+        yield process, executable, token, claim
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGTERM)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+
+
+@contextlib.contextmanager
+def _owned_copilot(tmp_path: Path):
+    source = shutil.which("sleep")
+    assert source is not None, "sleep is required for owned process fixtures"
+    executable = tmp_path / "copilot-bin" / "copilot"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(Path(source).read_bytes())
+    executable.chmod(0o700)
+    process = subprocess.Popen(
+        [str(executable), "60"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        _wait_for_process(process.pid)
+        token = sessions.mint_token()
+        claim = build_session_host_claim(Frontend.COPILOT, executable)
         recorded = sessions.record_session(
             sessions.NONE_SENTINEL,
             pid=process.pid,
@@ -378,6 +416,55 @@ def test_e01_e19_owned_claude_appends_exact_realpath(
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
+def test_live_copilot_owner_selects_profile_and_appends_exact_realpath(
+    tmp_path,
+    isolated_registry,
+):
+    home, _sessions_dir = isolated_registry
+    with _owned_copilot(tmp_path) as (
+        process,
+        _executable,
+        token,
+        _claim,
+    ):
+        target = tmp_path / "target"
+        target.mkdir()
+        source = target / "main.py"
+        source.write_text("value = 1\n", encoding="utf-8")
+        run = _write_run(
+            tmp_path,
+            pid=process.pid,
+            name="copilot-live",
+            target=str(target),
+        )
+
+        resolver = sessions.resolve_session_owner
+        with patch.object(
+            sessions,
+            "resolve_session_owner",
+            wraps=resolver,
+        ) as resolve_owner:
+            result = _process_with_env(
+                copilot_live_read_payload(str(source)),
+                _owner_env(home, process.pid, token),
+            )
+
+    assert resolve_owner.call_count == 1
+    assert result.parse_disposition is HostEventParseDisposition.PARSED
+    assert result.effect_disposition is HostEventEffectDisposition.APPLIED
+    assert result.event is not None
+    assert result.event.profile is HostEventProfileId.COPILOT_HOOK_V1
+    assert result.event.payload_session_id == (
+        "11111111-1111-4111-8111-111111111111"
+    )
+    assert result.recorded_path == source.resolve()
+    assert result.route == "session_owner_strong"
+    assert (run / track_read.MANIFEST_NAME).read_text(encoding="utf-8") == (
+        f"{source.resolve()}\n"
+    )
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
 def test_e15_e29_payload_paths_cannot_redirect_attribution(
     tmp_path,
     isolated_registry,
@@ -648,6 +735,31 @@ def test_c2_non_claude_owner_disables_effects(monkeypatch):
 
     assert result.disposition is (HostEventEffectDisposition.EFFECTS_DISABLED)
     assert result.reason_code == "profile_mismatch"
+
+
+def test_c2_live_copilot_profile_accepts_strong_owner(monkeypatch):
+    monkeypatch.setattr(
+        sessions,
+        "resolve_session_owner",
+        lambda: SessionOwner(
+            pid=9001,
+            frontend=Frontend.COPILOT,
+            host_verified=True,
+        ),
+    )
+    monkeypatch.setattr(sessions, "ledger_runs", lambda **_kwargs: [])
+
+    result = track_read.resolve_read_target(
+        environ={
+            sessions.ENV_SESSION_PID: "9001",
+            sessions.ENV_SESSION_TOKEN: "aa" * 16,
+        },
+        profile=HostEventProfileId.COPILOT_HOOK_V1,
+    )
+
+    assert result.disposition is HostEventEffectDisposition.NO_CANDIDATE
+    assert result.reason_code == "no_candidate"
+    assert result.route == "session_owner_strong"
 
 
 def test_n4_no_credentials_uses_labelled_legacy_global_route(
@@ -1946,13 +2058,13 @@ def test_t4_duplicate_ledger_record_remains_one_candidate(
     )
 
 
-def test_e03_alias_does_not_create_file_path_argument():
-    """The candidate-unverified fixture keeps native candidate argument keys."""
+def test_e03_alias_preserves_raw_args_and_creates_canonical_input():
+    """The adapter preserves native evidence while sharing one read contract."""
     from core.run.host_events import normalize_host_event, HostEventKind
 
     parsed = normalize_host_event(
-        _candidate_read_payload("/owned/a.py"),
-        profile=HostEventProfileId.COPILOT_1_0_84_4_HOOK_CANDIDATE,
+        copilot_read_event("/owned/a.py").to_bytes(),
+        profile=HostEventProfileId.COPILOT_HOOK_V1,
         registration_kind=HostEventKind.TOOL_SUCCESS,
     )
     assert parsed.event is not None
@@ -1962,9 +2074,11 @@ def test_e03_alias_does_not_create_file_path_argument():
         track_read.ReadArgumentContract("Read", "file_path"),
     )
 
-    assert observed.disposition is HostEventParseDisposition.INVALID
-    assert observed.observation is None
+    assert observed.disposition is HostEventParseDisposition.PARSED
+    assert observed.observation is not None
+    assert observed.observation.reported_path == "/owned/a.py"
     assert "file_path" not in (parsed.event.tool_args or {})
+    assert parsed.event.tool_input == {"file_path": "/owned/a.py"}
 
 
 def test_e04_missing_or_bad_read_arguments_have_no_observation():
@@ -2005,7 +2119,7 @@ def test_t5_process_read_event_invalid_early_return(
     def forbidden(*_args, **_kwargs):
         raise AssertionError("invalid input reached owner resolution")
 
-    monkeypatch.setattr(track_read, "resolve_read_target", forbidden)
+    monkeypatch.setattr(track_read, "_owner_target", forbidden)
     result = track_read.process_read_event(payload)
 
     assert result.parse_disposition is HostEventParseDisposition.INVALID

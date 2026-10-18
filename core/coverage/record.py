@@ -840,7 +840,9 @@ def write_record(run_dir: Path, record: dict[str, Any],
     """
     filename = f"coverage-{tool_name}.json" if tool_name else COVERAGE_RECORD_FILE
     path = Path(run_dir) / filename
-    save_json(path, record)
+    # Read coverage contains exact source paths gathered from an interactive
+    # session. Keep it owner-only like the manifest that feeds it.
+    save_json(path, record, mode=0o600 if tool_name == "read" else None)
     return path
 
 

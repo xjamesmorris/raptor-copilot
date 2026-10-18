@@ -1,8 +1,9 @@
 """Shared coverage ingestion for host read-tool events.
 
 The production hook and tests use this one implementation. Host-event parsing
-does not grant authority: a read is recorded only for a verified current
-Claude owner and the sole eligible running run in that owner's ledger.
+does not grant authority: a read is recorded only for a current owner whose
+verified frontend selects the fixed event profile and the sole eligible
+running run in that owner's ledger.
 
 The no-credential ``.active`` lookup remains solely as the pre-series Claude
 compatibility route. Reserved launch-evidence markers are ineligible both at
@@ -31,6 +32,7 @@ _MAX_STDIN_BYTES = 1 * 1024 * 1024
 _MAX_METADATA_BYTES = 1 * 1024 * 1024
 _MAX_PROJECT_BYTES = 1 * 1024 * 1024
 _MAX_REPORTED_PATH = 16 * 1024
+_UNRESOLVED_OWNER = object()
 
 _SOURCE_EXTENSIONS = frozenset(
     {
@@ -97,7 +99,7 @@ _SOURCE_EXTENSIONS = frozenset(
 
 @dataclass(frozen=True)
 class ReadArgumentContract:
-    """Native argument key for a canonical read tool."""
+    """Canonical argument key for a canonical read tool."""
 
     canonical_tool_name: str
     path_key: str
@@ -168,6 +170,10 @@ _DIAGNOSTICS = MappingProxyType(
             ("bad_success", "hook event success value is invalid"),
             ("bad_tool_args", "hook event tool arguments are invalid"),
             ("bad_tool_name", "hook event tool name is invalid"),
+            (
+                "ambiguous_field_alias",
+                "hook event mixes incompatible field aliases",
+            ),
             ("budget", "hook event exceeds the byte budget"),
             ("core_import_failed", "coverage hook core import failed"),
             ("depth", "hook event nesting exceeds the parser limit"),
@@ -193,6 +199,8 @@ _DIAGNOSTICS = MappingProxyType(
                 "registration_mismatch",
                 ("hook event does not match the fixed registration"),
             ),
+            ("missing_session_id", "hook event session identity is missing"),
+            ("missing_tool_name", "hook event tool name is missing"),
             ("unsupported_kind", "hook event registration kind is unsupported"),
             ("unsupported_profile", "hook event profile is unsupported"),
             ("unsupported_tool", "hook event tool is unsupported"),
@@ -210,17 +218,10 @@ def _diag(code: str, **values: int) -> None:
     sys.stdout.flush()
 
 
-def _read_argument_contract(profile: Any) -> ReadArgumentContract:
-    from core.run.host_events import HostEventProfileId
-
-    if profile is HostEventProfileId.CLAUDE_LEGACY_V1:
-        return ReadArgumentContract(
-            canonical_tool_name="Read",
-            path_key="file_path",
-        )
+def _read_argument_contract() -> ReadArgumentContract:
     return ReadArgumentContract(
         canonical_tool_name="Read",
-        path_key="path",
+        path_key="file_path",
     )
 
 
@@ -228,34 +229,31 @@ def extract_read_observation(
     event: Any,
     contract: ReadArgumentContract,
 ) -> ReadObservationResult:
-    """Extract one host-native read argument without renaming any key."""
+    """Extract one read from the normalized cross-frontend contract."""
     from core.run.host_events import HostEventParseDisposition, _diag as detail
 
-    if (
-        event.raw_tool_name is not None
-        and event.canonical_tool_name != contract.canonical_tool_name
-    ):
+    if event.canonical_tool_name != contract.canonical_tool_name:
         return ReadObservationResult(
             disposition=HostEventParseDisposition.UNSUPPORTED,
             observation=None,
             reason_code="unsupported_tool",
             detail=detail("unsupported_tool"),
         )
-    if event.tool_args is None:
+    if event.tool_input is None:
         return ReadObservationResult(
             disposition=HostEventParseDisposition.INVALID,
             observation=None,
             reason_code="missing_tool_args",
             detail=detail("missing_tool_args"),
         )
-    if contract.path_key not in event.tool_args:
+    if contract.path_key not in event.tool_input:
         return ReadObservationResult(
             disposition=HostEventParseDisposition.INVALID,
             observation=None,
             reason_code="missing_file_path",
             detail=detail("missing_file_path"),
         )
-    reported_path = event.tool_args[contract.path_key]
+    reported_path = event.tool_input[contract.path_key]
     if (
         not isinstance(reported_path, str)
         or not reported_path
@@ -377,15 +375,30 @@ def _target_from_metadata(
 
 def _owner_target(
     environ: Mapping[str, str],
+    profile: Any,
+    *,
+    owner: Any = _UNRESOLVED_OWNER,
 ) -> ReadTargetResult:
     from core.project import sessions
-    from core.run.host_events import HostEventEffectDisposition, _diag as detail
+    from core.run.host_events import (
+        HostEventEffectDisposition,
+        HostEventProfileId,
+        _diag as detail,
+    )
     from core.startup.host import Frontend
 
     pid_present = sessions.ENV_SESSION_PID in environ
     token_present = sessions.ENV_SESSION_TOKEN in environ
     credential_present = pid_present or token_present
     if not credential_present:
+        if profile is not HostEventProfileId.CLAUDE_LEGACY_V1:
+            return ReadTargetResult(
+                target=None,
+                disposition=HostEventEffectDisposition.EFFECTS_DISABLED,
+                reason_code="profile_mismatch",
+                detail=detail("profile_mismatch"),
+                route="legacy_global_fallback",
+            )
         global_run_dir, global_target = _find_global_run()
         if global_run_dir is None:
             return ReadTargetResult(
@@ -419,7 +432,8 @@ def _owner_target(
             route="legacy_global_fallback",
         )
 
-    owner = sessions.resolve_session_owner()
+    if owner is _UNRESOLVED_OWNER:
+        owner = sessions.resolve_session_owner()
     raw_pid = environ.get(sessions.ENV_SESSION_PID, "")
     if (
         not pid_present
@@ -452,7 +466,18 @@ def _owner_target(
             detail=detail("owner_mismatch"),
             route="session_owner",
         )
-    if owner.frontend is not Frontend.CLAUDE:
+    expected_frontend = (
+        Frontend.COPILOT
+        if profile is HostEventProfileId.COPILOT_HOOK_V1
+        else Frontend.CLAUDE
+    )
+    if (
+        owner.frontend is not expected_frontend
+        or (
+            expected_frontend is Frontend.COPILOT
+            and not owner.host_verified
+        )
+    ):
         return ReadTargetResult(
             target=None,
             disposition=HostEventEffectDisposition.EFFECTS_DISABLED,
@@ -555,9 +580,20 @@ def _owner_target(
 def resolve_read_target(
     *,
     environ: Mapping[str, str] | None = None,
+    profile: Any | None = None,
 ) -> ReadTargetResult:
     """Resolve the sole eligible run without consulting event-supplied paths."""
-    return _owner_target(os.environ if environ is None else environ)
+    from core.run.host_events import HostEventProfileId
+
+    selected = (
+        HostEventProfileId.CLAUDE_LEGACY_V1
+        if profile is None
+        else profile
+    )
+    return _owner_target(
+        os.environ if environ is None else environ,
+        selected,
+    )
 
 
 def _target_from_legacy_project(
@@ -781,6 +817,7 @@ def process_read_event(
     environ: Mapping[str, str] | None = None,
 ) -> ReadIngestResult:
     """Parse and, only for an enabled profile, record one read event."""
+    from core.project import sessions
     from core.run.host_events import (
         HostEventEffectDisposition,
         HostEventKind,
@@ -790,9 +827,21 @@ def process_read_event(
         _diag as detail,
         normalize_host_event,
     )
+    from core.startup.host import Frontend
 
+    owner: Any = _UNRESOLVED_OWNER
     if profile is None:
-        profile = HostEventProfileId.CLAUDE_LEGACY_V1
+        # One verified ownership snapshot selects the profile and remains the
+        # authority used for run attribution below.
+        owner = sessions.resolve_session_owner()
+        if (
+            owner is not None
+            and owner.frontend is Frontend.COPILOT
+            and owner.host_verified
+        ):
+            profile = HostEventProfileId.COPILOT_HOOK_V1
+        else:
+            profile = HostEventProfileId.CLAUDE_LEGACY_V1
     parsed = normalize_host_event(
         raw,
         profile=profile,
@@ -809,7 +858,7 @@ def process_read_event(
             detail=parsed.detail,
         )
 
-    contract = _read_argument_contract(profile)
+    contract = _read_argument_contract()
     observed = extract_read_observation(parsed.event, contract)
     if (
         observed.disposition is not HostEventParseDisposition.PARSED
@@ -832,7 +881,11 @@ def process_read_event(
             observation=observed.observation,
         )
 
-    target_result = resolve_read_target(environ=environ)
+    target_result = _owner_target(
+        os.environ if environ is None else environ,
+        profile,
+        owner=owner,
+    )
     if target_result.target is None:
         return ReadIngestResult(
             parse_disposition=HostEventParseDisposition.PARSED,
@@ -880,10 +933,7 @@ def _read_stdin_bytes() -> tuple[bytes | None, str | None]:
 
 def _run_hook() -> None:
     try:
-        from core.run.host_events import (
-            HostEventEffectDisposition,
-            HostEventProfileId,
-        )
+        from core.run.host_events import HostEventEffectDisposition
     except ImportError:
         _diag("core_import_failed")
         return
@@ -894,7 +944,6 @@ def _run_hook() -> None:
         return
     result = process_read_event(
         raw,
-        profile=HostEventProfileId.CLAUDE_LEGACY_V1,
     )
     if (
         result.effect_disposition is not HostEventEffectDisposition.APPLIED
