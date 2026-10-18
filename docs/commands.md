@@ -241,7 +241,7 @@ Deep static analysis with CodeQL dataflow validation.
 | `--max-findings <n>` | Maximum findings to process |
 | `--no-visualizations` | Skip diagram generation |
 | `--trust-repo` | Trust the repository |
-| `--phase-timeout <secs>` | Per-phase timeout in seconds |
+| `--phase-timeout <secs>` | Explicit per-phase timeout; `0` is unbounded for parent and child. If omitted, SCA keeps its own bounded 600s default. |
 | `--sandbox` / `--no-sandbox` | Enable or disable [sandbox](sandbox.md) (disable is [consent-gated](sandbox.md#disabling-the-sandbox)) |
 | `--audit` | Enable audit layer |
 | `--audit-verbose` | Verbose audit output |

@@ -65,6 +65,30 @@ _VERDICT_DISPLAY_PREFIXES = (
     "Unconfirmed", "Error", "Disproven",
 )
 
+_AGENTIC_NEGATIVE_RULINGS = {
+    "false_positive": "False Positive",
+    "mitigated": "Mitigated",
+    "test_code": "Test Code",
+    "dead_code": "Dead Code",
+    "unreachable": "Unreachable",
+}
+
+
+def _agentic_negative_ruling(finding: dict[str, Any]) -> str:
+    """Return a categorical agentic negative ruling, if present.
+
+    ``is_true_positive=False`` remains the coarse vulnerability verdict, but
+    agentic analysis also records why it was negative. Preserve that typed
+    status in reports instead of collapsing ``mitigated`` and ``test_code``
+    into an undifferentiated False Positive bucket.
+    """
+    ruling = finding.get("ruling")
+    if isinstance(ruling, dict):
+        status = ruling.get("agentic_ruling") or ruling.get("status")
+    else:
+        status = ruling
+    return _AGENTIC_NEGATIVE_RULINGS.get(str(status or "").strip().lower(), "")
+
 
 def _stage_ruling_status(finding: dict[str, Any]) -> str:
     """A validate-pipeline security ruling for the finding, or "".
@@ -136,7 +160,10 @@ def get_display_status(finding: dict[str, Any]) -> str:
         tp = _coerce_bool(finding.get("is_true_positive"))
         ex = _coerce_bool(finding.get("is_exploitable"))
         if tp is False:
-            return "False Positive"
+            # The boolean is the coarse "not a true positive" verdict;
+            # a typed agentic ruling refines that outcome instead of
+            # collapsing every negative assessment into False Positive.
+            return _agentic_negative_ruling(finding) or "False Positive"
         # is_exploitable=True beside a ruled_out/disproven ruling is a
         # contradictory shape no mechanical stage produces (prepare_F
         # derives is_exploitable FROM final_status, and the provenance

@@ -24,7 +24,7 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 from collections.abc import Callable
-from typing import NoReturn
+from typing import Any, NoReturn
 
 # Add the repo root to sys.path. resolve() first: invoked through a
 # symlink (or relatively on interpreters that don't absolutise
@@ -35,7 +35,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from core.config import RaptorConfig
 from core.json import load_json, save_json
 from core.logging import CONSOLE_LOG_LEVELS, configure_run_logging, get_logger
-from core.run.safe_io import safe_run_mkdir
+from core.run.safe_io import (
+    PRIVATE_TEXT_MAX_BYTES,
+    bound_artifact_references_in_record,
+    bounded_artifact_reference_fields,
+    safe_run_mkdir,
+    write_private_json,
+    write_private_text,
+)
 from core.sandbox import SANDBOX_ENGAGE_EXIT_CODE, SandboxSetupError, set_pdeathsig
 from core.sandbox.disable_consent import (
     export_disable_consent as _export_disable_consent,
@@ -136,6 +143,32 @@ def _accounting_console_lines(
             for label, spend in child_costs
         )
     return lines
+
+
+def _dispatch_failure_summary(orchestration: dict) -> dict[str, object]:
+    """Summarize incomplete LLM task batches for console/report warnings."""
+    batches = orchestration.get("dispatch_batches", [])
+    if not isinstance(batches, list):
+        return {"failed": 0, "not_run": 0, "details": []}
+    failed = 0
+    not_run = 0
+    details: list[str] = []
+    for batch in batches:
+        if not isinstance(batch, dict):
+            continue
+        batch_failed = int(batch.get("failed", 0) or 0)
+        batch_not_run = int(batch.get("not_run", 0) or 0)
+        failed += max(batch_failed, 0)
+        not_run += max(batch_not_run, 0)
+        if batch_failed or batch_not_run:
+            label = str(batch.get("phase") or batch.get("task") or "unknown")
+            pieces = []
+            if batch_failed:
+                pieces.append(f"{batch_failed} failed")
+            if batch_not_run:
+                pieces.append(f"{batch_not_run} not run")
+            details.append(f"{label}: {', '.join(pieces)}")
+    return {"failed": failed, "not_run": not_run, "details": details}
 
 
 def _kill_process_tree(process: "subprocess.Popen") -> None:
@@ -360,6 +393,478 @@ def _print_codeql_stderr_tail(codeql_stderr: str) -> None:
             "Pass --languages cpp,python,javascript,go (or a subset) "
             "to bypass auto-detection."
         )
+
+
+_TOOL_STATUS_VALUES = frozenset({"completed", "failed", "skipped"})
+
+
+def _bounded_tool_reason(reason: object, *, max_len: int = 300) -> str:
+    """Return a single bounded, terminal-safe diagnostic string."""
+    from core.security.redaction import redact_secrets
+
+    text = str(reason or "").strip()
+    if not text:
+        return ""
+    text = redact_secrets(text)
+    safe = sanitise_for_terminal(text, max_len=max_len)
+    if len(safe) > max_len:
+        safe = safe[:max(0, max_len - 3)] + "..."
+    return safe
+
+
+def _tool_state(
+    status: str,
+    *,
+    requested: bool,
+    reason: object = "",
+    artifacts: (
+        list[Path | str | None] | tuple[Path | str | None, ...]
+    ) = (),
+    **details: Any,
+) -> dict[str, Any]:
+    """Build the compatible per-tool execution-status contract."""
+    if status not in _TOOL_STATUS_VALUES:
+        raise ValueError(f"unsupported tool status: {status}")
+
+    state: dict[str, Any] = {
+        "status": status,
+        "enabled": bool(requested),
+        "requested": bool(requested),
+        "attempted": status in {"completed", "failed"},
+        "completed": status == "completed",
+        "failed": status == "failed",
+        "skipped": status == "skipped",
+    }
+
+    safe_reason = _bounded_tool_reason(reason)
+    if safe_reason:
+        state["reason"] = safe_reason
+        if status == "failed":
+            state["failure_reason"] = safe_reason
+        elif status == "skipped":
+            state["skip_reason"] = safe_reason
+    health = details.get("enrichment_health")
+    if isinstance(health, dict):
+        details["enrichment_health"] = bound_artifact_references_in_record(
+            health,
+        )
+    state.update(details)
+    state.update(bounded_artifact_reference_fields(artifacts))
+    return state
+
+
+def _codeql_enrichment_tool_fields(
+    codeql_metrics: dict[str, Any],
+) -> dict[str, Any]:
+    """Project additive IRIS health into the per-tool report contract.
+
+    Standard CodeQL remains ``completed`` when its own analysis succeeded.
+    Enrichment failure/degradation is nested and operator-visible instead of
+    being misreported as a scanner failure.
+    """
+    health = codeql_metrics.get("enrichment_health")
+    if not isinstance(health, dict):
+        return {}
+    health = bound_artifact_references_in_record(health) or {}
+
+    ref_fields = bounded_artifact_reference_fields(
+        health.get("artifacts", []),
+    )
+    refs = list(ref_fields["artifacts"])
+    status = str(health.get("status", ""))
+    degraded = bool(health.get("degraded"))
+    reason = ""
+    if status == "failed":
+        reason = (
+            "standard CodeQL completed; IRIS LocalFlowSource "
+            "enrichment failed"
+        )
+    elif status == "completed" and degraded:
+        reason = (
+            "standard CodeQL completed; IRIS LocalFlowSource queries "
+            "completed with install diagnostic warnings"
+        )
+
+    fields: dict[str, Any] = {
+        "enrichment_health": health,
+        "enrichment_status": status or None,
+        "enrichment_degraded": degraded,
+        "artifacts": refs,
+    }
+    if ref_fields.get("artifact_references_truncated"):
+        fields["enrichment_artifact_references_truncated"] = True
+        fields["enrichment_artifact_references_omitted"] = ref_fields[
+            "artifact_references_omitted"
+        ]
+    if refs:
+        fields["enrichment_artifact"] = refs[0]
+    if reason:
+        fields["reason"] = reason
+    return fields
+
+
+def _record_tool_failure(
+    output_dir: Path,
+    tool: str,
+    reason: object,
+    *,
+    exit_code: int | None = None,
+    timed_out: bool = False,
+) -> Path | None:
+    """Persist a bounded failure receipt and return its path."""
+    safe_reason = _bounded_tool_reason(reason)
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        failure_path = output_dir / "failure.json"
+        payload: dict[str, Any] = {
+            "tool": tool,
+            "status": "failed",
+            "reason": safe_reason or "unknown failure",
+            "timed_out": bool(timed_out),
+        }
+        if exit_code is not None:
+            payload["exit_code"] = exit_code
+        return write_private_json(failure_path, payload)
+    except (OSError, TypeError, ValueError) as exc:
+        logger.warning(
+            "failed to persist %s failure receipt in %s: %s",
+            tool,
+            sanitise_for_terminal(str(output_dir), max_len=240),
+            _bounded_tool_reason(exc),
+        )
+        return None
+
+
+def _last_diagnostic_line(stderr: str) -> str:
+    """Last non-empty diagnostic line, bounded and safe for reporting."""
+    for line in reversed((stderr or "").splitlines()):
+        if line.strip():
+            return _bounded_tool_reason(line)
+    return ""
+
+
+def _assessment_from_reports(
+    *,
+    validated_findings: int,
+    analysis: dict,
+    orchestration_result: dict | None,
+    max_findings: int | None,
+    llm_available: bool,
+) -> dict[str, Any]:
+    """Resolve assessment completeness for orchestrated and sequential runs."""
+    exact = (orchestration_result or {}).get("assessment")
+    if not isinstance(exact, dict):
+        exact = (
+            (orchestration_result or {}).get("orchestration", {})
+            .get("assessment")
+        )
+    if isinstance(exact, dict):
+        return dict(exact)
+
+    from packages.llm_analysis.orchestrator import _build_assessment_summary
+
+    requested = max(int(validated_findings or 0), 0)
+    eligible = requested
+    mode = analysis.get("mode") if isinstance(analysis, dict) else None
+    if mode == "prep_only":
+        prepared = analysis.get("results")
+        if isinstance(prepared, list):
+            try:
+                processed = max(
+                    int(analysis.get("processed", 0) or 0), 0,
+                )
+            except (TypeError, ValueError):
+                processed = 0
+            prepared_count = max(processed, len(prepared))
+            if prepared_count or requested == 0:
+                requested = prepared_count
+
+            # Match orchestrate()'s eligibility gate exactly: only an
+            # explicit canonical skipped status is mechanically
+            # ineligible. Bare prep records intentionally do not flow
+            # through derive_status(), which would classify every
+            # not-yet-analysed record as skipped.
+            from core.run.finding_status import ALL_STATUSES, is_skipped
+            mechanically_ineligible = sum(
+                1
+                for finding in prepared
+                if isinstance(finding, dict)
+                and finding.get("status") in ALL_STATUSES
+                and is_skipped(finding)
+            )
+            eligible = max(requested - mechanically_ineligible, 0)
+        selected = 0
+        analyzed = 0
+    else:
+        selected = max(int(analysis.get("processed", 0) or 0), 0)
+        analyzed = max(int(analysis.get("analyzed", 0) or 0), 0)
+        if selected == 0 and analyzed:
+            selected = analyzed
+
+    cap_source = "explicit" if max_findings is not None else "provider_default"
+    if max_findings is not None:
+        cap = max(int(max_findings), 0)
+    elif selected and selected < requested:
+        # Sequential provider-default runs only persist the resolved selected
+        # count. Recording that concrete cap is more truthful than claiming
+        # the outer process knows the child's provider configuration.
+        cap = selected
+    else:
+        cap = 0
+
+    summary = _build_assessment_summary(
+        requested=requested,
+        eligible=eligible,
+        selected=selected,
+        analyzed=analyzed,
+        cap=cap,
+        cap_source=cap_source,
+    )
+    if summary["unreviewed"] and not llm_available:
+        summary["reason"] = "autonomous analysis did not run: no LLM available"
+    elif summary["unreviewed"] and mode == "prep_only":
+        summary["reason"] = "orchestration did not complete"
+    return summary
+
+
+def _build_run_result(
+    tool_states: dict[str, dict[str, Any]],
+    assessment: dict[str, Any],
+    *,
+    extra_failures: list[str] | tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Build the aggregate result/exit contract.
+
+    Exit convention:
+
+    * 0 — aggregate output is usable. It may be ``complete`` or ``partial``;
+      at least one required scanner completed, or no tracked scanner was
+      required (for example imported-SARIF-only / OpenAnt-only mode).
+    * 1 — required scanners produced no usable output. The persisted report
+      is diagnostic evidence, not a successful partial scan.
+    * 2 — remains reserved by ``main`` for CLI/configuration misuse before an
+      aggregate report is produced.
+    """
+    display_names = {
+        "semgrep": "Semgrep",
+        "codeql": "CodeQL",
+        "sca": "SCA",
+    }
+    requested_scanners = [
+        name for name, state in tool_states.items()
+        if state.get("requested")
+    ]
+    required_scanners = [
+        name for name in requested_scanners
+        if tool_states[name].get("required_for_success", True)
+    ]
+    usable_scanners = [
+        name for name in requested_scanners
+        if tool_states[name].get("completed")
+    ]
+    failed_scanners = [
+        name for name in requested_scanners
+        if tool_states[name].get("failed")
+    ]
+    skipped_scanners = [
+        name for name in requested_scanners
+        if tool_states[name].get("skipped")
+    ]
+    not_requested = [
+        name for name, state in tool_states.items()
+        if not state.get("requested")
+    ]
+    all_requested_failed = (
+        bool(required_scanners)
+        and all(tool_states[name].get("failed") for name in required_scanners)
+    )
+    no_usable_scanner_output = (
+        bool(required_scanners)
+        and not any(
+            tool_states[name].get("completed")
+            for name in required_scanners
+        )
+    )
+
+    reasons: list[str] = []
+    for name, state in tool_states.items():
+        if state.get("failed"):
+            reason = state.get("failure_reason") or state.get("reason")
+            suffix = f": {reason}" if reason else ""
+            reasons.append(f"{display_names.get(name, name)} failed{suffix}")
+        elif state.get("requested") and state.get("skipped"):
+            reason = state.get("skip_reason") or state.get("reason")
+            suffix = f": {reason}" if reason else ""
+            reasons.append(f"{display_names.get(name, name)} skipped{suffix}")
+
+    unreviewed = int(assessment.get("unreviewed", 0) or 0)
+    if assessment.get("status") != "complete" and unreviewed:
+        analyzed = int(assessment.get("analyzed", 0) or 0)
+        eligible = int(assessment.get("eligible", 0) or 0)
+        reason = assessment.get("reason")
+        suffix = f" ({reason})" if reason else ""
+        reasons.append(
+            f"assessment incomplete: {analyzed} of {eligible} eligible "
+            f"findings analyzed; {unreviewed} unreviewed{suffix}"
+        )
+    elif assessment.get("status") != "complete":
+        reason = assessment.get("reason") or "assessment did not complete"
+        reasons.append(str(reason))
+
+    for reason in extra_failures:
+        safe_reason = _bounded_tool_reason(reason)
+        if safe_reason:
+            reasons.append(safe_reason)
+
+    failure_reason = None
+    if no_usable_scanner_output:
+        failure_reason = (
+            "all requested scanners failed"
+            if all_requested_failed
+            else "no requested scanner produced usable output"
+        )
+        reasons.insert(0, failure_reason)
+
+    failed = failure_reason is not None
+    partial = bool(reasons) and not failed
+    status = "failed" if failed else "partial" if partial else "complete"
+    exit_code = 1 if failed else 0
+    return {
+        "status": status,
+        "partial": partial,
+        "failed": failed,
+        "usable_output": not failed,
+        "pipeline_execution": "failed" if failed else "completed",
+        "assessment_completeness": assessment.get("status", "partial"),
+        "reasons": reasons,
+        "partial_reasons": reasons if partial else [],
+        "failure_reasons": reasons if failed else [],
+        "failure_reason": failure_reason,
+        "scanners": {
+            "requested": requested_scanners,
+            "required_for_success": required_scanners,
+            "usable": usable_scanners,
+            "failed": failed_scanners,
+            "skipped": skipped_scanners,
+            "not_requested": not_requested,
+            "all_requested_failed": all_requested_failed,
+            "no_usable_output": no_usable_scanner_output,
+        },
+        "exit_code": exit_code,
+        "exit_code_contract": (
+            "0 = usable aggregate output (complete or partial; at least one "
+            "required scanner completed, or no tracked scanner was "
+            "required). 1 = required scanners produced no usable output. "
+            "2 = CLI/configuration error before aggregate output."
+        ),
+    }
+
+
+def _result_contract_fields(
+    run_result: dict[str, Any],
+    assessment: dict[str, Any],
+) -> dict[str, Any]:
+    """Additive top-level fields for the persisted aggregate report."""
+    return {
+        "result": dict(run_result),
+        "assessment": dict(assessment),
+    }
+
+
+def _completion_partial_metadata(
+    run_result: dict[str, Any],
+    assessment: dict[str, Any],
+    tool_states: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Concise lifecycle metadata for complete versus partial output."""
+    failures = {
+        name: {
+            "reason": state.get("failure_reason") or state.get("reason"),
+            "artifact": state.get("artifact"),
+        }
+        for name, state in tool_states.items()
+        if state.get("failed")
+    }
+    return {
+        "result_status": run_result.get("status", "partial"),
+        "partial": bool(run_result.get("partial")),
+        "failed": bool(run_result.get("failed")),
+        "exit_code": int(run_result.get("exit_code", 1)),
+        "pipeline_execution": run_result.get("pipeline_execution", "failed"),
+        "usable_output": bool(run_result.get("usable_output")),
+        "reasons": list(run_result.get("reasons", [])),
+        "partial_reasons": list(run_result.get("partial_reasons", [])),
+        "failure_reasons": list(run_result.get("failure_reasons", [])),
+        "scanners": dict(run_result.get("scanners", {})),
+        "assessment": assessment,
+        "tool_failures": failures,
+    }
+
+
+def _finalize_run_lifecycle(
+    out_dir: Path,
+    run_result: dict[str, Any],
+    *,
+    extra: dict[str, Any],
+    manifest: dict[str, Any],
+) -> str:
+    """Persist completed/partial output as completed, all-failed as failed."""
+    if int(run_result.get("exit_code", 1)) == 0:
+        from core.run import complete_run
+
+        complete_run(out_dir, extra=extra, manifest=manifest)
+        return "completed"
+
+    from core.run import fail_run
+
+    fail_run(
+        out_dir,
+        run_result.get("failure_reason")
+        or "requested scanners produced no usable output",
+        extra=dict(extra),
+    )
+    return "failed"
+
+
+def _build_tool_execution_report_section(
+    tool_states: dict[str, dict[str, Any]],
+):
+    """Render per-tool completion/failure/skip truth into Markdown."""
+    from core.reporting import ReportSection
+    from core.security.prompt_output_sanitise import sanitise_string
+
+    display_names = {
+        "semgrep": "Semgrep",
+        "codeql": "CodeQL",
+        "sca": "SCA",
+    }
+
+    def _cell(value: object, cap: int = 180) -> str:
+        return sanitise_string(
+            str(value or "").strip(), max_chars=cap,
+        ).replace("|", "\\|").replace("\n", " ")
+
+    lines = [
+        "| Tool | State | Attempted | Findings | Reason | Artifact |",
+        "|---|---|---:|---:|---|---|",
+    ]
+    for name in ("semgrep", "codeql", "sca"):
+        state = tool_states.get(name) or _tool_state(
+            "skipped", requested=False, reason="not requested",
+        )
+        artifact = state.get("artifact") or ""
+        findings = state.get("findings")
+        if findings is None:
+            findings = "unknown"
+        lines.append(
+            f"| {_cell(display_names[name], 40)} "
+            f"| {_cell(str(state.get('status', 'skipped')).title(), 40)} "
+            f"| {'yes' if state.get('attempted') else 'no'} "
+            f"| {_cell(findings, 30)} "
+            f"| {_cell(state.get('reason', ''), 180)} "
+            f"| {_cell(artifact, 240)} |"
+        )
+    return ReportSection(title="Tool Execution", content="\n".join(lines))
 
 
 def _collect_child_pass_costs(prepass_result, postpass_result,
@@ -1603,20 +2108,136 @@ def _should_run_mechanical_sca(sca_agent, deep_sca_requested: bool) -> bool:
     return bool(sca_agent) and not deep_sca_requested
 
 
+def _sca_subprocess_timeout(
+    phase_timeout: int | None,
+    *,
+    explicitly_set: bool,
+) -> int | None:
+    """Resolve the SCA parent's wall timeout.
+
+    SCA keeps its historical bounded default unless the operator explicitly
+    supplied the repository-wide --phase-timeout flag. An explicit zero is
+    the unbounded sentinel and passes through unchanged.
+    """
+    if explicitly_set:
+        return phase_timeout
+    from packages.sca.agent import DEFAULT_SCA_SUBPROCESS_TIMEOUT
+    return DEFAULT_SCA_SUBPROCESS_TIMEOUT
+
+
+def _sca_required_for_success(
+    *,
+    run_semgrep: bool,
+    run_codeql: bool,
+    deep_sca_requested: bool,
+) -> bool:
+    """Whether SCA participates in the aggregate hard-failure gate."""
+    return bool(run_semgrep or run_codeql or deep_sca_requested)
+
+
+def _sandbox_worker_passthrough(args) -> list[str]:
+    """Sandbox argv forwarded to scanner workers.
+
+    ``--no-sandbox`` is the compatibility override for a wrapper-created
+    Namespace that also carries a profile value. Child parsers make the two
+    spellings mutually exclusive, so forwarding both would turn an accepted
+    parent choice into a child argparse failure.
+    """
+    passthrough: list[str] = []
+    if getattr(args, "no_sandbox", False):
+        passthrough.append("--no-sandbox")
+    elif getattr(args, "sandbox", None) is not None:
+        passthrough.extend(["--sandbox", args.sandbox])
+    if getattr(args, "audit", False):
+        passthrough.append("--audit")
+    if getattr(args, "audit_verbose", False):
+        passthrough.append("--audit-verbose")
+    if getattr(args, "sandbox_floor", None) is not None:
+        passthrough.extend(["--sandbox-floor", args.sandbox_floor])
+    return passthrough
+
+
 def _persist_redacted_sca_stderr(stderr: str, output_dir: Path) -> str:
     """Persist and return the same redacted SCA diagnostic text."""
+    from core.security.log_sanitisation import escape_nonprintable
     from core.security.redaction import redact_secrets
 
-    safe_stderr = redact_secrets(stderr)
-    retained_stderr = safe_stderr[-1024 * 1024:]
-    if len(retained_stderr) != len(safe_stderr):
+    safe_stderr = escape_nonprintable(
+        redact_secrets(stderr),
+        preserve_newlines=True,
+    )
+    encoded = safe_stderr.encode("utf-8")
+    marker = b"[earlier SCA stderr truncated]\n"
+    if len(encoded) > PRIVATE_TEXT_MAX_BYTES:
         retained_stderr = (
-            "[earlier SCA stderr truncated]\n" + retained_stderr
-        )
+            marker
+            + encoded[-(PRIVATE_TEXT_MAX_BYTES - len(marker)):]
+        ).decode("utf-8", errors="ignore")
+    else:
+        retained_stderr = safe_stderr
     stderr_path = output_dir / "stderr.log"
-    stderr_path.write_text(retained_stderr, encoding="utf-8")
-    stderr_path.chmod(0o600)
+    write_private_text(stderr_path, retained_stderr)
     return safe_stderr
+
+
+def _sca_diagnostic_tool_fields(
+    diagnostic: dict[str, Any],
+    *,
+    default_disposition: str,
+) -> dict[str, Any]:
+    """Project the private SCA receipt into bounded report metadata."""
+    disposition = str(
+        diagnostic.get("disposition") or default_disposition
+    )
+    if disposition not in {"success", "failed", "skipped", "unsupported"}:
+        disposition = default_disposition
+    fields: dict[str, Any] = {"disposition": disposition}
+    status = diagnostic.get("status")
+    if isinstance(status, str) and status in {
+        "running", "completed", "failed", "timed_out",
+        "cancelled", "interrupted", "skipped", "unsupported",
+    }:
+        fields["diagnostic_status"] = status
+    mode = diagnostic.get("mode")
+    if isinstance(mode, str) and mode in {"mechanical", "deep"}:
+        fields["analysis_mode"] = mode
+    phase = diagnostic.get("phase")
+    if isinstance(phase, dict):
+        name = phase.get("name")
+        description = phase.get("description")
+        if isinstance(name, str) and name:
+            fields["phase"] = _bounded_tool_reason(name, max_len=64)
+        if isinstance(description, str) and description:
+            fields["phase_description"] = _bounded_tool_reason(
+                description,
+                max_len=160,
+            )
+    return fields
+
+
+def _sca_failure_reason(
+    returncode: int,
+    safe_stderr: str,
+    diagnostic: dict[str, Any],
+) -> str:
+    """Build an actionable failure reason from child-owned evidence."""
+    detail = diagnostic.get("reason")
+    if not isinstance(detail, str) or not detail.strip():
+        detail = (
+            safe_stderr.strip().splitlines()[-1]
+            if safe_stderr.strip()
+            else "no stderr"
+        )
+    phase = diagnostic.get("phase")
+    if isinstance(phase, dict):
+        name = phase.get("name")
+        description = phase.get("description")
+        if isinstance(name, str) and name and name not in detail:
+            phase_text = name
+            if isinstance(description, str) and description:
+                phase_text += f" ({description})"
+            detail = f"{detail} during {phase_text}"
+    return f"exit code {returncode}: {detail}"
 
 
 def _build_completion_manifest(orch_meta, import_result, import_sarif_files,
@@ -2083,13 +2704,16 @@ Examples:
     )
     parser.add_argument(
         "--phase-timeout", type=int,
-        default=RaptorConfig.DEFAULT_TIMEOUT, metavar="SECONDS",
+        default=None, metavar="SECONDS",
         help=(
             "Per-phase wall-clock timeout in seconds for the three "
             "long-running subprocess calls (Semgrep scan, CodeQL scan, "
-            "analysis subprocess). Default: %(default)s (sourced from "
-            "RaptorConfig.DEFAULT_TIMEOUT). Set to 0 to disable the "
-            "timeout entirely — useful for kernel-scale targets where "
+            f"analysis subprocess). Default: {RaptorConfig.DEFAULT_TIMEOUT} "
+            "(sourced from RaptorConfig.DEFAULT_TIMEOUT). SCA keeps its "
+            "own 600s default unless this flag is explicitly supplied. "
+            "Set to 0 to disable parent and child timeouts entirely — "
+            "no internal SCA deadline is installed. Useful for kernel-scale "
+            "targets where "
             "source_intel spatch + LLM analysis can take hours. "
             "Operator is responsible for Ctrl-C when unbounded."
         ),
@@ -2746,6 +3370,9 @@ def main() -> int:
 
     parser = build_parser()
     args = parser.parse_args()
+    args.phase_timeout_explicit = args.phase_timeout is not None
+    if not args.phase_timeout_explicit:
+        args.phase_timeout = RaptorConfig.DEFAULT_TIMEOUT
 
     apply_cli_args(args, parser=parser)
 
@@ -2826,8 +3453,10 @@ def main() -> int:
     # (or that read ``args.phase_timeout or None``) all see the
     # operator's choice. Same pattern as raptor_codeql.py for
     # cross-command consistency.
-    if args.phase_timeout != RaptorConfig.DEFAULT_TIMEOUT:
-        RaptorConfig.DEFAULT_TIMEOUT = args.phase_timeout if args.phase_timeout > 0 else None
+    if args.phase_timeout_explicit:
+        RaptorConfig.DEFAULT_TIMEOUT = (
+            args.phase_timeout if args.phase_timeout > 0 else None
+        )
 
     # Run-level console verbosity. File audit logging remains DEBUG;
     # this only controls what the operator sees on stderr.
@@ -3529,6 +4158,30 @@ def main() -> int:
     run_semgrep = not args.codeql_only and not skip_scan and not _openant_only
     run_codeql = (args.codeql or args.codeql_only) and not args.no_codeql and not skip_scan and not _openant_only
 
+    if skip_scan:
+        semgrep_skip_reason = "replaced by imported SARIF"
+        codeql_skip_reason = "replaced by imported SARIF"
+    elif _openant_only:
+        semgrep_skip_reason = "--openant-only"
+        codeql_skip_reason = "--openant-only"
+    else:
+        semgrep_skip_reason = "--codeql-only" if args.codeql_only else "not requested"
+        if args.no_codeql:
+            codeql_skip_reason = "--no-codeql"
+        else:
+            codeql_skip_reason = "not requested"
+
+    semgrep_tool_state = _tool_state(
+        "skipped",
+        requested=run_semgrep,
+        reason=semgrep_skip_reason,
+    )
+    codeql_tool_state = _tool_state(
+        "skipped",
+        requested=run_codeql,
+        reason=codeql_skip_reason,
+    )
+
     # Defensive guard for the "no scanners enabled" case. OpenAnt
     # (--openant or --openant-only) IS an enabled scanner — the Phase
     # 1b semantic scan — so the guard fires only when truly nothing
@@ -3560,23 +4213,11 @@ def main() -> int:
     # Discovered by E2E against /tmp/vulns: the outer process logged
     # "audit engaged" but no sandbox-summary.json appeared in any
     # subprocess's run dir.
-    sandbox_passthrough = []
-    if getattr(args, "sandbox", None) is not None:
-        sandbox_passthrough.extend(["--sandbox", args.sandbox])
-    if getattr(args, "no_sandbox", False):
-        sandbox_passthrough.append("--no-sandbox")
-    if getattr(args, "audit", False):
-        sandbox_passthrough.append("--audit")
-    if getattr(args, "audit_verbose", False):
-        sandbox_passthrough.append("--audit-verbose")
-    # Worker-inherit invariant for the per-run floor consent: the
-    # flag rides the worker COMMAND LINE (never an env var — targets
-    # can then neither observe nor influence sandbox policy; the
-    # project setting is re-read by each worker's own run-pin
-    # bootstrap, and the legacy env var already has its
-    # SAFE_ENV_ALLOWLIST + TARGET_ENV_STRIP_SET entries).
-    if getattr(args, "sandbox_floor", None) is not None:
-        sandbox_passthrough.extend(["--sandbox-floor", args.sandbox_floor])
+    # Worker-inherit invariant for profile/audit/floor choices. The
+    # per-run floor rides the worker command line (never a target-visible
+    # env var); explicit sandbox disable consent rides separately as a
+    # backed nonce in each child's safe environment.
+    sandbox_passthrough = _sandbox_worker_passthrough(args)
 
     if run_semgrep:
         print("\n[*] Running Semgrep analysis...")
@@ -3784,6 +4425,22 @@ def main() -> int:
                 )
             except Exception as e:  # noqa: BLE001
                 logger.warning("failed to write semgrep timeout marker: %s", e)
+            semgrep_failure = _record_tool_failure(
+                out_dir / "scan",
+                "semgrep",
+                f"timed out after {args.phase_timeout}s",
+                timed_out=True,
+            )
+            semgrep_tool_state = _tool_state(
+                "failed",
+                requested=True,
+                reason=f"timed out after {args.phase_timeout}s",
+                artifacts=[
+                    semgrep_failure,
+                    out_dir / ".semgrep_timeout",
+                ],
+                timed_out=True,
+            )
             if not run_codeql:
                 _fail_run_and_exit(
                     out_dir,
@@ -3837,8 +4494,60 @@ def main() -> int:
             else:
                 semgrep_sarifs = list(actual_scan_dir.glob("semgrep_*.sarif"))
                 all_sarif_files.extend(semgrep_sarifs)
+            semgrep_artifacts: list[Path] = []
+            if scan_metrics_file.exists():
+                semgrep_artifacts.append(scan_metrics_file)
+            semgrep_result_artifacts: list[Path] = []
+            if sarif_file.exists():
+                semgrep_artifacts.append(sarif_file)
+                semgrep_result_artifacts.append(sarif_file)
+            else:
+                semgrep_artifacts.extend(semgrep_sarifs)
+                semgrep_result_artifacts.extend(semgrep_sarifs)
+            if semgrep_result_artifacts:
+                semgrep_tool_state = _tool_state(
+                    "completed",
+                    requested=True,
+                    artifacts=semgrep_artifacts,
+                )
+            else:
+                reason = (
+                    f"exit code {rc} but no Semgrep scan artifacts "
+                    "were produced"
+                )
+                semgrep_failure = _record_tool_failure(
+                    actual_scan_dir,
+                    "semgrep",
+                    reason,
+                    exit_code=rc,
+                )
+                semgrep_tool_state = _tool_state(
+                    "failed",
+                    requested=True,
+                    reason=reason,
+                    artifacts=[semgrep_failure],
+                    exit_code=rc,
+                )
+                print(
+                    "⚠️  Semgrep exited without scan artifacts — treating "
+                    "the scanner result as failed",
+                    file=sys.stderr,
+                )
         elif rc != -1:  # -1 is timeout, already reported
             print(f"✗ Semgrep scan failed (exit code {rc})", file=sys.stderr)
+            semgrep_failure = _record_tool_failure(
+                out_dir / "scan",
+                "semgrep",
+                f"exit code {rc}",
+                exit_code=rc,
+            )
+            semgrep_tool_state = _tool_state(
+                "failed",
+                requested=True,
+                reason=f"exit code {rc}",
+                artifacts=[semgrep_failure],
+                exit_code=rc,
+            )
             if not run_codeql:
                 _fail_run_and_exit(out_dir, f"Semgrep scan failed (exit code {rc})")
 
@@ -3867,6 +4576,19 @@ def main() -> int:
                 file=sys.stderr,
             )
             logger.error("CodeQL scan timed out")
+            codeql_failure = _record_tool_failure(
+                out_dir / "codeql",
+                "codeql",
+                f"timed out after {args.phase_timeout}s",
+                timed_out=True,
+            )
+            codeql_tool_state = _tool_state(
+                "failed",
+                requested=True,
+                reason=f"timed out after {args.phase_timeout}s",
+                artifacts=[codeql_failure],
+                timed_out=True,
+            )
 
         if rc == SANDBOX_ENGAGE_EXIT_CODE:
             # CodeQL subprocess reported the sandbox could not engage —
@@ -3882,6 +4604,24 @@ def main() -> int:
             )
 
         if rc != 0:
+            if rc != -1:
+                detail = _last_diagnostic_line(codeql_stderr)
+                reason = f"exit code {rc}"
+                if detail:
+                    reason += f": {detail}"
+                codeql_failure = _record_tool_failure(
+                    out_dir / "codeql",
+                    "codeql",
+                    reason,
+                    exit_code=rc,
+                )
+                codeql_tool_state = _tool_state(
+                    "failed",
+                    requested=True,
+                    reason=reason,
+                    artifacts=[codeql_failure],
+                    exit_code=rc,
+                )
             if all_sarif_files:
                 print("⚠️  CodeQL scan failed — continuing with existing findings", file=sys.stderr)
             else:
@@ -3907,7 +4647,10 @@ def main() -> int:
                     codeql_metrics = {}
 
                 total_findings = codeql_metrics.get('total_findings', 0)
-                sarif_files = codeql_metrics.get('sarif_files', [])
+                sarif_fields = bounded_artifact_reference_fields(
+                    codeql_metrics.get('sarif_files', []),
+                )
+                sarif_files = sarif_fields["artifacts"]
 
                 print("\n✓ CodeQL scan complete:")
                 print(f"  - Languages: {', '.join(codeql_metrics.get('languages_detected', {}).keys())}")
@@ -3915,6 +4658,54 @@ def main() -> int:
                 print(f"  - SARIF files: {len(sarif_files)}")
 
                 all_sarif_files.extend(Path(sarif) for sarif in sarif_files)
+                codeql_artifacts = [codeql_report]
+                codeql_artifacts.extend(
+                    Path(sarif) for sarif in sarif_files
+                )
+                enrichment_fields = _codeql_enrichment_tool_fields(
+                    codeql_metrics,
+                )
+                for artifact in enrichment_fields.pop("artifacts", []):
+                    if str(artifact) not in {
+                        str(existing) for existing in codeql_artifacts
+                    }:
+                        codeql_artifacts.append(artifact)
+                enrichment_reason = enrichment_fields.pop("reason", "")
+                codeql_tool_state = _tool_state(
+                    "completed",
+                    requested=True,
+                    reason=enrichment_reason,
+                    artifacts=codeql_artifacts,
+                    sarif_file_references_truncated=bool(
+                        sarif_fields.get("artifact_references_truncated")
+                    ),
+                    sarif_file_references_omitted=int(
+                        sarif_fields.get("artifact_references_omitted", 0)
+                    ),
+                    **enrichment_fields,
+                )
+                if enrichment_reason:
+                    print(f"  - Enrichment: {enrichment_reason}")
+            else:
+                reason = "exit code 0 but codeql_report.json was not produced"
+                codeql_failure = _record_tool_failure(
+                    codeql_out_dir,
+                    "codeql",
+                    reason,
+                    exit_code=0,
+                )
+                codeql_tool_state = _tool_state(
+                    "failed",
+                    requested=True,
+                    reason=reason,
+                    artifacts=[codeql_failure],
+                    exit_code=0,
+                )
+                print(
+                    "⚠️  CodeQL exited 0 without a report — treating the "
+                    "scanner result as failed",
+                    file=sys.stderr,
+                )
 
     # Check if we have any findings from source-code scanners.
     # SCA may still contribute findings even when Semgrep/CodeQL found nothing,
@@ -3928,11 +4719,34 @@ def main() -> int:
     sca_out = out_dir / "sca"
     try:
         from packages.sca.agent import _find_sca_agent, run_sca_subprocess
+        from packages.sca.diagnostics import (
+            diagnostic_path as _sca_diagnostic_path,
+            read_sca_diagnostic,
+        )
         sca_agent = _find_sca_agent()
     except ImportError:
         sca_agent = None
+        _sca_diagnostic_path = None
+        read_sca_diagnostic = None
 
     run_mechanical_sca = _should_run_mechanical_sca(sca_agent, args.sca)
+    sca_requested = bool(args.sca or sca_agent)
+    if args.sca:
+        sca_skip_reason = "deferred to deep SCA"
+    elif sca_agent:
+        sca_skip_reason = "pending mechanical SCA"
+    else:
+        sca_skip_reason = "SCA agent not available"
+    sca_tool_state = _tool_state(
+        "skipped",
+        requested=sca_requested,
+        reason=sca_skip_reason,
+        disposition=(
+            "skipped"
+            if args.sca or sca_agent
+            else "unsupported"
+        ),
+    )
     if sca_agent and not run_mechanical_sca:
         # Deferred: the opt-in deep SCA phase (PHASE 1b below) analyses
         # the same dependency set with LLM review + triage. Running the
@@ -3954,6 +4768,20 @@ def main() -> int:
                 original_repo_path,
                 sca_out,
                 sandbox_args=sandbox_passthrough,
+                timeout=_sca_subprocess_timeout(
+                    args.phase_timeout,
+                    explicitly_set=args.phase_timeout_explicit,
+                ),
+            )
+            sca_diagnostic = (
+                read_sca_diagnostic(sca_out)
+                if read_sca_diagnostic is not None
+                else {}
+            )
+            sca_diagnostic_file = (
+                _sca_diagnostic_path(sca_out)
+                if _sca_diagnostic_path is not None
+                else sca_out / "diagnostics.json"
             )
             safe_stderr = ""
             if sca_stderr:
@@ -3979,6 +4807,25 @@ def main() -> int:
                 # hard-failure gate downstream.
                 if sca_sarif.exists() and sca_findings_count:
                     all_sarif_files.append(sca_sarif)
+                sca_artifacts = [
+                    path for path in (
+                        sca_out / "findings.json",
+                        sca_sarif,
+                        sca_out / "report.md",
+                        sca_out / "stderr.log",
+                        sca_diagnostic_file,
+                    )
+                    if path.exists()
+                ]
+                sca_tool_state = _tool_state(
+                    "completed",
+                    requested=True,
+                    artifacts=sca_artifacts,
+                    **_sca_diagnostic_tool_fields(
+                        sca_diagnostic,
+                        default_disposition="success",
+                    ),
+                )
                 print("\n✓ SCA complete:")
                 print(f"  - Dependencies: {sca_metrics.get('deps_analysed', 0)}")
                 print(f"  - Vulnerability findings: {sca_metrics.get('vuln_findings', 0)}")
@@ -4022,17 +4869,93 @@ def main() -> int:
                 except Exception:
                     logger.debug("SAGE SCA store skipped", exc_info=True)
             else:
-                detail = (
-                    safe_stderr.strip().splitlines()[-1]
-                    if safe_stderr.strip()
-                    else "no stderr"
+                reason = _sca_failure_reason(
+                    rc,
+                    safe_stderr,
+                    sca_diagnostic,
                 )
-                logger.warning("SCA stderr: %s", detail)
+                logger.warning("SCA stderr: %s", reason)
                 logger.warning("SCA failed (rc=%d) — continuing without dep findings", rc)
+                diagnostic_fields = _sca_diagnostic_tool_fields(
+                    sca_diagnostic,
+                    default_disposition="failed",
+                )
+                sca_failure = _record_tool_failure(
+                    sca_out,
+                    "sca",
+                    reason,
+                    exit_code=rc,
+                    timed_out=(
+                        diagnostic_fields.get("diagnostic_status")
+                        == "timed_out"
+                        or "timed out" in reason.lower()
+                    ),
+                )
+                sca_artifacts = [sca_failure]
+                sca_artifacts.extend(
+                    path for path in (
+                        sca_out / "stderr.log",
+                        sca_out / "findings.json",
+                        sca_out / "findings.sarif",
+                        sca_out / "report.md",
+                        sca_diagnostic_file,
+                    )
+                    if path.exists()
+                )
+                sca_tool_state = _tool_state(
+                    "failed",
+                    requested=True,
+                    reason=reason,
+                    artifacts=sca_artifacts,
+                    exit_code=rc,
+                    timed_out=(
+                        diagnostic_fields.get("diagnostic_status")
+                        == "timed_out"
+                        or "timed out" in reason.lower()
+                    ),
+                    **diagnostic_fields,
+                )
                 sca_findings_count = 0
         except Exception as e:  # noqa: BLE001
             print(f"⚠️  SCA failed: {sanitise_for_terminal(str(e), max_len=300)}", file=sys.stderr)
             logger.warning("SCA failed — continuing without dep findings: %s", e)
+            sca_diagnostic = (
+                read_sca_diagnostic(sca_out)
+                if read_sca_diagnostic is not None
+                else {}
+            )
+            reason = f"{type(e).__name__}: {e}"
+            phase = sca_diagnostic.get("phase")
+            if isinstance(phase, dict) and phase.get("name"):
+                reason += f" during {phase['name']}"
+            diagnostic_fields = _sca_diagnostic_tool_fields(
+                sca_diagnostic,
+                default_disposition="failed",
+            )
+            sca_failure = _record_tool_failure(
+                sca_out,
+                "sca",
+                reason,
+            )
+            sca_tool_state = _tool_state(
+                "failed",
+                requested=True,
+                reason=reason,
+                artifacts=[
+                    sca_failure,
+                    *(
+                        path for path in (
+                            sca_out / "stderr.log",
+                            sca_out / "findings.json",
+                            sca_out / "findings.sarif",
+                            sca_out / "report.md",
+                            sca_out / "diagnostics.json",
+                        )
+                        if path.exists()
+                    ),
+                ],
+                **diagnostic_fields,
+            )
             sca_findings_count = 0
     else:
         sca_findings_count = 0
@@ -4423,6 +5346,8 @@ def main() -> int:
             sca_options = ScaRunOptions(
                 enable_llm_review=not args.skip_sca_review,
                 enable_triage=not args.skip_sca_triage,
+                diagnostics_path=sca_deep_out / "diagnostics.json",
+                analysis_mode="deep",
             )
             sca_result = run_sca(
                 target=original_repo_path,
@@ -4444,13 +5369,91 @@ def main() -> int:
                         sca_result.vuln_findings, sca_result.hygiene_findings,
                         sca_result.supply_chain_findings)
             sca_deep_count = sca_result.vuln_findings + sca_result.supply_chain_findings
+            sca_findings_count = sca_deep_count
             total_findings += sca_deep_count
+            scan_metrics["total_findings"] = total_findings
+            sca_tool_state = _tool_state(
+                "completed",
+                requested=True,
+                artifacts=[
+                    sca_result.findings_path,
+                    sca_result.report_path,
+                    sca_result.sarif_path,
+                    sca_result.sbom_path,
+                    sca_deep_out / "diagnostics.json",
+                ],
+                disposition="success",
+                analysis_mode="deep",
+            )
         except ImportError:
             print("⚠️  SCA package not available — skipping dependency analysis", file=sys.stderr)
             logger.warning("SCA import failed — packages/sca not installed")
+            reason = "SCA package not available"
+            sca_failure = _record_tool_failure(
+                out_dir / "sca_deep",
+                "sca",
+                reason,
+            )
+            sca_tool_state = _tool_state(
+                "skipped",
+                requested=True,
+                reason=reason,
+                artifacts=[
+                    sca_failure,
+                    *(
+                        path for path in (
+                            out_dir / "sca_deep" / "findings.json",
+                            out_dir / "sca_deep" / "findings.sarif",
+                            out_dir / "sca_deep" / "report.md",
+                            out_dir / "sca_deep" / "diagnostics.json",
+                        )
+                        if path.exists()
+                    ),
+                ],
+                disposition="unsupported",
+                analysis_mode="deep",
+            )
         except Exception as e:
             print(f"⚠️  SCA failed: {sanitise_for_terminal(str(e), max_len=300)}", file=sys.stderr)
             logger.exception("SCA phase failed: %s", e)  # noqa: TRY401
+            reason = f"{type(e).__name__}: {e}"
+            try:
+                from packages.sca.diagnostics import finalize_sca_diagnostic
+                finalize_sca_diagnostic(
+                    out_dir / "sca_deep",
+                    disposition="failed",
+                    reason=reason,
+                    mode="deep",
+                )
+            except Exception:
+                logger.debug(
+                    "failed to persist deep-SCA diagnostics",
+                    exc_info=True,
+                )
+            sca_failure = _record_tool_failure(
+                out_dir / "sca_deep",
+                "sca",
+                reason,
+            )
+            sca_tool_state = _tool_state(
+                "failed",
+                requested=True,
+                reason=reason,
+                artifacts=[
+                    sca_failure,
+                    *(
+                        path for path in (
+                            out_dir / "sca_deep" / "findings.json",
+                            out_dir / "sca_deep" / "findings.sarif",
+                            out_dir / "sca_deep" / "report.md",
+                            out_dir / "sca_deep" / "diagnostics.json",
+                        )
+                        if path.exists()
+                    ),
+                ],
+                disposition="failed",
+                analysis_mode="deep",
+            )
 
 
     # ========================================================================
@@ -4923,9 +5926,139 @@ def main() -> int:
     # ========================================================================
     workflow_duration = time.time() - workflow_start
 
+    assessment = _assessment_from_reports(
+        validated_findings=validated_findings,
+        analysis=analysis,
+        orchestration_result=orchestration_result,
+        max_findings=args.max_findings,
+        llm_available=llm_env.llm_available,
+    )
+
+    if sca_result:
+        sca_counts = {
+            "deps_analysed": sca_result.deps_analysed,
+            "vuln_findings": sca_result.vuln_findings,
+            "hygiene_findings": sca_result.hygiene_findings,
+            "supply_chain_findings": sca_result.supply_chain_findings,
+            "llm_reviews": sca_result.llm_reviews_run,
+            "triage_run": sca_result.triage_run,
+        }
+    elif sca_tool_state.get("failed"):
+        sca_counts = {
+            "deps_analysed": None,
+            "vuln_findings": None,
+            "hygiene_findings": None,
+            "supply_chain_findings": None,
+            "llm_reviews": None,
+            "triage_run": False,
+        }
+    else:
+        sca_counts = {
+            "deps_analysed": sca_metrics.get("deps_analysed", 0),
+            "vuln_findings": sca_metrics.get("vuln_findings", 0),
+            "hygiene_findings": sca_metrics.get("hygiene_findings", 0),
+            "supply_chain_findings": sca_metrics.get(
+                "supply_chain_findings", 0
+            ),
+            "llm_reviews": 0,
+            "triage_run": False,
+        }
+
+    tool_states = {
+        "semgrep": {
+            **semgrep_tool_state,
+            "findings": (
+                semgrep_metrics.get("total_findings", 0)
+                if semgrep_tool_state.get("completed")
+                else None if semgrep_tool_state.get("failed") else 0
+            ),
+        },
+        "codeql": {
+            **codeql_tool_state,
+            "findings": (
+                codeql_metrics.get("total_findings", 0)
+                if codeql_tool_state.get("completed")
+                else None if codeql_tool_state.get("failed") else 0
+            ),
+            "languages": (
+                list(codeql_metrics.get("languages_detected", {}).keys())
+                if codeql_tool_state.get("completed")
+                else None if codeql_tool_state.get("failed") else []
+            ),
+        },
+        "sca": {
+            **sca_tool_state,
+            # Always-on SCA is additive in import-only and OpenAnt-only
+            # modes. Its failure remains visible/partial but cannot be the
+            # sole reason those non-primary workflows exit 1. Explicit
+            # --sca, Semgrep, or CodeQL makes dependency analysis part of
+            # the required scanner set again.
+            "required_for_success": _sca_required_for_success(
+                run_semgrep=run_semgrep,
+                run_codeql=run_codeql,
+                deep_sca_requested=args.sca,
+            ),
+            "findings": (
+                None
+                if sca_tool_state.get("failed")
+                else (
+                    sca_counts["vuln_findings"]
+                    + sca_counts["hygiene_findings"]
+                    + sca_counts["supply_chain_findings"]
+                )
+            ),
+        },
+    }
+    extra_partial_failures = []
+    if openant_hard_error:
+        extra_partial_failures.append(
+            f"OpenAnt failed: {openant_hard_error}"
+        )
+    if taint_metrics.get("hard_error"):
+        extra_partial_failures.append(
+            f"Cross-file taint failed: {taint_metrics.get('error', 'unknown')}"
+        )
+    run_result = _build_run_result(
+        tool_states,
+        assessment,
+        extra_failures=extra_partial_failures,
+    )
+
+    scanner_failed = any(
+        tool_states[name].get("failed")
+        for name in ("semgrep", "codeql")
+    ) or bool(openant_hard_error) or bool(taint_metrics.get("hard_error"))
+    if run_result.get("failed"):
+        scan_phase_status = "failed"
+    elif skip_scan:
+        scan_phase_status = "skipped"
+    elif scanner_failed:
+        scan_phase_status = "partial"
+    else:
+        scan_phase_status = "completed"
+
     print("\n" + "=" * 70)
-    print("🎉 RAPTOR AGENTIC WORKFLOW COMPLETE")
+    print(
+        "RAPTOR AGENTIC PIPELINE EXECUTION "
+        f"{'FAILED' if run_result.get('failed') else 'COMPLETE'}"
+    )
     print("=" * 70)
+    if run_result.get("failed"):
+        print(
+            "\n✗ Result: FAILED — requested scanners produced no usable "
+            "output. Diagnostic reports were persisted."
+        )
+        for reason in run_result["failure_reasons"]:
+            print(f"   - {reason}")
+    elif run_result["partial"]:
+        print(
+            "\n⚠️  Result: PARTIAL — usable output was generated, but this "
+            "is not a clean full assessment."
+        )
+        for reason in run_result["partial_reasons"]:
+            print(f"   - {reason}")
+    else:
+        print("\nResult: COMPLETE — all eligible findings were assessed.")
 
     # Coverage nudge: /agentic reviews what the scanners flag; make the
     # size of what it DIDN'T review visible instead of implying
@@ -4947,36 +6080,34 @@ def main() -> int:
         "repository": str(original_repo_path),
         "duration_seconds": workflow_duration,
         "tools_used": {
-            "semgrep": not args.codeql_only,
-            "codeql": args.codeql or args.codeql_only,
-            "sca": bool(sca_agent and sca_metrics),
+            "semgrep": tool_states["semgrep"]["attempted"],
+            "codeql": tool_states["codeql"]["attempted"],
+            "sca": tool_states["sca"]["attempted"],
         },
         "phases": {
             "scanning": {
-                "completed": not skip_scan,
+                "status": scan_phase_status,
+                "execution_completed": True,
+                "completed": scan_phase_status == "completed",
+                "partial": scan_phase_status == "partial",
+                "failed": scan_phase_status == "failed",
                 "total_findings": scan_metrics.get('total_findings', 0),
                 "files_scanned": scan_metrics.get('total_files_scanned', 0),
                 "threat_model_candidates": threat_model_findings_count,
                 "semgrep": {
-                    "enabled": not args.codeql_only,
-                    "findings": semgrep_metrics.get('total_findings', 0) if semgrep_metrics else 0,
+                    "enabled": tool_states["semgrep"]["requested"],
+                    **tool_states["semgrep"],
                 },
                 "codeql": {
-                    "enabled": args.codeql or args.codeql_only,
-                    "findings": codeql_metrics.get('total_findings', 0) if codeql_metrics else 0,
-                    "languages": list(codeql_metrics.get('languages_detected', {}).keys()) if codeql_metrics else [],
+                    "enabled": tool_states["codeql"]["requested"],
+                    **tool_states["codeql"],
                 },
             },
             "threat_model": threat_model_phase,
             "sca": {
-                "enabled": args.sca,
-                "completed": sca_result is not None,
-                "deps_analysed": sca_result.deps_analysed if sca_result else 0,
-                "vuln_findings": sca_result.vuln_findings if sca_result else 0,
-                "hygiene_findings": sca_result.hygiene_findings if sca_result else 0,
-                "supply_chain_findings": sca_result.supply_chain_findings if sca_result else 0,
-                "llm_reviews": sca_result.llm_reviews_run if sca_result else 0,
-                "triage_run": sca_result.triage_run if sca_result else False,
+                "enabled": tool_states["sca"]["requested"],
+                **tool_states["sca"],
+                **sca_counts,
             },
             "exploitability_validation": {
                 "completed": bool(validation_result),
@@ -4986,12 +6117,16 @@ def main() -> int:
                 "noise_reduction_percent": ((total_findings - validated_findings) / total_findings * 100) if total_findings > 0 else 0,
             },
             "autonomous_analysis": {
-                "completed": bool(analysis),
+                "completed": bool(analysis)
+                and analysis.get("mode") != "prep_only",
+                "prepared": analysis.get("mode") == "prep_only",
+                "mode": analysis.get("mode"),
                 "skipped": not llm_env.llm_available,
                 "exploitable": analysis.get('exploitable', 0),
                 "exploits_generated": analysis.get('exploits_generated', 0),
                 "patches_generated": analysis.get('patches_generated', 0),
                 "dataflow_validated": analysis.get('dataflow_validated', 0) if (args.codeql or args.codeql_only) else 0,
+                "assessment": assessment,
             },
             "orchestration": orchestration_result.get("orchestration", {}) if orchestration_result else {
                 "completed": False,
@@ -5009,8 +6144,24 @@ def main() -> int:
             "threats": threat_model_phase.get("threats"),
             "threat_model_summary": str(out_dir / "threat-model-summary.json") if threat_model_phase.get("completed") else None,
             "threat_model_candidates": threat_model_phase.get("candidate_sarif"),
-            "sca_findings": str(sca_findings_path) if sca_findings_path and sca_findings_path.exists() else None,
-            "sca_report": str(out_dir / "sca" / "report.md") if sca_result else None,
+            "sca_findings": (
+                str(sca_result.findings_path)
+                if sca_result
+                else (
+                    str(sca_out / "findings.json")
+                    if (sca_out / "findings.json").exists()
+                    else None
+                )
+            ),
+            "sca_report": (
+                str(sca_result.report_path)
+                if sca_result
+                else (
+                    str(sca_out / "report.md")
+                    if (sca_out / "report.md").exists()
+                    else None
+                )
+            ),
             "validation_report": str(out_dir / "validation" / "findings.json") if validation_result else None,
             "autonomous_report": str(analysis_report) if analysis_report and analysis_report.exists() else None,
             "orchestrated_report": str(out_dir / "orchestrated_report.json") if orchestration_result else None,
@@ -5031,6 +6182,7 @@ def main() -> int:
             "enriched_sarif": None,  # populated after --sarif-out write
         }
     }
+    final_report.update(_result_contract_fields(run_result, assessment))
 
     report_file = out_dir / "raptor_agentic_report.json"
     save_json(report_file, final_report)
@@ -5174,14 +6326,44 @@ def main() -> int:
     print(f"   Total findings: {scan_metrics.get('total_findings', 0)}")
     if threat_model_findings_count:
         print(f"     Threat model candidates: {threat_model_findings_count}")
-    if semgrep_metrics:
-        print(f"     Semgrep: {semgrep_metrics.get('total_findings', 0)}")
-    if codeql_metrics:
-        print(f"     CodeQL: {codeql_metrics.get('total_findings', 0)}")
+    print("   Tool execution:")
+    for tool_name, label in (
+        ("semgrep", "Semgrep"),
+        ("codeql", "CodeQL"),
+        ("sca", "SCA"),
+    ):
+        state = tool_states[tool_name]
+        if state.get("completed"):
+            print(
+                f"     {label}: Completed "
+                f"({state.get('findings', 0)} findings)"
+            )
+        elif state.get("failed"):
+            artifact = state.get("artifact")
+            artifact_note = (
+                f"; artifact: "
+                f"{sanitise_for_terminal(str(artifact), max_len=300)}"
+                if artifact else ""
+            )
+            print(
+                f"     ⚠️  {label}: Failed (findings unknown) — "
+                f"{state.get('failure_reason', 'unknown failure')}"
+                f"{artifact_note}"
+            )
+        else:
+            print(
+                f"     {label}: Skipped — "
+                f"{state.get('skip_reason', 'not requested')}"
+            )
+    print(
+        f"   Assessment completeness: "
+        f"{str(assessment.get('status', 'partial')).title()} — "
+        f"{assessment.get('analyzed', 0)} of "
+        f"{assessment.get('eligible', 0)} eligible findings analyzed; "
+        f"{assessment.get('unreviewed', 0)} unreviewed"
+    )
     # Build findings funnel from orchestration results
     analysed_count = 0
-    true_positives = 0
-    false_positives = 0
     unverdicted = 0
     exploitable_count = 0
     inconsistent_count = 0
@@ -5202,8 +6384,6 @@ def main() -> int:
         # dispatch failure looks like a successful run.
         from core.orchestration.funnel import bucket_orchestration_results
         _buckets = bucket_orchestration_results(orchestration_result.get("results", []))
-        true_positives = _buckets["true_positives"]
-        false_positives = _buckets["false_positives"]
         unverdicted = _buckets["unverdicted"]
         exploitable_count = _buckets["exploitable"]
         inconsistent_count = _buckets["inconsistent"]
@@ -5227,15 +6407,15 @@ def main() -> int:
     sarif_out_path = getattr(args, "sarif_out", None)
     if sarif_out_path:
         from core.sarif.enriched_writer import write_enriched_sarif
-        analysed_results = (
+        sarif_results = (
             orchestration_result.get("results", [])
             if orchestration_result else []
         )
-        if analysed_results:
+        if sarif_results:
             sarif_out_resolved = Path(sarif_out_path)
             if not sarif_out_resolved.is_absolute():
                 sarif_out_resolved = out_dir / sarif_out_resolved
-            n = write_enriched_sarif(analysed_results, sarif_out_resolved)
+            n = write_enriched_sarif(sarif_results, sarif_out_resolved)
             print(f"\n✓ Enriched SARIF written: {sarif_out_resolved} ({n} findings)")
             final_report["outputs"]["enriched_sarif"] = str(sarif_out_resolved)
             save_json(report_file, final_report)
@@ -5248,15 +6428,17 @@ def main() -> int:
         if total_findings > validated_findings:
             reduction = ((total_findings - validated_findings) / total_findings) * 100
             print(f"   Duplicates removed: {reduction:.0f}%")
-    if analysed_count > 0 and analysed_count < validated_findings:
-        skipped = validated_findings - analysed_count
-        print(f"   Analysed: {analysed_count} of {validated_findings}")
-        _cap_note = (
-            f"--max-findings {args.max_findings}"
-            if args.max_findings is not None
-            else "provider default cap; pass --max-findings 0 for all, or set a higher value"
+    if assessment.get("unreviewed", 0) > 0:
+        skipped = int(assessment["unreviewed"])
+        eligible = int(assessment.get("eligible", validated_findings) or 0)
+        print(f"   Analysed: {analysed_count} of {eligible}")
+        _cap_note = assessment.get("cap_reason") or assessment.get("reason")
+        if not _cap_note:
+            _cap_note = "assessment incomplete"
+        print(
+            f"   ⚠️  {skipped} finding{'s' if skipped != 1 else ''} "
+            f"unreviewed ({_cap_note})"
         )
-        print(f"   ⚠️  {skipped} finding{'s' if skipped != 1 else ''} skipped ({_cap_note})")
     elif analysed_count > 0:
         print(f"   Analysed: {analysed_count}")
     if failed_count > 0 or blocked_count > 0:
@@ -5278,10 +6460,51 @@ def main() -> int:
                 err_snippet = (first_err[:120] + "...") if len(first_err) > 120 else first_err
                 print(f"     {model}: {info.get('count', 0)} error{'s' if info.get('count') != 1 else ''}"
                       + (f" — {err_snippet}" if err_snippet else ""))
-    if true_positives > 0 or false_positives > 0:
-        print(f"   True positives: {true_positives}")
-        if false_positives > 0:
-            print(f"   False positives: {false_positives}")
+    results = (
+        orchestration_result.get("results", [])
+        if orchestration_result else []
+    )
+    analysed_results = [
+        r for r in results
+        if isinstance(r, dict)
+        and ("is_true_positive" in r or "error" in r)
+    ]
+    from core.reporting import build_findings_summary as _build_verdict_summary
+    verdict_counts = _build_verdict_summary(analysed_results)
+    final_report["verdicts"] = verdict_counts
+    save_json(report_file, final_report)
+    if analysed_results:
+        from core.reporting.formatting import get_display_status
+        verdict_distribution: dict[str, int] = {}
+        for result in analysed_results:
+            status = get_display_status(result)
+            verdict_distribution[status] = (
+                verdict_distribution.get(status, 0) + 1
+            )
+        ordered_statuses = (
+            "Exploitable",
+            "Confirmed",
+            "Confirmed (Constrained)",
+            "Confirmed (Blocked)",
+            "False Positive",
+            "Mitigated",
+            "Test Code",
+            "Dead Code",
+            "Unreachable",
+            "Ruled Out",
+            "Unconfirmed",
+        )
+        verdict_parts = [
+            f"{verdict_distribution.pop(status)} {status}"
+            for status in ordered_statuses
+            if verdict_distribution.get(status)
+        ]
+        verdict_parts.extend(
+            f"{count} {status}"
+            for status, count in sorted(verdict_distribution.items())
+        )
+        if verdict_parts:
+            print(f"   Verdicts: {', '.join(verdict_parts)}")
     if unverdicted > 0:
         # Per-finding LLM dispatch returned empty / low-quality response
         # (q<0.5 from cc_dispatch leaves verdict fields as None). Pre-fix
@@ -5412,6 +6635,16 @@ def main() -> int:
     for line in _accounting_console_lines(cost_summary, child_costs):
         print(sanitise_for_terminal(line))
     if orchestration_result:
+        dispatch_health = _dispatch_failure_summary(
+            orchestration_result.get("orchestration", {}),
+        )
+        if dispatch_health["failed"] or dispatch_health["not_run"]:
+            details = "; ".join(dispatch_health["details"])
+            print(sanitise_for_terminal(
+                "   ⚠️  Incomplete LLM task work retained alongside "
+                f"successful results — {details}",
+                max_len=500,
+            ))
         # Fast-tier scorecard savings — surface concrete behaviour
         # of the prefilter (full ANALYSE calls skipped on findings
         # the cheap tier confidently classified as FPs and the
@@ -5434,10 +6667,6 @@ def main() -> int:
         print(f"   Exploits: {autonomous_out / 'exploits'}/")
     if patches_count > 0 and autonomous_out:
         print(f"   Patches: {autonomous_out / 'patches'}/")
-
-    # Filter to analysed results (used by both console table and report)
-    results = orchestration_result.get("results", []) if orchestration_result else []
-    analysed_results = [r for r in results if "is_true_positive" in r or "error" in r]
 
     # Results at a Glance table (matches /validate console output)
     if orchestration_result:  # noqa: SIM102
@@ -5468,15 +6697,43 @@ def main() -> int:
     # reason. Mirror that asymmetry away.
     if not args.codeql_only and semgrep_metrics:
         print("   ✓ Scanned with Semgrep")
+    elif tool_states["semgrep"].get("failed"):
+        print(
+            "   ⚠️  Semgrep failed — "
+            f"{tool_states['semgrep'].get('failure_reason', 'unknown failure')}"
+        )
     if codeql_metrics:
         print("   ✓ Scanned with CodeQL")
         if codeql_metrics.get('total_findings', 0) > 0:
             print("   ✓ Validated dataflow paths")
+    elif tool_states["codeql"].get("failed"):
+        print(
+            "   ⚠️  CodeQL failed — "
+            f"{tool_states['codeql'].get('failure_reason', 'unknown failure')}"
+        )
     if sca_metrics:
         print(f"   ✓ Analysed {sca_metrics.get('deps_analysed', 0)} dependencies (SCA)")
+    elif sca_result:
+        print(f"   ✓ Analysed {sca_result.deps_analysed} dependencies (SCA)")
+    elif tool_states["sca"].get("failed"):
+        print(
+            "   ⚠️  SCA failed — "
+            f"{tool_states['sca'].get('failure_reason', 'unknown failure')}"
+        )
     if validation_result:
         print("   ✓ Deduplicated findings")
-    print("   ✓ Analysed vulnerabilities")
+    if assessment.get("status") == "complete":
+        print(
+            f"   ✓ Assessed all {assessment.get('eligible', 0)} eligible "
+            "findings"
+        )
+    else:
+        print(
+            f"   ⚠️  Assessment partial — "
+            f"{assessment.get('analyzed', 0)} of "
+            f"{assessment.get('eligible', 0)} eligible findings analyzed; "
+            f"{assessment.get('unreviewed', 0)} unreviewed"
+        )
     if exploits_count > 0:
         print(f"   ✓ Generated {exploits_count} exploit{'s' if exploits_count != 1 else ''}")
     if patches_count > 0:
@@ -5518,9 +6775,16 @@ def main() -> int:
         via = None
 
     pipeline_parts = ["Threat Model"] if threat_model_phase.get("completed") else []
-    pipeline_parts.append("Scan")
-    if sca_metrics:
+    scan_label = {
+        "failed": "Scan (failed)",
+        "partial": "Scan (partial)",
+        "skipped": "Scan (skipped)",
+    }.get(scan_phase_status, "Scan")
+    pipeline_parts.append(scan_label)
+    if tool_states["sca"].get("completed"):
         pipeline_parts.append("SCA")
+    elif tool_states["sca"].get("failed"):
+        pipeline_parts.append("SCA (failed)")
     if validation.get("completed"):
         pipeline_parts.append("Dedup")
     if analysed_count > 0:
@@ -5534,6 +6798,15 @@ def main() -> int:
         "Target": f"`{final_report.get('repository', 'unknown')}`",
         "Date": final_report.get("timestamp", "unknown")[:10],
         "Pipeline": f"{' → '.join(pipeline_parts)} ({format_elapsed(duration)})",
+        "Execution": str(
+            run_result.get("pipeline_execution", "failed")
+        ).title(),
+        "Assessment": (
+            f"{str(assessment.get('status', 'partial')).title()} — "
+            f"{assessment.get('analyzed', 0)}/"
+            f"{assessment.get('eligible', 0)} eligible findings analyzed; "
+            f"{assessment.get('unreviewed', 0)} unreviewed"
+        ),
     }
     if via:
         metadata["Model"] = via
@@ -5545,17 +6818,38 @@ def main() -> int:
         extra_summary["Unchecked flows"] = threat_model_phase.get("unchecked_flows", 0)
     extra_summary["Total findings"] = scanning.get("total_findings", 0)
     semgrep = scanning.get("semgrep", {})
-    if semgrep.get("enabled"):
+    if semgrep.get("completed"):
         extra_summary["Semgrep"] = semgrep.get("findings", 0)
+    elif semgrep.get("failed"):
+        extra_summary["Semgrep"] = (
+            f"Failed — {semgrep.get('failure_reason', 'unknown failure')}"
+        )
     codeql = scanning.get("codeql", {})
-    if codeql.get("enabled"):
+    if codeql.get("completed"):
         extra_summary["CodeQL"] = codeql.get("findings", 0)
-    if sca_findings_count:
-        extra_summary["SCA"] = sca_findings_count
+    elif codeql.get("failed"):
+        extra_summary["CodeQL"] = (
+            f"Failed — {codeql.get('failure_reason', 'unknown failure')}"
+        )
+    if tool_states["sca"].get("completed"):
+        extra_summary["SCA"] = tool_states["sca"].get("findings", 0)
+    elif tool_states["sca"].get("failed"):
+        extra_summary["SCA"] = (
+            "Failed — "
+            f"{tool_states['sca'].get('failure_reason', 'unknown failure')}"
+        )
     if validation.get("completed"):
         extra_summary["After deduplication"] = validation.get("validated_findings", 0)
-    if analysed_count > 0:
-        extra_summary["Analysed"] = analysed_count
+    extra_summary["Assessment requested"] = assessment.get("requested", 0)
+    extra_summary["Assessment eligible"] = assessment.get("eligible", 0)
+    extra_summary["Selected for analysis"] = assessment.get("selected", 0)
+    extra_summary["Analysed"] = assessment.get("analyzed", 0)
+    extra_summary["Unreviewed"] = assessment.get("unreviewed", 0)
+    if assessment.get("cap_applied"):
+        extra_summary["Analysis cap"] = (
+            f"{assessment.get('cap')} "
+            f"({assessment.get('cap_reason', 'cap applied')})"
+        )
     if failed_count > 0:
         extra_summary["Failed"] = failed_count
     if blocked_count > 0:
@@ -5575,9 +6869,25 @@ def main() -> int:
     if aggregation:
         aggregate_model = aggregation.get("analysed_by")
         extra_summary["Aggregate synthesis"] = aggregate_model or "completed"
+    dispatch_health = _dispatch_failure_summary(orch_phase)
+    if dispatch_health["failed"] or dispatch_health["not_run"]:
+        extra_summary["Incomplete LLM task work"] = (
+            f"{dispatch_health['failed']} failed, "
+            f"{dispatch_health['not_run']} not run"
+        )
 
     # Warnings
     warnings = []
+    if run_result.get("failed"):
+        warnings.extend(
+            f"Failed result: {reason}"
+            for reason in run_result.get("failure_reasons", [])
+        )
+    elif run_result.get("partial"):
+        warnings.extend(
+            f"Partial result: {reason}"
+            for reason in run_result.get("partial_reasons", [])
+        )
     if severity_mismatches:
         warnings.append(f"{len(severity_mismatches)} high-severity finding(s) ruled as false positive — review recommended")
     if contradictions > 0:
@@ -5599,6 +6909,13 @@ def main() -> int:
             "Model-dependent defenses disabled (--accept-weakened-defenses). "
             "Envelope tags, datamarking, and base64 wrapping were not applied. "
             "Findings may be influenced by adversarial content in the target."
+        )
+    if dispatch_health["failed"] or dispatch_health["not_run"]:
+        details = "; ".join(dispatch_health["details"])
+        warnings.append(
+            "Incomplete LLM review/enrichment work was retained despite "
+            f"successful final findings: {details}. See "
+            "orchestrated_report.json::orchestration.dispatch_batches."
         )
 
     # Output files — significant outputs only, not per-category SARIF
@@ -5634,7 +6951,7 @@ def main() -> int:
         output_files.append(sarif_files[0])
     output_files.append("agentic-report.md")
 
-    extra_sections = []
+    extra_sections = [_build_tool_execution_report_section(tool_states)]
     if audit_postpass.get("enabled"):
         extra_sections.append(_build_audit_report_section(
             audit_postpass,
@@ -5677,11 +6994,10 @@ def main() -> int:
     except Exception:
         logger.debug("diagram rendering failed", exc_info=True)
 
-    # Mark run as completed
+    # Persist lifecycle state according to the aggregate exit contract.
     try:
-        from core.run import complete_run
         orch_meta = (orchestration_result or {}).get("orchestration", {})
-        complete_run(out_dir, extra={
+        lifecycle_extra = {
             "findings_count": analysed_count,
             "exploitable_count": exploitable_count,
             "duration_seconds": round(workflow_duration, 1),
@@ -5689,10 +7005,21 @@ def main() -> int:
             "analysis_models": orch_meta.get("analysis_models", []),
             "aggregate_models": orch_meta.get("aggregate_models", []),
             "aggregated": orch_meta.get("aggregated", False),
-        }, manifest=_build_completion_manifest(
-            orch_meta, import_result, import_sarif_files,
-            reanalyze_dir=getattr(args, "reanalyze", None),
-        ))
+            **_completion_partial_metadata(
+                run_result,
+                assessment,
+                tool_states,
+            ),
+        }
+        _finalize_run_lifecycle(
+            out_dir,
+            run_result,
+            extra=lifecycle_extra,
+            manifest=_build_completion_manifest(
+                orch_meta, import_result, import_sarif_files,
+                reanalyze_dir=getattr(args, "reanalyze", None),
+            ),
+        )
     except Exception as e:  # noqa: BLE001
         logger.debug("Run metadata: %s", e)  # Optional — don't fail the pipeline
 
@@ -5718,11 +7045,10 @@ def main() -> int:
         except Exception as e:  # noqa: BLE001
             logger.debug("Failed to clean temp git dir: %s", e)
 
-    # Successful end of the full pipeline: the run was marked complete
-    # above, in-band hard failures already called sys.exit(1)/return 2.
-    # ``main`` feeds ``sys.exit(main())`` — the exit code must be an
-    # explicit int, not an implicit-None fallthrough.
-    return 0
+    # Complete and usable-partial reports exit 0. An all-requested-scanners
+    # failure persists its diagnostic report + failed lifecycle and exits 1.
+    # CLI/configuration misuse remains exit 2 at the earlier guards.
+    return int(run_result.get("exit_code", 1))
 
 
 #: Cap on gap-audit finding rows inlined into the agentic report —

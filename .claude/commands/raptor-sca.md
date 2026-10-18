@@ -115,6 +115,7 @@ libexec/raptor-sca-run /path/to/project --offline
 | `report.md` | Severity-sorted markdown | humans |
 | `sbom.cdx.json` | CycloneDX 1.5 + VEX | Dependency-Track, CycloneDX CLI |
 | `coverage-sca.json` | Files examined | RAPTOR coverage layer |
+| `diagnostics.json` | Private 0600 phase/deadline/disposition receipt | timeout and cancellation triage |
 | `proposed/` (fix --out) | Rewritten manifest files | operator review then `git apply` |
 | `changes.json` / `changes.md` (fix) | Per-change record | review |
 
@@ -127,6 +128,11 @@ libexec/raptor-sca-run /path/to/project --offline
 - Reachability is **two-tier**: module-level import evidence (Python AST, npm import sweep, per-ecosystem scanners) plus function-level checks when the advisory names affected functions (`likely_called` / `not_function_reachable` verdicts). See `docs/sca.md` for the verdict table.
 - All optional dependencies (`defusedxml`, `packaging`, `tomli` on 3.10-, `PyYAML`) degrade gracefully — missing one only narrows ecosystem coverage.
 - **LLM auto-detection:** When an LLM provider is configured, `fix --allow-major` automatically analyses major-version-bump CVEs against your project's actual call sites. Safe bumps are included; breaking changes show migration guidance. Use `--no-llm` to force mechanical-only mode.
+- The always-on `/agentic` SCA subprocess is mechanical: it disables LLM review and triage. `--sca` owns the separate deep-SCA pass. The mechanical child receives an internal deadline shorter than the parent timeout, caps individual HTTP retry loops, and records its current phase in private `diagnostics.json` so a timeout is never reported as zero findings.
+- Mechanical mode is a hard invariant: the API normalizes review/triage off and lower-level contradictory options are rejected. Sub-second deadline remainder is never rounded up, and the direct agent rejects unknown options while accepting the documented shared sandbox passthrough (including `--sandbox-floor`).
+- Agentic SCA keeps its bounded 600-second subprocess default unless the operator explicitly supplies `/agentic --phase-timeout`. An explicit `--phase-timeout 0` is unbounded for both the parent wait and child deadline (the child receives no `--deadline-seconds`).
+- An accepted `/agentic --no-sandbox` / `--sandbox none` consent is explicitly propagated to the SCA worker as a backed nonce, matching Semgrep/CodeQL; arbitrary child env values cannot mint that authority. Wrapper-created `--sandbox X` + `--no-sandbox` state forwards only `--no-sandbox` (the compatibility override), never both mutually-exclusive flags.
+- The trusted direct `python -m packages.sca.agent` compatibility path is parser-only (it does not execute target builds/installers): direct `--sandbox none` remains available and direct `--no-sandbox` overrides a supplied profile. Agentic workers are provenance-marked and still re-run the shared explicit-consent gate.
 
 ## Exit codes
 

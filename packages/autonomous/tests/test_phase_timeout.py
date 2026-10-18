@@ -52,6 +52,13 @@ class PhaseTimeoutArgparseTests(unittest.TestCase):
             msg="help text should mention unbounded/kernel-scale use case",
         )
 
+    def test_help_preserves_sca_default_until_explicit_override(self):
+        proc = self._run_help()
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("SCA keeps its own", proc.stdout)
+        self.assertIn("600s default", proc.stdout)
+        self.assertIn("parent and child timeouts", proc.stdout)
+
 
 class RaptorCodeqlPhaseTimeoutTests(unittest.TestCase):
     """`/codeql --phase-timeout` parses + mutates RaptorConfig.CODEQL_TIMEOUT.

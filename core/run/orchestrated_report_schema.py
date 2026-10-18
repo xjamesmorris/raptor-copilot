@@ -162,6 +162,11 @@ _FINDING_SCHEMA = {
         "error": {"type": "string"},
         "cc_error": {"type": "string"},
         "cc_debug_file": {"type": "string"},
+        "diagnostic_artifact": {"type": "string"},
+        "artifacts": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
         "skip_reason": {"type": "string"},
     },
     "required": ["finding_id", "status"],
@@ -179,6 +184,43 @@ _ORCHESTRATION_SCHEMA = {
         "findings_analysed": {"type": "integer", "minimum": 0},
         "findings_skipped": {"type": "integer", "minimum": 0},
         "findings_total": {"type": "integer", "minimum": 0},
+        "assessment": {"$ref": "#/definitions/assessment"},
+        "dispatch_failures": {"type": "integer", "minimum": 0},
+        "dispatch_incomplete_tasks": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "dispatch_batches": {
+            "type": "array",
+            "description": (
+                "Per-task dispatch outcomes, including failed primary, "
+                "review, enrichment, and fallback batches. Successful "
+                "fallback output does not erase an earlier failed batch."
+            ),
+            "items": {
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string"},
+                    "phase": {"type": "string"},
+                    "status": {"type": "string"},
+                    "input_items": {"type": "integer", "minimum": 0},
+                    "result_records": {"type": "integer", "minimum": 0},
+                    "succeeded": {"type": "integer", "minimum": 0},
+                    "failed": {"type": "integer", "minimum": 0},
+                    "not_run": {"type": "integer", "minimum": 0},
+                    "complete": {"type": "boolean"},
+                    "error_types": {"type": "object"},
+                    "failed_by_model": {"type": "object"},
+                    "first_error": {"type": "string"},
+                    "artifact": {"type": "string"},
+                    "artifacts": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "additionalProperties": True,
+            },
+        },
 
         "cost": {
             "type": "object",
@@ -312,6 +354,7 @@ SCHEMA = {
             "items": _FINDING_SCHEMA,
         },
         "orchestration": _ORCHESTRATION_SCHEMA,
+        "assessment": {"$ref": "#/definitions/assessment"},
 
         # Aggregate counters — recomputable from ``results``, kept
         # at the top level for cheap-read summary consumers.
@@ -329,6 +372,38 @@ SCHEMA = {
         "aggregation": {"type": "object"},
     },
     "required": ["mode", "results"],
+    "definitions": {
+        "assessment": {
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "enum": ["complete", "partial"]},
+                "requested": {"type": "integer", "minimum": 0},
+                "eligible": {"type": "integer", "minimum": 0},
+                "selected": {"type": "integer", "minimum": 0},
+                "analyzed": {"type": "integer", "minimum": 0},
+                "unreviewed": {"type": "integer", "minimum": 0},
+                "unselected": {"type": "integer", "minimum": 0},
+                "analysis_failures": {"type": "integer", "minimum": 0},
+                "not_eligible": {"type": "integer", "minimum": 0},
+                "cap": {"type": "integer", "minimum": 0},
+                "cap_applied": {"type": "boolean"},
+                "cap_source": {"type": "string"},
+                "cap_reason": {"type": ["string", "null"]},
+                "reason": {"type": ["string", "null"]},
+            },
+            "required": [
+                "status",
+                "requested",
+                "eligible",
+                "selected",
+                "analyzed",
+                "unreviewed",
+                "cap",
+                "cap_applied",
+            ],
+            "additionalProperties": True,
+        },
+    },
     "additionalProperties": True,
 }
 

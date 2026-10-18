@@ -394,6 +394,52 @@ Every scan run produces:
 | `sbom.cdx.json` | CycloneDX 1.5 + VEX | SBOM consumers, Dependency-Track, etc. |
 | `sbom.spdx.json` | SPDX 2.3 | Compliance pipelines (only when `--spdx` passed) |
 | `findings.sarif` | SARIF 2.1.0 | GitHub / GitLab / IDE integrations |
+| `diagnostics.json` | Private JSON (mode `0600`) | Current/completed phase, deadline, cancellation/timeout reason, and final success/failed/skipped/unsupported disposition |
+
+When `/agentic` launches its always-on SCA subprocess, that child is
+mechanical: LLM review and triage remain gated behind the distinct deep
+`--sca` phase. The parent propagates a slightly shorter child deadline and
+the child caps each HTTP retry loop, leaving time to write
+`diagnostics.json` and exit before the parent timeout. A timeout or
+cancellation is therefore a visible failed disposition with an active phase,
+never an empty successful scan.
+
+The mode contract is enforced centrally: the public API normalizes
+`analysis_mode="mechanical"` to review/triage disabled, while direct
+`RunOptions` construction rejects contradictory mechanical-plus-LLM gates.
+Sub-second remaining deadlines are passed as sub-second transport bounds (or
+refused before dispatch when too little time remains); they are never rounded
+up beyond the declared deadline. The direct agent accepts the documented SCA
+and shared sandbox flags only, including wrapper-forwarded `--sandbox-floor`;
+unknown options fail at argparse instead of being silently dropped.
+
+Under `/agentic`, SCA retains its historical 600-second bounded subprocess
+default when `--phase-timeout` is omitted; the repository-wide default used by
+the other phases does not silently lengthen it. An explicitly supplied
+positive `--phase-timeout` overrides SCA too. Explicit
+`--phase-timeout 0` means unbounded for both the parent wait and the child:
+no internal SCA deadline is installed.
+
+When `/agentic` is already running under an accepted `--no-sandbox` or
+`--sandbox none` consent, the SCA worker receives that same backed nonce
+through a dedicated RAPTOR-worker dispatch channel. The SCA launcher cannot
+mint consent from an arbitrary environment value, and ordinary sandboxed
+children still have the nonce stripped.
+
+The direct internal `python -m packages.sca.agent` compatibility surface is
+narrower: it runs RAPTOR's data parsers and does not execute target
+build/install code, so its historical `--sandbox none` / `--no-sandbox`
+library path remains available without minting a global disable consent.
+`--no-sandbox` overrides a simultaneously supplied profile before strict
+argument parsing. Agentic workers carry a hidden provenance bit and always
+re-enter the shared consent gate; external target-execution entry points are
+unchanged.
+
+In imported-SARIF-only and `--openant-only` workflows, always-on SCA is
+additive rather than a primary scanner requirement. Its failure remains
+visible as a partial-run reason and private diagnostic, but cannot by itself
+turn otherwise usable imported/OpenAnt output into exit status 1. Explicit
+`--sca` and normal Semgrep/CodeQL runs keep SCA in the required scanner set.
 
 ### Render Flags
 

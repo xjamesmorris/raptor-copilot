@@ -64,6 +64,25 @@ class TestSchemaShape(unittest.TestCase):
         # Cost subobject required to be an object when present.
         self.assertEqual(orch["properties"]["cost"]["type"], "object")
 
+    def test_assessment_completeness_contract_is_documented(self):
+        assessment_ref = SCHEMA["properties"]["assessment"]["$ref"]
+        self.assertEqual(assessment_ref, "#/definitions/assessment")
+        assessment = SCHEMA["definitions"]["assessment"]
+        self.assertTrue({
+            "requested",
+            "eligible",
+            "selected",
+            "analyzed",
+            "unreviewed",
+            "cap",
+            "cap_applied",
+        }.issubset(assessment["required"]))
+        self.assertEqual(
+            SCHEMA["properties"]["orchestration"]["properties"]
+            ["assessment"]["$ref"],
+            assessment_ref,
+        )
+
     def test_cost_section_documents_additive_accounting_fields(self):
         cost = SCHEMA["properties"]["orchestration"]["properties"]["cost"]
         props = cost["properties"]
@@ -111,6 +130,8 @@ class TestSchemaShape(unittest.TestCase):
             "accounting",
             "accounting_complete",
             "cache_hit",
+            "diagnostic_artifact",
+            "artifacts",
         ):
             self.assertIn(name, props)
             self.assertNotIn(name, finding["required"])
@@ -124,6 +145,29 @@ class TestSchemaShape(unittest.TestCase):
         ):
             self.assertEqual(props[name]["type"], "object")
             self.assertTrue(props[name]["additionalProperties"])
+
+    def test_orchestration_documents_dispatch_batch_completeness(self):
+        props = SCHEMA["properties"]["orchestration"]["properties"]
+        self.assertIn("dispatch_batches", props)
+        self.assertIn("dispatch_failures", props)
+        self.assertIn("dispatch_incomplete_tasks", props)
+        batch = props["dispatch_batches"]["items"]
+        for name in (
+            "task",
+            "phase",
+            "status",
+            "input_items",
+            "result_records",
+            "succeeded",
+            "failed",
+            "not_run",
+            "complete",
+            "error_types",
+            "failed_by_model",
+            "first_error",
+            "artifacts",
+        ):
+            self.assertIn(name, batch["properties"])
 
     def test_completeness_descriptions_do_not_claim_invoice_authority(self):
         finding = SCHEMA["properties"]["results"]["items"]["properties"]
