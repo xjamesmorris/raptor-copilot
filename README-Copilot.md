@@ -6,12 +6,22 @@ execution layer and separate analysis-provider configuration remain unchanged.
 
 ## Quickstart
 
-Install a native Linux Copilot CLI and sign in with `copilot login`. Install
-Python dependencies with `uv sync --locked`; source scanning also needs
-Semgrep. From this checkout's root:
+Install the native Linux Copilot CLI and sign in with `copilot login`:
+
+```bash
+curl -fsSL https://gh.io/copilot-install | bash
+```
+
+Do **not** use `npm install -g @github/copilot` for RAPTOR's Copilot frontend.
+That upstream-supported package installs a JavaScript loader; RAPTOR's live
+host contract intentionally requires a directly identifiable native Linux ELF
+and will refuse the loader. Install Python dependencies with
+`uv sync --locked`; source scanning also needs Semgrep. From this checkout's
+root:
 
 ```bash
 source .venv/bin/activate
+./bin/raptor doctor --verbose
 
 # Start with this repository's Copilot defaults
 ./bin/raptor --frontend copilot

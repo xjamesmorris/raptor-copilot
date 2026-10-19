@@ -7,6 +7,50 @@ for those who prefer a batteries-included environment.
 See also: [README](README.md), [architecture](architecture.md).
 
 
+## Interactive frontends
+
+At least one interactive frontend is needed for an interactive RAPTOR session.
+Standalone commands such as `scan`, `codeql`, and `doctor` can run without
+one.
+
+| Frontend | Install |
+|----------|---------|
+| Claude Code | `curl -fsSL https://claude.ai/install.sh \| bash` |
+| GitHub Copilot CLI (Linux) | `curl -fsSL https://gh.io/copilot-install \| bash` |
+
+RAPTOR's Copilot host contract requires the native Linux executable. The
+upstream-supported `npm install -g @github/copilot` package installs a
+JavaScript loader and is therefore not launchable as RAPTOR's Copilot
+frontend. `./bin/raptor doctor --verbose` detects this case and prints the
+native-install remediation.
+
+### Fedora 44 verified baseline
+
+The following clean-room installation was verified on Fedora 44 Cloud Edition:
+
+```bash
+sudo dnf install -y \
+  git curl ca-certificates tar gzip unzip file which findutils procps-ng \
+  gcc gcc-c++ make python3-devel uv pipx
+
+uv sync --locked
+pipx install semgrep
+
+# Install either or both native frontends.
+curl -fsSL https://claude.ai/install.sh | bash
+curl -fsSL https://gh.io/copilot-install | bash
+
+source .venv/bin/activate
+./bin/raptor doctor --verbose
+```
+
+This installs only RAPTOR's core Python environment, the required Semgrep
+scanner, and native interactive frontends. CodeQL, Coccinelle, AFL++, GDB,
+Joern, radare2, rr, Frida, tree-sitter grammars, and BigQuery configuration
+remain optional capability additions; doctor reports the features reduced by
+their absence.
+
+
 ## Python
 
 Python **3.12+** is required. The sandbox layer hard-requires
@@ -19,7 +63,7 @@ the suite fails at import/setup on 3.11 and earlier.
 
 | Tool | Required | Purpose | Install |
 |------|----------|---------|---------|
-| Semgrep | Yes | Static analysis scanning | `pip install semgrep` |
+| Semgrep | Yes | Static analysis scanning | `pipx install semgrep` |
 | Coccinelle (spatch) | No | Semantic patch analysis | `apt install coccinelle` (>=1.3) |
 | CodeQL | No | Deep dataflow analysis | [codeql-cli-binaries](https://github.com/github/codeql-cli-binaries) |
 | Joern | No | CPG dataflow queries (`/audit`, tiered taint sweeps) | [joern.io](https://joern.io) — **v4.0.458 or newer** (first 2026 release; needs a JVM) |

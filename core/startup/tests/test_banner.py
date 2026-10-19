@@ -104,6 +104,7 @@ def test_doctor_retains_frontend_fact(stub_startup_checks, monkeypatch):
     monkeypatch.setenv("RAPTOR_FRONTEND_MODEL", "gpt-6-astra")
     monkeypatch.setattr(doctor, "_module_dep_warnings", lambda: [])
     monkeypatch.setattr(doctor, "_imported_annotation_advisories", lambda: [])
+    monkeypatch.setattr(doctor, "_frontend_readiness", lambda: ([], []))
     monkeypatch.setattr(
         "core.startup.aws_imds.aws_imds_advisories", lambda: [],
     )

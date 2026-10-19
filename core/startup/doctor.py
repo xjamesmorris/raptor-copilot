@@ -193,6 +193,66 @@ def _module_dep_warnings() -> list[str]:
     return out
 
 
+def _frontend_readiness(
+    *,
+    search_path: str | None = None,
+) -> tuple[list[str], list[str]]:
+    """Return launch-readiness passes and actionable frontend warnings.
+
+    The startup banner reports the selected frontend but does not inspect every
+    installed frontend. Doctor is explicitly diagnostic, so it checks both
+    supported hosts without executing either one. This catches an upstream-
+    supported Copilot npm loader that RAPTOR must refuse because the live host
+    contract requires a directly identifiable native Linux executable.
+    """
+    from .host import FrontendLaunchState, FrontendPreparation, prepare_frontend
+
+    passes: list[str] = []
+    warnings: list[str] = []
+    ready = 0
+    gated: list[tuple[str, str, FrontendPreparation]] = []
+    for name, label in (
+        ("claude", "Claude Code"),
+        ("copilot", "GitHub Copilot CLI"),
+    ):
+        preparation = prepare_frontend(name, search_path=search_path)
+        if preparation.launch_state is FrontendLaunchState.READY:
+            ready += 1
+            passes.append(
+                f"{label} frontend ready: {preparation.executable}"
+            )
+            continue
+        if not preparation.installed:
+            continue
+        gated.append((name, label, preparation))
+
+    for name, label, preparation in gated:
+        reason = (
+            preparation.reason
+            or "frontend launch contract is not met"
+        )
+        if name == "copilot":
+            if sys.platform == "linux":
+                warnings.append(
+                    f"{label} is installed at {preparation.executable} but "
+                    f"RAPTOR cannot launch it: {reason}; install the native "
+                    "Linux CLI with "
+                    "`curl -fsSL https://gh.io/copilot-install | bash`"
+                )
+            elif ready == 0:
+                warnings.append(
+                    f"{label} is installed but RAPTOR's Copilot frontend "
+                    "currently requires native Linux; install Claude Code "
+                    "or use standalone RAPTOR commands on this platform"
+                )
+        else:
+            warnings.append(
+                f"{label} is installed at {preparation.executable} but RAPTOR "
+                f"cannot launch it: {reason}"
+            )
+    return passes, warnings
+
+
 # Bounded-scan caps for the imported-annotation advisory sweep. Doctor
 # is on-demand, but a project output dir can hold arbitrarily many runs
 # and notes — the sweep reads at most this much before reporting what
@@ -395,6 +455,9 @@ def _gather() -> tuple[
         frontend_status = check_frontend()
         if frontend_status:
             env_parts = [*env_parts, f"frontend {frontend_status}"]
+        frontend_passes, frontend_warnings = _frontend_readiness()
+        env_parts = [*env_parts, *frontend_passes]
+        env_warnings = [*env_warnings, *frontend_warnings]
         lang_line, lang_warnings = check_lang()
         env_warnings = list(env_warnings) + list(lang_warnings)
         # Doctor-only depth (same rationale shape as the module-import

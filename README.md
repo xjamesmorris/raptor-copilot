@@ -65,7 +65,8 @@ the code.
 - One interactive frontend (optional if you only need the standalone CLIs):
   - **Claude Code** with an active subscription (Max, Pro, Team, or Enterprise) or an Anthropic API key; or
   - **GitHub Copilot CLI** with a signed-in account. Copilot frontend launch currently requires its native Linux executable.
-- **Python 3.12+** and **Node.js 18+**.
+- **Python 3.12+**. Node.js is not required when using the recommended native
+  frontend installers.
 - **Semgrep** (`pip install semgrep`) for static analysis. CodeQL is optional but recommended.
 
 The interactive frontend and analysis dispatch layer are separate. Claude Code
@@ -88,11 +89,11 @@ uv sync --locked
 # Compatibility path during the uv migration
 # pip install -r requirements.txt
 
-# Install your chosen interactive frontend (Claude shown here)
-npm install -g @anthropic-ai/claude-code
+# Install your chosen native interactive frontend (Claude shown here)
+curl -fsSL https://claude.ai/install.sh | bash
 
 # Install Semgrep (required for scanning)
-pip install semgrep
+pipx install semgrep
 
 # Add the launcher to your PATH -- put this in your shell profile to make it
 # permanent. Append rather than prepend, so system directories stay ahead of
@@ -103,6 +104,8 @@ export PATH="$PATH:$PWD/bin"
 raptor
 
 # Or launch RAPTOR with GitHub Copilot CLI
+# First install its native Linux executable:
+# curl -fsSL https://gh.io/copilot-install | bash
 raptor --frontend copilot
 ```
 
@@ -508,7 +511,7 @@ CLI with no interactive-frontend dependency.
 
 ```bash
 # No `claude` process involved at any point
-python3 raptor.py doctor                        # status check -- explicitly "no claude needed"
+./bin/raptor doctor --verbose                   # actionable local setup check; no frontend needed
 python3 raptor.py agentic --repo /path/to/code   # scan -> dedup -> analysis
 python3 raptor.py scan --repo /path/to/code
 ```

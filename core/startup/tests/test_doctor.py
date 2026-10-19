@@ -10,9 +10,17 @@ classification + exit code.
 from __future__ import annotations
 
 import typing
+from pathlib import Path
+
+import pytest
 
 from core.startup import doctor
 from core.startup.doctor import _render, main
+from core.startup.host import (
+    Frontend,
+    FrontendLaunchState,
+    FrontendPreparation,
+)
 
 
 def _gather_stub(
@@ -35,6 +43,126 @@ def _gather_stub(
         lang_line, project_line,
         list(advisories),
     )
+
+
+class TestFrontendReadiness:
+    def _preparation(
+        self,
+        frontend: Frontend,
+        state: FrontendLaunchState,
+        *,
+        path: str | None,
+        reason: str | None = None,
+    ) -> FrontendPreparation:
+        return FrontendPreparation(
+            frontend=frontend,
+            executable=Path(path) if path else None,
+            launch_state=state,
+            provider_usable=None,
+            session_claim=None,
+            reason=reason,
+        )
+
+    def test_native_copilot_and_claude_are_passes(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        values = {
+            "claude": self._preparation(
+                Frontend.CLAUDE,
+                FrontendLaunchState.READY,
+                path="/home/user/.local/bin/claude",
+            ),
+            "copilot": self._preparation(
+                Frontend.COPILOT,
+                FrontendLaunchState.READY,
+                path="/home/user/.local/bin/copilot",
+            ),
+        }
+        monkeypatch.setattr(
+            "core.startup.host.prepare_frontend",
+            lambda name, search_path=None: values[name],
+        )
+
+        passes, warnings = doctor._frontend_readiness()
+
+        assert warnings == []
+        assert len(passes) == 2
+        assert any("Claude Code frontend ready" in line for line in passes)
+        assert any("GitHub Copilot CLI frontend ready" in line for line in passes)
+
+    def test_copilot_loader_gets_native_install_remediation(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        values = {
+            "claude": self._preparation(
+                Frontend.CLAUDE,
+                FrontendLaunchState.READY,
+                path="/home/user/.local/bin/claude",
+            ),
+            "copilot": self._preparation(
+                Frontend.COPILOT,
+                FrontendLaunchState.GATED,
+                path="/home/user/.local/bin/copilot",
+                reason="a directly identifiable native Linux executable is required",
+            ),
+        }
+        monkeypatch.setattr(
+            "core.startup.host.prepare_frontend",
+            lambda name, search_path=None: values[name],
+        )
+
+        passes, warnings = doctor._frontend_readiness()
+
+        assert len(passes) == 1
+        assert len(warnings) == 1
+        assert "cannot launch it" in warnings[0]
+        assert "https://gh.io/copilot-install" in warnings[0]
+        assert "npm" not in warnings[0]
+
+    def test_no_frontend_is_allowed_for_standalone_commands(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(
+            "core.startup.host.prepare_frontend",
+            lambda name, search_path=None: self._preparation(
+                Frontend(name),
+                FrontendLaunchState.MISSING,
+                path=None,
+                reason=f"{name} not found",
+            ),
+        )
+
+        passes, warnings = doctor._frontend_readiness()
+
+        assert passes == []
+        assert warnings == []
+
+    def test_optional_copilot_is_quiet_off_linux_when_claude_is_ready(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        values = {
+            "claude": self._preparation(
+                Frontend.CLAUDE,
+                FrontendLaunchState.READY,
+                path="/home/user/.local/bin/claude",
+            ),
+            "copilot": self._preparation(
+                Frontend.COPILOT,
+                FrontendLaunchState.GATED,
+                path="/home/user/.local/bin/copilot",
+                reason="native Linux is required",
+            ),
+        }
+        monkeypatch.setattr(doctor.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            "core.startup.host.prepare_frontend",
+            lambda name, search_path=None: values[name],
+        )
+
+        passes, warnings = doctor._frontend_readiness()
+
+        assert len(passes) == 1
+        assert warnings == []
 
 
 # ---------------------------------------------------------------------------
