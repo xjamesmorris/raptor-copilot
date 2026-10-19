@@ -160,21 +160,31 @@ def run_sca_subprocess(
     # inside the child gets EACCES.
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    cmd: list = [
-        sys.executable, str(agent_path),
-        "--repo", str(target),
-        "--out", str(output_dir),
-        # Hidden provenance bit: agentic workers must re-run the shared
-        # disable-consent gate; only direct SCA CLI compatibility uses the
-        # trusted library profile-none path.
-        "--agentic-worker",
-        # This is the always-on MECHANICAL SCA phase. Deep review/triage
-        # belongs exclusively to /agentic --sca; letting the child
-        # auto-detect Claude Code here made one 600-second LLM call consume
-        # the mechanical phase's entire 600-second parent budget.
-        "--skip-review",
-        "--skip-triage",
-    ]
+    # Prefer invoking the agent via a direct file path when available in
+    # the working tree (developer runs). When running from an installed
+    # packaged CLI the source file may not be present at that absolute
+    # path; fall back to module invocation with -m so installed wheels /
+    # zipapps work too.
+    if agent_path is not None and Path(agent_path).is_file():
+        cmd: list = [
+            sys.executable, str(agent_path),
+            "--repo", str(target),
+            "--out", str(output_dir),
+            "--agentic-worker",
+            "--skip-review",
+            "--skip-triage",
+        ]
+    else:
+        # Fall back to module invocation so installed packages that expose
+        # the module on sys.path still work (no file: path required).
+        cmd = [
+            sys.executable, "-m", "packages.sca.agent",
+            "--repo", str(target),
+            "--out", str(output_dir),
+            "--agentic-worker",
+            "--skip-review",
+            "--skip-triage",
+        ]
     child_deadline = _child_deadline_seconds(timeout)
     if child_deadline is not None:
         cmd.extend(["--deadline-seconds", str(child_deadline)])
