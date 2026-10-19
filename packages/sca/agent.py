@@ -146,54 +146,40 @@ def run_sca_subprocess(
     ``124``; caller cancellation uses ``130``. The sandbox owns process-tree
     teardown for all three terminal paths.
     """
-    from core.config import RaptorConfig
+    from core.config import RaptorConfig, pin_raptor_dir
     from core.sandbox import SandboxCancelled, SandboxSetupError
     from core.sandbox.disable_consent import (
         NONCE_ENV_VAR,
         export_disable_consent,
     )
-    from core.sandbox import run as sandbox_run
+    from core.sandbox import python_runtime_tool_paths, run as sandbox_run
 
+    agent_path = agent_path.resolve()
+    if not agent_path.is_file():
+        raise FileNotFoundError(f"SCA agent file is missing or invalid: {agent_path}")
     # Ensure output_dir exists before Landlock setup — the sandbox
     # registers a writable rule by opening the path as a directory fd.
     # If it doesn't exist, the rule silently fails and every write
     # inside the child gets EACCES.
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Prefer invoking the agent via a direct file path when available in
-    # the working tree (developer runs). When running from an installed
-    # packaged CLI the source file may not be present at that absolute
-    # path; fall back to module invocation with -m so installed wheels /
-    # zipapps work too.
-    if agent_path is not None and Path(agent_path).is_file():
-        cmd: list = [
-            sys.executable, str(agent_path),
-            "--repo", str(target),
-            "--out", str(output_dir),
-            "--agentic-worker",
-            "--skip-review",
-            "--skip-triage",
-        ]
-    else:
-        # Fall back to module invocation so installed packages that expose
-        # the module on sys.path still work (no file: path required).
-        cmd = [
-            sys.executable, "-m", "packages.sca.agent",
-            "--repo", str(target),
-            "--out", str(output_dir),
-            "--agentic-worker",
-            "--skip-review",
-            "--skip-triage",
-        ]
+    cmd: list[str] = [
+        sys.executable, str(agent_path),
+        "--repo", str(target),
+        "--out", str(output_dir),
+        "--agentic-worker",
+        # This is the always-on mechanical phase; deep review belongs to
+        # /agentic --sca, not this time-bounded subprocess.
+        "--skip-review",
+        "--skip-triage",
+    ]
     child_deadline = _child_deadline_seconds(timeout)
     if child_deadline is not None:
         cmd.extend(["--deadline-seconds", str(child_deadline)])
     cmd.extend(sandbox_args)
 
-    # The child's import chain (core.coverage.schema → core.logging →
-    # RaptorLogger → ensure_directories) writes structured audit logs
-    # to LOG_DIR. Include it in the sandbox's writable surface so the
-    # child doesn't get EACCES on the first log emit.
+    # The child's import chain initializes RaptorLogger, which writes
+    # to LOG_DIR. Grant it explicitly so the first log emit can succeed.
     log_dir = RaptorConfig.LOG_DIR
     log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -203,11 +189,24 @@ def run_sca_subprocess(
     child_env = dict(
         env if env is not None else RaptorConfig.get_safe_env()
     )
+    pin_raptor_dir(child_env)
     # --sandbox none / --no-sandbox is consent-gated again in the child.
     # Export only an already-accepted parent grant; this helper cannot mint
     # authority and is a no-op for ordinary sandboxed runs.
     child_env.pop(NONCE_ENV_VAR, None)
     export_disable_consent(child_env)
+
+    # Mount namespaces see the target and output, not the RAPTOR checkout.
+    # Bind only the Python source the trusted worker imports, rather than
+    # exposing the entire checkout (including other runs and local secrets).
+    source_roots = (
+        RaptorConfig.REPO_ROOT / "core",
+        RaptorConfig.REPO_ROOT / "packages",
+    )
+    tool_paths = [str(root) for root in source_roots]
+    tool_paths.extend(python_runtime_tool_paths())
+    if not any(agent_path.is_relative_to(root) for root in source_roots):
+        tool_paths.append(str(agent_path))
 
     try:
         result = sandbox_run(
@@ -218,6 +217,7 @@ def run_sca_subprocess(
             caller_label="sca-agent",
             target=str(target),
             output=str(output_dir),
+            tool_paths=tool_paths,
             writable_paths=[str(log_dir), str(cache_dir)],
             env=child_env,
             env_caller_filtered=True,

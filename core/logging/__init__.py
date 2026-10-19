@@ -257,8 +257,9 @@ class RaptorLogger:
             self.logger.setLevel(logging.DEBUG)
             self.logger.propagate = False
 
-            # Ensure log directory exists
-            RaptorConfig.ensure_directories()
+            # Logging must not create unrelated job/schema/database paths:
+            # sandboxed workers only grant this directory for writes.
+            RaptorConfig.LOG_DIR.mkdir(parents=True, exist_ok=True)
 
             # Console handler with standard formatting
             console_handler = logging.StreamHandler(sys.stderr)

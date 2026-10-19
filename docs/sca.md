@@ -403,6 +403,11 @@ the child caps each HTTP retry loop, leaving time to write
 `diagnostics.json` and exit before the parent timeout. A timeout or
 cancellation is therefore a visible failed disposition with an active phase,
 never an empty successful scan.
+For targets outside the RAPTOR checkout, the sandbox mounts only the canonical
+RAPTOR `core/` and `packages/` trees and the Python runtime read-only, not the
+whole checkout. An external `RAPTOR_SCA_AGENT` override grants its agent file
+only; logs and the SCA cache retain their existing writable paths. The logger
+does not require unrelated `out/jobs` or CodeQL directories inside the worker.
 
 The mode contract is enforced centrally: the public API normalizes
 `analysis_mode="mechanical"` to review/triage disabled, while direct

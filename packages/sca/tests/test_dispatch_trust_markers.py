@@ -17,6 +17,8 @@ from packages.sca.agent import run_sca_subprocess
 
 def test_sca_subprocess_opts_into_keep_trust_markers(tmp_path):
     recorded = {}
+    agent = tmp_path / "agent.py"
+    agent.write_text("# agent stub\n", encoding="utf-8")
 
     def _fake_run(cmd, **kwargs):
         recorded.update(kwargs)
@@ -24,7 +26,7 @@ def test_sca_subprocess_opts_into_keep_trust_markers(tmp_path):
 
     with patch("core.sandbox.run", side_effect=_fake_run):
         run_sca_subprocess(
-            agent_path=tmp_path / "agent.py",
+            agent_path=agent,
             target=tmp_path / "repo",
             output_dir=tmp_path / "out",
         )
