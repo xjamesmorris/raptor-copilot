@@ -272,13 +272,35 @@ path; `HANDOFF.md` and `HUMAN-REVIEW.md` are older September 13 snapshots.
 
 ### P2
 
-- [ ] **MVP-11 - Verify dependency readiness on a fresh Fedora environment.**
+- [x] **MVP-11 - Verify dependency readiness on a fresh Fedora environment.**
+
+  **Completed October 18, 2026 (October 19 UTC):** a fresh
+  `fedora-cascade44` Fedora 44 Cloud Edition VM installed the documented core
+  toolchain, completed `uv sync --locked` in approximately 1.8 seconds,
+  installed Semgrep separately with pipx, and installed native Claude and
+  Copilot frontends with their official scripts. Native host claims,
+  discovery, launcher-backed doctor, source integrity, and a 642-test
+  cross-frontend runtime parity matrix passed.
+
+  The run exposed and repaired two clean-install gaps: doctor did not
+  distinguish Copilot's incompatible npm loader from its required native ELF,
+  and release archives omitted Copilot's `.github/agents` projection and
+  repository settings. Doctor now prints the official native-install
+  remediation, and release tests preserve runtime Copilot/plugin surfaces
+  while continuing to exclude CI/development paths.
+
+  CodeQL, Coccinelle, AFL++, GDB, Joern, radare2, rr, Frida, tree-sitter
+  grammars, and BigQuery configuration were deliberately left absent and are
+  reported as optional capability reductions. Cloud-init completed with a
+  recoverable hostname warning, but the resulting hostname, SSH, networking,
+  and passwordless sudo were correct. No frontend authentication, model
+  request, vulnerability scan, or host credential copy occurred.
 
   Suggested acceptance work: use a fresh Fedora VM template with
   `fedora-cascade44` and the documented setup path, rather than relying on
   this developer machine's preinstalled tools.
 
-  **Done when:** native Copilot, Python dependencies, and required scanners
+  **Acceptance evidence:** native Copilot, Python dependencies, and required scanners
   install and pass a representative bounded parity smoke run. Required
   missing dependencies fail actionably; optional tools and reduced coverage
   are clearly distinguished. Repair installer/checker gaps actually found,
