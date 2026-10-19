@@ -6,7 +6,14 @@
 # /command and the startup banner were silently absent
 # (test_release_workflow.sh pins the inclusion; release.yml verifies
 # the extracted archive carries the runtime surface).
-.github/          export-ignore
+.github/actions/  export-ignore
+.github/codeql/   export-ignore
+.github/docker/   export-ignore
+.github/evals/    export-ignore
+.github/sca/      export-ignore
+.github/scripts/  export-ignore
+.github/tests/    export-ignore
+.github/workflows/ export-ignore
 .devcontainer/    export-ignore
 .vscode/          export-ignore
 .gitattributes    export-ignore

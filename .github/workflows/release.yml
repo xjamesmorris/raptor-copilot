@@ -162,14 +162,16 @@ jobs:
 
           # The published archive is the product: verify the extracted
           # tree carries the runtime surface BEFORE packaging. .claude/
-          # is the LLM dispatch surface (slash commands, skills,
-          # agents, the SessionStart hook) — a .gitattributes
-          # export-ignore once shipped releases with all of it
-          # silently absent. Named oracle for the archive-content
-          # claim; test_release_workflow.sh pins the same set against
-          # the real .gitattributes.
+          # is the LLM dispatch surface; plugins/agents is Claude's
+          # guarded agent plugin; .github/agents and the Copilot settings
+          # are Copilot's runtime projection. Broad export-ignore rules once
+          # shipped releases with these surfaces silently absent. Named
+          # oracle for the archive-content claim; test_release_workflow.sh
+          # pins the same set against the real .gitattributes.
           for p in .claude/commands .claude/skills .claude/hooks \
-                   .claude/settings.json CLAUDE.md raptor.py bin \
+                   .claude/settings.json .github/agents \
+                   .github/copilot/settings.json plugins/agents \
+                   CLAUDE.md raptor.py bin \
                    libexec core packages engine tiers; do
             if [ ! -e "/tmp/${NAME}/${p}" ]; then
               echo "::error::release archive missing runtime surface: ${p}"

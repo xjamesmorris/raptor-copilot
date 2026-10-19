@@ -109,7 +109,14 @@ CFFEOF
     # Create .gitattributes
     cp "$SCRIPT_DIR/.gitattributes" "$REPO/.gitattributes" 2>/dev/null || \
     cat > .gitattributes <<'ATTR'
-.github/          export-ignore
+.github/actions/  export-ignore
+.github/codeql/   export-ignore
+.github/docker/   export-ignore
+.github/evals/    export-ignore
+.github/sca/      export-ignore
+.github/scripts/  export-ignore
+.github/tests/    export-ignore
+.github/workflows/ export-ignore
 .devcontainer/    export-ignore
 .vscode/          export-ignore
 .gitattributes    export-ignore
@@ -123,8 +130,12 @@ conftest.py       export-ignore
 ATTR
 
     # Create files that should be excluded from archives
-    mkdir -p .github/workflows .vscode test docs/img
+    mkdir -p .github/workflows .github/agents .github/copilot \
+             plugins/agents .vscode test docs/img
     echo "workflow" > .github/workflows/test.yml
+    echo "agent"    > .github/agents/demo.md
+    echo "{}"       > .github/copilot/settings.json
+    echo "plugin"   > plugins/agents/README.md
     echo "vscode"   > .vscode/settings.json
     echo "test"     > test/test_something.py
     echo "img"      > docs/img/logo.png
@@ -527,14 +538,17 @@ assert_file_exists "raptor-offset in archive"       "$ARCHIVE_DIR/core/startup/a
 assert_file_exists "core/config/__init__.py in archive"      "$ARCHIVE_DIR/core/config/__init__.py"
 assert_file_exists "packages/ in archive"           "$ARCHIVE_DIR/packages/__init__.py"
 
-# Runtime surface ships (the .claude/ dispatch surface was once
-# export-ignored as "dev/CI" — releases lost every /command and the
-# SessionStart hook; both directions pinned here against the REAL
-# .gitattributes, and release.yml verifies the same set at publish).
+# Runtime surface ships. Broad export-ignore rules once removed the .claude
+# dispatch surface and the Copilot/plugin agent surfaces from releases; both
+# directions are pinned here against the REAL .gitattributes, and release.yml
+# verifies the same set at publish.
 assert_file_exists ".claude/commands in archive"    "$ARCHIVE_DIR/.claude/commands/scan.md"
 assert_file_exists ".claude/skills in archive"      "$ARCHIVE_DIR/.claude/skills/demo.md"
 assert_file_exists ".claude/hooks in archive"       "$ARCHIVE_DIR/.claude/hooks/session_start.sh"
 assert_file_exists ".claude/settings.json in archive" "$ARCHIVE_DIR/.claude/settings.json"
+assert_file_exists ".github/agents in archive"      "$ARCHIVE_DIR/.github/agents/demo.md"
+assert_file_exists ".github/copilot settings in archive" "$ARCHIVE_DIR/.github/copilot/settings.json"
+assert_file_exists "plugins/agents in archive"      "$ARCHIVE_DIR/plugins/agents/README.md"
 
 # The release.yml runtime-surface verify loop, run against the
 # fixture archive with the member list DERIVED from release.yml
@@ -549,6 +563,12 @@ VERIFY_MEMBERS=$(awk '/for p in /{f=1} f{print; if (/; do/) exit}' \
     | sed -e 's/.*for p in//' -e 's/; do.*//' | tr -s ' \n' ' ')
 assert_contains "derived verify list carries .claude/commands" \
     "$VERIFY_MEMBERS" ".claude/commands"
+assert_contains "derived verify list carries .github/agents" \
+    "$VERIFY_MEMBERS" ".github/agents"
+assert_contains "derived verify list carries Copilot settings" \
+    "$VERIFY_MEMBERS" ".github/copilot/settings.json"
+assert_contains "derived verify list carries agent plugin" \
+    "$VERIFY_MEMBERS" "plugins/agents"
 assert_contains "derived verify list carries CLAUDE.md" \
     "$VERIFY_MEMBERS" "CLAUDE.md"
 assert_contains "derived verify list carries libexec" \
@@ -560,7 +580,7 @@ done
 assert_eq "runtime-surface verify loop finds no gaps" "" "$VERIFY_FAIL"
 
 # Should be excluded by .gitattributes export-ignore
-assert_file_missing ".github/ excluded"             "$ARCHIVE_DIR/.github"
+assert_file_missing ".github/workflows excluded"   "$ARCHIVE_DIR/.github/workflows"
 assert_file_missing ".vscode/ excluded"             "$ARCHIVE_DIR/.vscode"
 assert_file_missing ".gitattributes excluded"       "$ARCHIVE_DIR/.gitattributes"
 assert_file_missing ".env excluded"                 "$ARCHIVE_DIR/.env"
