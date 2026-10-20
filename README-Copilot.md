@@ -189,7 +189,7 @@ model:
 
 # Repository default used by direct Copilot and by RAPTOR launches without
 # an explicit --model
-copilot config --repo model gpt-6-astra
+copilot config --repo model auto
 ```
 
 Both `--model VALUE` and `--model=VALUE` preserve the model text exactly.

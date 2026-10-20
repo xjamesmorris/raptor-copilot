@@ -1737,7 +1737,7 @@ def test_native_copilot_never_enables_yolo_by_default(tmp_path):
         )
         for model in (
             "gpt-6-astra",
-            "gpt-6-astra",
+            "gpt-6-luna",
             _UNLISTED_MODEL,
         )
         for args in (
@@ -1905,7 +1905,7 @@ def test_native_copilot_leaves_unlisted_repo_model_to_native_config(
     settings = workspace.root / ".github" / "copilot" / "settings.json"
     settings.parent.mkdir(parents=True)
     settings.write_text(
-        '{\n  "model": "gpt-6-astra"\n}\n',
+        f'{{\n  "model": "{_UNLISTED_MODEL}"\n}}\n',
         encoding="utf-8",
     )
 
@@ -1922,7 +1922,7 @@ def test_native_copilot_leaves_unlisted_repo_model_to_native_config(
     assert not any(arg.startswith("--model=") for arg in argv)
     assert fields["env.RAPTOR_FRONTEND_MODEL"] == "<unset>"
     assert fields["cwd"] == str(workspace.root)
-    assert "gpt-6-astra" in settings.read_text(encoding="utf-8")
+    assert _UNLISTED_MODEL in settings.read_text(encoding="utf-8")
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
