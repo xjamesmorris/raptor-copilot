@@ -625,6 +625,9 @@ class RaptorConfig:
         # TARGET_ENV_STRIP_SET (sandboxed code never sees the
         # credential; see core/sandbox/context.py).
         "RAPTOR_SESSION_PID", "RAPTOR_SESSION_TOKEN",
+        # Restriction only; never an authorization token. Keep it across
+        # worker/target boundaries even when frontend identity is stripped.
+        "RAPTOR_SESSION_SERVICE_POLICY",
         #   RAPTOR_REGISTRY_HOME  operator-registry relocation override
         #                    (core.project.registry_home — projects
         #                    registry, .active bookmark, sessions.d,
@@ -1267,6 +1270,8 @@ class RaptorConfig:
         # RAPTOR's own Python children never import another tree's
         # modules (see pin_raptor_dir).
         pin_raptor_dir(env)
+        from core.security.session_services import pin_child_service_policy
+        pin_child_service_policy(env)
         return env
 
     # LLM provider API-key env vars.  These are intentionally NOT in
@@ -1456,6 +1461,9 @@ class RaptorConfig:
             preserve_proxy=True,
             include_python_user_base=include_python_user_base,
         )
+        from core.security.session_services import session_services_restricted
+        if session_services_restricted():
+            return env
         for var in RaptorConfig.LLM_API_KEY_VARS:
             val = os.environ.get(var)
             if val:

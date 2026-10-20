@@ -62,7 +62,10 @@ def write_env_file():
         f'export RAPTOR_DIR={shlex.quote(repo_root)}\n'
         f'export PATH="$PATH":{shlex.quote(bin_dir)}\n'
     )
-    for key in ("RAPTOR_FRONTEND", "RAPTOR_FRONTEND_MODEL"):
+    for key in (
+        "RAPTOR_FRONTEND", "RAPTOR_FRONTEND_MODEL",
+        "RAPTOR_SESSION_SERVICE_POLICY",
+    ):
         value = os.environ.get(key)
         if value:
             content += f"export {key}={shlex.quote(value)}\n"
@@ -92,6 +95,13 @@ def generate_banner():
 
 def warm_sage_embeddings():
     """Fire one embed call in a background process to warm the Ollama model."""
+    from core.security.session_services import (
+        report_session_service_policy,
+        session_services_restricted,
+    )
+    if session_services_restricted():
+        report_session_service_policy()
+        return
     try:
         from core.sage.config import SageConfig
         cfg = SageConfig.from_env()

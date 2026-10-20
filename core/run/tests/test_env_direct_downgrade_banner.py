@@ -16,6 +16,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 _RAPTOR_ROOT = Path(__file__).resolve().parents[3]
 
 
@@ -107,6 +109,37 @@ class TestAnnounce:
 
 
 class TestRunScriptFallback:
+    def test_copilot_child_is_offline_without_dispatcher_or_credentials(
+        self, monkeypatch, capsys, tmp_path,
+    ):
+        raptor = _import_raptor()
+        monkeypatch.setenv("COPILOT_CLI", "1")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "fixture-other-account")
+        with patch.object(raptor, "_get_or_start_dispatcher") as dispatcher, \
+             patch.object(
+                 raptor.subprocess, "run",
+                 return_value=SimpleNamespace(returncode=0),
+             ) as run:
+            rc = raptor._run_script(Path("scanner.py"), [], out_dir=tmp_path)
+
+        assert rc == 0
+        dispatcher.assert_not_called()
+        child_env = run.call_args.kwargs["env"]
+        assert child_env["RAPTOR_SESSION_SERVICE_POLICY"] == "copilot-only"
+        assert "ANTHROPIC_API_KEY" not in child_env
+        assert "RAPTOR_LLM_SOCKET" not in child_env
+        assert "CREDENTIAL-ISOLATION DOWNGRADE" not in capsys.readouterr().err
+        assert not (tmp_path / "credential-posture.json").exists()
+
+    def test_copilot_cannot_reuse_a_cached_dispatcher(self, monkeypatch):
+        from core.security.session_services import ServiceAuthorizationError
+
+        raptor = _import_raptor()
+        monkeypatch.setenv("COPILOT_CLI", "1")
+        monkeypatch.setattr(raptor, "_active_dispatcher", object())
+        with pytest.raises(ServiceAuthorizationError):
+            raptor._get_or_start_dispatcher()
+
     def test_fallback_announces_and_records(self, monkeypatch, capsys,
                                             tmp_path):
         """dispatcher=None → the env-direct branch prints the banner

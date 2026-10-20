@@ -111,6 +111,23 @@ class TestEnvSwitch:
             TranscriptReplayer(tmp_path / "absent.jsonl")
 
 
+def test_copilot_replay_stays_offline_with_an_external_primary(tmp_path, monkeypatch):
+    path = tmp_path / "copilot-replay.jsonl"
+    _record_entry(TranscriptRecorder(path))
+    monkeypatch.setenv("COPILOT_CLI", "1")
+    config = LLMConfig(
+        primary_model=ModelConfig(
+            provider="anthropic", model_name="fixture", api_key="unused",
+        ),
+        fallback_models=[],
+        enable_caching=False,
+    )
+    client = TranscriptLLMClient(config, session=TranscriptReplayer(path))
+    result = client.generate("analyse this", system_prompt="sys", task_type="analyse")
+    assert result.content == "verdict text"
+    assert client.providers == {}
+
+
 # ---------------------------------------------------------------------------
 # Recorder
 # ---------------------------------------------------------------------------

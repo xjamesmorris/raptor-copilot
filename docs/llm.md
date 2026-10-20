@@ -4,6 +4,22 @@ RAPTOR uses large language models for vulnerability analysis, exploit generation
 validation, and autonomous decision-making. This guide covers provider configuration,
 model selection, multi-model workflows, and cost management.
 
+## Copilot session restriction
+
+The standalone provider configuration below applies outside restricted
+Copilot sessions. Under Copilot, RAPTOR cannot verify that an SDK, a
+dispatcher, or another CLI process uses the account/service that started
+the active session. Autodetection, model inventory/key probes, explicit
+standalone dispatch, and Claude fallback are therefore refused or reported
+as unavailable without making requests. Ambient keys, `models.json`,
+`--model`, and previous consent do not grant current authorization.
+
+Native Copilot reasoning stays in the current host session. RAPTOR has no
+headless Copilot provider or verified per-operation external authorization
+bridge; no configuration opt-out is offered. Offline transcript replay
+does not authorize live calls. See `README-Copilot.md` for the kernel
+network ceiling, requirements, and enforcement limits.
+
 ## Supported Providers
 
 Eight providers are supported. RAPTOR probes for configured providers in this order

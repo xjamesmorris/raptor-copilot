@@ -17,6 +17,10 @@ from pathlib import Path
 from typing import Any, Optional
 
 from core.logging import get_logger
+from core.security.session_services import (
+    report_session_service_policy,
+    session_services_restricted,
+)
 
 from .accounting import (
     TrustedUsdRoute,
@@ -466,6 +470,9 @@ def _build_claudecode_config() -> Optional['ModelConfig']:
     billed. Cloud APIs default to 120s in ``ModelConfig`` (well-tuned
     for them); CC's subprocess + structured-output overhead needs more.
     """
+    if session_services_restricted():
+        report_session_service_policy()
+        return None
     import shutil
     if not shutil.which("claude"):
         return None
@@ -847,6 +854,9 @@ def _get_default_primary_model(
     except when that primary could only ever be a live Ollama
     endpoint.
     """
+    if session_services_restricted():
+        report_session_service_policy()
+        return None
     if _operator_primary_override is not None:
         return _operator_primary_override
     if isinstance(prefer, str):

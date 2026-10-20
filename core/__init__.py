@@ -34,9 +34,16 @@ first access only. ``from core import RaptorConfig`` triggers
 __getattr__("RaptorConfig"), imports core.config, returns the
 class. Subsequent accesses hit the module's regular namespace
 because __getattr__ stores the resolved value.
+
+The one eager bootstrap is the session service guard. It must run before
+consumers can initialize SDKs or spawn network-capable descendants.
 """
 
 from typing import Any
+
+from core.security.session_services import install_session_service_guards
+
+install_session_service_guards()
 
 # Map of public name → (submodule, attribute_name). Keep in sync
 # with __all__ below.

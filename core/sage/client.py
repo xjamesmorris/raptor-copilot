@@ -237,8 +237,11 @@ class SageClient:
     """
 
     def __init__(self, config: SageConfig | None = None) -> None:
-        ensure_loopback_no_proxy()
         self._config = config or SageConfig.from_env()
+        if self._config.enabled:
+            from core.security.session_services import require_service_authorization
+            require_service_authorization("the SAGE service")
+        ensure_loopback_no_proxy()
         self._client = None
         self._query_cache: dict[tuple[str, str, int, float | None], tuple[tuple[str, float, str], ...]] = {}
         # Guards the eviction+insert pair: hook consumers query this
@@ -304,6 +307,8 @@ class SageClient:
         """
         if not self._config.enabled:
             return False
+        from core.security.session_services import require_service_authorization
+        require_service_authorization("a SAGE health request")
         if not _ensure_sdk():
             return False
         try:
@@ -322,6 +327,8 @@ class SageClient:
         """Get or create the underlying sync SDK client."""
         if not self._config.enabled:
             return None
+        from core.security.session_services import require_service_authorization
+        require_service_authorization("the SAGE service")
         if not _ensure_sdk():
             return None
         if self._client is None:

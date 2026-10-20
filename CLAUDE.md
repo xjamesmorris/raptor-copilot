@@ -5,6 +5,45 @@ Dangerous operations (apply patches, delete, git push): ASK FIRST.
 
 ---
 
+## COPILOT SESSION SERVICE BOUNDARY
+
+When hosted by Copilot, stay within the service/account that authenticated
+the active Copilot session. This applies to direct `copilot` development
+sessions as well as `bin/raptor --frontend copilot`.
+
+- Do not launch another harness or standalone model client, including
+  `claude`, `codex`, `gemini`, `ollama`, or another `copilot` process.
+  A model name or a shared provider hostname is not proof of the same account.
+- Installed tools, environment keys, saved `models.json`, project trust,
+  `--yolo`, previous approvals, and previously configured MCP/SAGE services
+  are not fresh service authorization. Neither are blanket instructions to
+  install, scan, recover from errors, or use another model.
+- Any additional service requires explicit approval for this operation,
+  naming its purpose, data to send, destination, and account/credential
+  identity. This includes web lookups, downloads, package installation,
+  cloud APIs, telemetry, target requests, and local inference/sidecar services.
+  Unknown identity or unavailable approval means stop before the call.
+- Never try an alternate provider/account after a refusal, timeout, quota
+  limit, or missing dependency. Never log in, switch credentials, remove
+  session markers, or change the guard to make a refused operation work.
+  Approval to edit code is not approval to contact another service.
+- Native Copilot tools/managed children remain within the current host
+  session; a different model within that service is not itself a different
+  account. Do not substitute a repository-spawned CLI or SDK for them.
+
+Repository transports fail closed: RAPTOR has no verified bridge to the
+active Copilot account and no machine-verifiable per-operation external
+authorization channel. Consequently those transports remain blocked even
+when a configuration names a provider. Do not invent an override. Use local
+work and the active session, or report the blocked external operation.
+
+The runtime guard covers repository Python entry points and their native
+descendants. It does not control Copilot's own internal routing, arbitrary
+host tools, or processes already running before the guard was installed.
+Do not describe instruction text as an OS-wide egress guarantee.
+
+---
+
 ## SESSION START
 
 **Banner and quick commands are for top-level operator-facing sessions only.**

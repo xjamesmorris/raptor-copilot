@@ -174,7 +174,7 @@ def test_check_llm_keeps_no_external_when_seam_empty(
     assert lines == ["   llm: no external LLM configured"]
 
 
-def test_claude_presence_is_labelled_as_analysis_cli_not_authentication(
+def test_copilot_does_not_advertise_installed_claude_as_an_authorized_transport(
     isolated_home, monkeypatch,
 ) -> None:
     monkeypatch.setenv("RAPTOR_FRONTEND", "copilot")
@@ -189,10 +189,9 @@ def test_claude_presence_is_labelled_as_analysis_cli_not_authentication(
     lines, warnings = startup_init.check_llm()
 
     assert lines == [
-        "   llm: no external LLM configured",
-        "        claude code ✓ (analysis CLI installed; auth not checked)",
+        "   llm: Copilot session only (standalone providers blocked)",
     ]
-    assert warnings == []
+    assert any("saved credentials are not consent" in warning for warning in warnings)
 
 
 def test_check_llm_parses_commented_models_json(

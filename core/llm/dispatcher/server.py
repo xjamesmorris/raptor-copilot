@@ -1417,6 +1417,8 @@ class LLMDispatcher:
         token_budget: int | None = None,
         creds: CredentialStore | None = None,
     ) -> None:
+        from core.security.session_services import require_service_authorization
+        require_service_authorization("a credential-bearing LLM dispatcher")
         self.run_id = run_id
         # TTL/budget resolution order: explicit caller arg →
         # ``RAPTOR_LLM_DISPATCHER_TOKEN_TTL_S`` / ``..._BUDGET`` env →

@@ -28,6 +28,32 @@ from pathlib import Path
 
 import pytest
 
+# Test scenarios supply their own session identity, just as they supply
+# fake provider credentials. Never turn a Copilot-origin test into live use.
+_session_service_test_env = (
+    "RAPTOR_FRONTEND", "COPILOT_CLI", "COPILOT_AGENT_SESSION_ID",
+    "RAPTOR_SESSION_SERVICE_POLICY",
+)
+_copilot_test_origin = (
+    os.environ.get("RAPTOR_FRONTEND") == "copilot"
+    or any(os.environ.get(name) for name in _session_service_test_env[1:])
+)
+if _copilot_test_origin and os.environ.get("RAPTOR_TEST_LIVE_LLM") == "1":
+    raise pytest.UsageError("Live LLM tests are not authorized by a Copilot session")
+for _session_service_name in _session_service_test_env:
+    os.environ.pop(_session_service_name, None)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_session_service_policy(monkeypatch):
+    from core.security import session_services
+
+    for name in _session_service_test_env:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(session_services, "_restricted", False)
+    monkeypatch.setattr(session_services, "_notice_shown", False)
+
+
 os.environ.setdefault("_RAPTOR_TRUSTED", "1")
 
 # Disable reach_verdict_log atexit flush during tests so the synthetic

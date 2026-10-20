@@ -209,6 +209,13 @@ def _check_pypi_update(package: str, installed: str) -> bool:
     ``_cached_cli_version``.  Never raises — network / parse
     failures silently return False.
     """
+    from core.security.session_services import (
+        report_session_service_policy,
+        session_services_restricted,
+    )
+    if session_services_restricted():
+        report_session_service_policy()
+        return False
     import time
 
     cache_dir = Path(
@@ -486,6 +493,13 @@ def check_llm() -> tuple[list, list]:
 
     Returns (lines, warnings).
     """
+    from core.security.session_services import session_services_restricted
+    if session_services_restricted():
+        return (
+            ["   llm: Copilot session only (standalone providers blocked)"],
+            ["Copilot service policy: external probes, fallbacks, and "
+             "ancillary services disabled; saved credentials are not consent"],
+        )
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     lines = []

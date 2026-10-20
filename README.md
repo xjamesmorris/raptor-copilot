@@ -111,7 +111,11 @@ raptor --frontend copilot
 
 Copilot users should also read
 [README-Copilot.md](README-Copilot.md) for model routing, subagent
-configuration, and troubleshooting.
+configuration, and troubleshooting. Copilot sessions enforce a fail-closed
+service boundary: repository-managed providers, harness fallbacks, and
+ancillary network services are blocked, rather than using another account.
+This includes direct `copilot` development sessions; it does not control
+Copilot's own internal routing or arbitrary host tools.
 
 The `raptor` launcher is the recommended way to start a session, and it works
 from any directory -- it resolves the RAPTOR installation, remembers the

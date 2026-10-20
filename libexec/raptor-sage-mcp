@@ -29,6 +29,14 @@ if [ -z "${CLAUDECODE:-}" ] && [ -z "${_RAPTOR_TRUSTED:-}" ]; then
 fi
 # ─── end trust-marker check ─────────────────────────────────
 
+if [[ -n "${RAPTOR_SESSION_SERVICE_POLICY:-}"
+        || "${RAPTOR_FRONTEND:-}" == "copilot"
+        || -n "${COPILOT_CLI:-}"
+        || -n "${COPILOT_AGENT_SESSION_ID:-}" ]]; then
+    echo "raptor-sage-mcp: Copilot session service policy blocks SAGE/Docker access; prior setup is not current authorization." >&2
+    exit 3
+fi
+
 # Resolve RAPTOR_DIR via symlink chain (same pattern as raptor-sage-setup).
 SCRIPT="$0"
 _symhops=0

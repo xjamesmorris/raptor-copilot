@@ -70,6 +70,13 @@ def _ollama_gpu_available() -> bool:
     ``SAGE_OLLAMA_URL`` (same knob the direct-embed path in
     core/sage/client.py reads); default is the compose-mapped port.
     """
+    from core.security.session_services import (
+        report_session_service_policy,
+        session_services_restricted,
+    )
+    if session_services_restricted():
+        report_session_service_policy()
+        return False
     global _ollama_has_gpu, _ollama_gpu_checked_at
     if _ollama_has_gpu:
         return True
@@ -171,6 +178,13 @@ def _get_client() -> SageClient | None:
     only on the negative-cache side where the cost of being
     wrong is "all SAGE features disabled for the rest of the run".
     """
+    from core.security.session_services import (
+        report_session_service_policy,
+        session_services_restricted,
+    )
+    if session_services_restricted():
+        report_session_service_policy()
+        return None
     global _client, _client_initialised, _client_none_decided_at
     with _client_lock:
         needs_init = not _client_initialised

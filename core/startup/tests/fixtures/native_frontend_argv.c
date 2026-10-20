@@ -24,6 +24,7 @@ static int write_capture(int argc, char **argv)
 {
     const char *capture = getenv("RAPTOR_TEST_FRONTEND_CAPTURE");
     const char *frontend_model;
+    const char *service_policy;
     const char *copilot_agent_session_id;
     const char *copilot_cli;
     const char *copilot_cli_binary_version;
@@ -58,6 +59,7 @@ static int write_capture(int argc, char **argv)
         }
     }
     frontend_model = getenv("RAPTOR_FRONTEND_MODEL");
+    service_policy = getenv("RAPTOR_SESSION_SERVICE_POLICY");
     copilot_agent_session_id = getenv("COPILOT_AGENT_SESSION_ID");
     copilot_cli = getenv("COPILOT_CLI");
     copilot_cli_binary_version = getenv("COPILOT_CLI_BINARY_VERSION");
@@ -68,6 +70,11 @@ static int write_capture(int argc, char **argv)
             "env.RAPTOR_FRONTEND_MODEL=%s\n",
             frontend_model == NULL ? "<unset>" : frontend_model
         ) < 0
+            || fprintf(
+                stream,
+                "env.RAPTOR_SESSION_SERVICE_POLICY=%s\n",
+                service_policy == NULL ? "<unset>" : service_policy
+            ) < 0
             || fprintf(
                 stream,
                 "env.COPILOT_AGENT_SESSION_ID=%s\n",

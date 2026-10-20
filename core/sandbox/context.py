@@ -2601,6 +2601,9 @@ def sandbox(block_network=_UNSET, target: str | None = None, output: str | None 
         # "full (default)" contract. Callers that genuinely want an
         # open-network sandbox say block_network=False explicitly.
         block_network = PROFILES[DEFAULT_PROFILE]["block_network"]
+    if not block_network or use_egress_proxy or effectively_disabled:
+        from core.security.session_services import require_service_authorization
+        require_service_authorization("a network-enabled subprocess")
     strict_required = profile == "strict"
     # Explicitly disabled: no seccomp either (rlimits-only contract).
     if effectively_disabled:

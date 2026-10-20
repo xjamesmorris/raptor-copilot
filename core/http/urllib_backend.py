@@ -592,6 +592,8 @@ class UrllibClient:
         — with a clear :class:`HttpError` naming the bad value —
         while direct/no_proxy traffic is unaffected.
         """
+        from core.security.session_services import require_service_authorization
+        require_service_authorization("an HTTP service request")
         if not self._proxy_map:
             return self._http
         parsed = _urlparse.urlsplit(url)

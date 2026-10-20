@@ -1,8 +1,48 @@
 # RAPTOR with GitHub Copilot CLI
 
 Copilot can host RAPTOR's interactive decision layer on Linux, loading its
-instructions, commands, skills, agents, and coverage plugin. The Python
-execution layer and separate analysis-provider configuration remain unchanged.
+instructions, commands, skills, agents, and coverage plugin. Repository-owned
+execution is **session-only and offline**: it cannot silently switch to a
+separate harness, provider, account, or ancillary service.
+
+## Service/account boundary
+
+Only the already-running Copilot session owns its authenticated account.
+RAPTOR does not treat another `copilot` process, a Claude CLI installation,
+an API key, a configured provider endpoint, or a local inference server as
+that session. A different model within the active Copilot service is not,
+by itself, a different account.
+
+Under both direct Copilot launches and `--frontend copilot`, RAPTOR:
+
+- disables provider autodetection, credential probes, Claude fallback,
+  provider dispatchers, update checks, and automatic SAGE/Ollama calls;
+- refuses explicit standalone providers too: `--model`, saved credentials,
+  `--yolo`, sandbox overrides, and project trust are not service consent;
+- installs a Linux seccomp network ceiling at RAPTOR's `core` bootstrap.
+  Native descendants remain offline even if they clear their environment.
+  Named Unix services and loopback inference are blocked as well as remote
+  services; anonymous stream/seqpacket socketpairs remain usable for IPC;
+- refuses execution if the ceiling cannot be installed, if socket/io_uring
+  descriptors were inherited, or if bootstrap occurs after threads started.
+  Linux and `libseccomp.so.2` are required.
+
+External work requires fresh authorization for the exact operation, service,
+account/credential identity, and data being sent. RAPTOR has neither a
+verified bridge to Copilot's current credentials nor a verified scoped-grant
+channel, so repository-managed external transports stay blocked; there is
+no environment/config opt-out. Network-dependent commands may therefore
+refuse rather than complete. Native session reasoning and local file work
+remain available. Approval to patch this repository does not grant service
+access, and deleting markers or launching another harness is not a remedy.
+
+**Boundary:** this protects repository Python entry points and their process
+trees, plus the repository's SAGE shell entry points. It is not an OS-wide
+firewall: arbitrary tools launched directly by Copilot, host-managed MCP or
+extensions, Copilot's own account routing, already-running processes, and
+hostile same-UID modification of the framework are outside that enforcement.
+The project instructions require explicit approval on those host surfaces;
+host/OS controls are necessary for a universal egress guarantee.
 
 ## Quickstart
 
@@ -67,14 +107,14 @@ example with an explicit `--model gpt-6-astra`:
 
 ```text
 frontend: GitHub Copilot CLI (model: gpt-6-astra)
-   llm: no external LLM configured
+   llm: Copilot session only (standalone providers blocked)
 ```
 
 Without an explicit model, the label is `session/config default`. The static
 "Based on Claude Code" attribution is not the active frontend indicator.
-The Claude Code line under `llm:` only reports that its analysis CLI is
-installed on PATH; it does not verify authentication or select the frontend.
-RAPTOR can use Claude Code for analysis independently of the Copilot frontend.
+Claude CLI installation is not authentication or authorization, so its
+availability is not advertised as a fallback here. Startup does not
+validate other accounts or warm ancillary services.
 
 ## Development defaults
 
@@ -226,9 +266,10 @@ present a difference as an acceptance failure. An explicit parent `--model`
 remains parent-only, and neither parent nor managed-child selection configures
 RAPTOR finding analysis.
 
-RAPTOR analysis requires a configured provider or its Claude Code fallback.
-Selecting the Copilot frontend does not enable a headless Copilot provider.
-Repeat `/agentic --model` for independent configured analysis models.
+Outside Copilot, RAPTOR analysis can use configured providers or its Claude
+Code fallback. Inside Copilot, those transports are blocked: selecting this
+frontend does not enable a headless Copilot provider, and repeating
+`/agentic --model` does not authorize other services/accounts.
 
 ## Long-running commands and child permissions
 

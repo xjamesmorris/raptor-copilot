@@ -132,6 +132,13 @@ def _get_inventory(api_key: str | None) -> list[str]:
     Thread-safe: concurrent first-callers from multiple threads collapse
     to a single fetch via ``_INVENTORY_LOCK``.
     """
+    from core.security.session_services import (
+        report_session_service_policy,
+        session_services_restricted,
+    )
+    if session_services_restricted():
+        report_session_service_policy()
+        return []
     global _INVENTORY, _INVENTORY_PROBED
 
     # Fast path — already probed. Reads of ``_INVENTORY_PROBED`` and
@@ -158,6 +165,8 @@ def _fetch_inventory(api_key: str) -> list[str]:
     Returns an empty list on non-200 responses. Raises on transport
     errors — :func:`_get_inventory` absorbs those.
     """
+    from core.security.session_services import require_service_authorization
+    require_service_authorization("a provider model-inventory request")
     import requests
 
     # Hardcoded Anthropic API hostname — not SSRF.

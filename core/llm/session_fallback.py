@@ -1,5 +1,9 @@
 """Session-transport fallback for dispatcher-only model chains.
 
+This fallback is forbidden under Copilot: another harness is not the active
+session's authenticated service. The service-policy refusal happens before
+dispatcher bootstrap and outside the recovery handlers below.
+
 The Bedrock provider is dispatcher-only by design: workers never hold
 AWS credentials, so ``create_provider`` hard-refuses without
 ``RAPTOR_LLM_SOCKET`` (the guard is correct and stays). Launcher runs
@@ -123,9 +127,13 @@ def client_with_session_fallback(
 
     ``notice`` receives at most ONE message per call (cases 3/4);
     default is a warning on this module's logger, prefixed with
-    *label*. Never raises: unexpected errors preserve the original
-    client, matching the bootstrap's fire-and-forget contract.
+    *label*. Copilot service-policy refusals raise before recovery.
+    Otherwise unexpected errors preserve the original client, matching
+    the bootstrap's fire-and-forget contract.
     """
+    from core.security.session_services import require_service_authorization
+    require_service_authorization("a standalone LLM route or harness fallback")
+
     def _say(msg: str) -> None:
         # Shielded: a raising notice sink must not discard the decided
         # outcome (a constructed session client would leak away as the

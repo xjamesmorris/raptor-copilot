@@ -76,6 +76,14 @@ if [ -z "${CLAUDECODE:-}" ] && [ -z "${_RAPTOR_TRUSTED:-}" ]; then
 fi
 # ─── end trust-marker check ─────────────────────────────────
 
+if [[ -n "${RAPTOR_SESSION_SERVICE_POLICY:-}"
+        || "${RAPTOR_FRONTEND:-}" == "copilot"
+        || -n "${COPILOT_CLI:-}"
+        || -n "${COPILOT_AGENT_SESSION_ID:-}" ]]; then
+    echo "raptor-sage-setup: Copilot session service policy blocks SAGE/Docker access; setup flags are not service/account authorization." >&2
+    exit 3
+fi
+
 # Exit codes: 2 is reserved for the trust-marker refusal above
 # (cc-trust-check convention); usage errors exit 3, and an explicit
 # help request exits 0.

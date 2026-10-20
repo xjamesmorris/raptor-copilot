@@ -600,6 +600,14 @@ fi
 # Parse RAPTOR-specific args, collect frontend args. Selection is an
 # operator argument only — no RAPTOR_HOST/COPILOT_* environment value
 # participates in host authority.
+if [[ -n "${RAPTOR_SESSION_SERVICE_POLICY:-}"
+        || "${RAPTOR_FRONTEND:-}" == "copilot"
+        || -n "${COPILOT_CLI:-}"
+        || -n "${COPILOT_AGENT_SESSION_ID:-}" ]]; then
+    echo "raptor: Copilot session service policy refuses a nested frontend/harness." >&2
+    echo "  Use the already-running Copilot session; another CLI process cannot prove the same account." >&2
+    exit 1
+fi
 STARTUP_ARGS=("--caller-dir" "$RAPTOR_CALLER_DIR")
 FRONTEND_ARGS=()
 FRONTEND_MODEL=""
@@ -844,6 +852,9 @@ if [[ "$FRONTEND" == "copilot" && "$CONTINUE_SESSION" -eq 0 ]]; then
 fi
 unset CONTINUE_SESSION COPILOT_SESSION_MODE
 export RAPTOR_FRONTEND="$FRONTEND"
+if [[ "$FRONTEND" == "copilot" ]]; then
+    export RAPTOR_SESSION_SERVICE_POLICY="copilot-only"
+fi
 if [[ -n "$FRONTEND_MODEL" ]]; then
     export RAPTOR_FRONTEND_MODEL="$FRONTEND_MODEL"
 else

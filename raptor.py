@@ -937,6 +937,11 @@ def _get_or_start_dispatcher(audit_path=None):
     in-memory/logger-only. First construction wins — the singleton's
     audit destination cannot move mid-invocation.
     """
+    from core.security.session_services import (
+        ServiceAuthorizationError,
+        require_service_authorization,
+    )
+    require_service_authorization("a standalone LLM dispatcher")
     global _active_dispatcher
     if _active_dispatcher is not None:
         return _active_dispatcher
@@ -990,6 +995,8 @@ def _get_or_start_dispatcher(audit_path=None):
         )
         atexit.register(_active_dispatcher.shutdown)
         return _active_dispatcher
+    except ServiceAuthorizationError:
+        raise
     except Exception as exc:  # noqa: BLE001
         # Failure to start the dispatcher must not break the run —
         # fall through to the env-direct path. The fallback itself is
@@ -1144,6 +1151,17 @@ def _run_script(script_path: Path, args: list, out_dir: Path | None = None) -> i
     try:
         from core.config import RaptorConfig
         from core.sandbox.disable_consent import passthrough_nonce_env
+        from core.security.session_services import (
+            report_session_service_policy,
+            session_services_restricted,
+        )
+        if session_services_restricted():
+            report_session_service_policy()
+            return subprocess.run(
+                cmd,
+                env=RaptorConfig.get_safe_env(include_python_user_base=True),
+                check=False,
+            ).returncode
         audit_path = None
         if out_dir is not None:
             from core.llm.dispatcher.lifecycle import audit_path_for_run_dir

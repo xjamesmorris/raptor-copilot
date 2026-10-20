@@ -20,6 +20,10 @@ from core.llm.models_config_perm import (
     refuse_exposed_inline_keys,
 )
 from core.logging import get_logger
+from core.security.session_services import (
+    report_session_service_policy,
+    session_services_restricted,
+)
 
 logger = get_logger()
 
@@ -159,6 +163,9 @@ _ollama_checked: bool = False
 
 def _get_available_ollama_models() -> list[str]:
     """Get list of available Ollama models. Cached per-process to avoid repeated HTTP checks."""
+    if session_services_restricted():
+        report_session_service_policy()
+        return []
     global _cached_ollama_models, _ollama_checked
     if _ollama_checked:
         return _cached_ollama_models or []
@@ -722,6 +729,9 @@ def _read_config_models() -> list:
     try:
         from core.json import load_json_with_comments
 
+        if session_services_restricted():
+            report_session_service_policy()
+            return []
         config_path = _models_config_path()
 
         data = load_json_with_comments(config_path)
@@ -909,6 +919,11 @@ def detect_llm_availability() -> LLMAvailability:
     Returns:
         LLMAvailability with three flags: external_llm, claude_code, llm_available
     """
+    if session_services_restricted():
+        report_session_service_policy()
+        return LLMAvailability(
+            external_llm=False, claude_code=False, llm_available=False,
+        )
     global _cached_llm_availability
     if _cached_llm_availability is not None:
         return _cached_llm_availability

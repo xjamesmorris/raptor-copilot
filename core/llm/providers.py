@@ -510,6 +510,8 @@ class LLMProvider(ABC):
     """Abstract base class for LLM providers."""
 
     def __init__(self, config: ModelConfig) -> None:
+        from core.security.session_services import require_service_authorization
+        require_service_authorization("a standalone LLM provider")
         import threading
         self.config = config
         self.total_tokens = 0
@@ -607,6 +609,8 @@ class LLMProvider(ABC):
 
     def validate_pinned_route(self) -> None:
         """Reject mutation of a route pinned by :class:`LLMClient`."""
+        from core.security.session_services import require_service_authorization
+        require_service_authorization("a standalone LLM request")
         snapshot = getattr(self, "_raptor_pinned_route_snapshot", None)
         if not isinstance(snapshot, PinnedRouteSnapshot):
             return
@@ -5817,6 +5821,8 @@ def create_provider(config: ModelConfig) -> LLMProvider:
     Returns:
         LLMProvider instance
     """
+    from core.security.session_services import require_service_authorization
+    require_service_authorization("a standalone LLM provider")
     provider = config.provider.lower()
     if provider in (
         "claudecode-resumable",

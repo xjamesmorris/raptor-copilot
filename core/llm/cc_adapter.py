@@ -126,6 +126,8 @@ _CC_TRANSPORT_DISABLED_ENV = "RAPTOR_CC_TRANSPORT_DISABLED"
 
 def cc_transport_disabled() -> bool:
     """True when live ``claude`` CLI spawns are administratively off."""
+    from core.security.session_services import require_service_authorization
+    require_service_authorization("the Claude Code harness")
     import os as _os
     return _os.environ.get(_CC_TRANSPORT_DISABLED_ENV, "") not in ("", "0")
 
@@ -223,6 +225,8 @@ def cc_subprocess_env(
     children that execute target-repo code: get_safe_env()'s whole
     point is that untrusted children never see cloud credentials.
     """
+    from core.security.session_services import require_service_authorization
+    require_service_authorization("the Claude Code harness")
     import os
 
     from core.config import RaptorConfig

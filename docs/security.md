@@ -234,6 +234,34 @@ This section covers the repository-facing threat model and process-level
 controls; the agent guide covers per-agent capability declarations, network
 hooks, credential isolation, and SAGE trust boundaries.
 
+### Copilot session service isolation
+
+`core/security/session_services.py` treats Copilot identity as a restriction,
+never as authorization for a standalone SDK, another harness, a saved
+account, or a local sidecar. It suppresses automatic probes and refuses
+provider, dispatcher, HTTP, network-enabled subprocess, and SAGE paths.
+No persistent grant, trust flag, model choice, or environment opt-out can
+authorize them. The active Copilot account is opaque to RAPTOR; an unknown
+account is refused rather than inferred from a hostname or model name.
+
+At repository Python bootstrap, `offline_network.py` installs an inherited
+Linux seccomp ceiling: socket creation/connections, io_uring, and
+cross-process fd acquisition cannot supply a network route. Addressable
+datagram socketpairs are denied; anonymous stream/seqpacket pairs remain
+available. Bootstrap refuses already-open socket/io_uring descriptors,
+already-started threads, and unavailable containment. A Python audit hook
+also supplies explicit errors before DNS or direct SDK connections.
+
+This is a process-tree network ceiling, not a replacement for the target
+sandbox or an OS-wide firewall. Copilot's own authentication/routing, native
+host tools and MCP/extensions, processes started earlier, and malicious
+same-UID changes to the framework are outside it. Shell commands that never
+enter repository Python are not generally contained; the SAGE wrappers and
+nested frontend launcher have explicit early refusals. Project instructions
+require fresh, operation/account-specific approval on host-owned surfaces.
+No verified in-repository scoped authorization bridge currently exists, so
+network-dependent repository commands remain blocked under Copilot.
+
 ---
 
 ## Security Invariants

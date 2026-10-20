@@ -1228,14 +1228,12 @@ def test_native_copilot_rejects_ambiguous_resume_before_exec(
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
-def test_native_copilot_exec_scrubs_inherited_session_markers(tmp_path):
+def test_native_copilot_exec_scrubs_inherited_loader_markers(tmp_path):
     workspace, launcher, capture, env = _native_frontend_argv_harness(
         tmp_path,
         "copilot",
     )
     for name in (
-        "COPILOT_AGENT_SESSION_ID",
-        "COPILOT_CLI",
         "COPILOT_CLI_BINARY_VERSION",
         "COPILOT_CLI_RESOLVED_DIST_DIR",
         "COPILOT_LOADER_PID",
@@ -1252,6 +1250,7 @@ def test_native_copilot_exec_scrubs_inherited_session_markers(tmp_path):
     assert result.returncode == 0, (result.stdout, result.stderr)
     argv, fields = _read_native_frontend_capture(capture)
     assert "--session-id=exact-session" in argv
+    assert fields["env.RAPTOR_SESSION_SERVICE_POLICY"] == "copilot-only"
     for name in (
         "COPILOT_AGENT_SESSION_ID",
         "COPILOT_CLI",
@@ -1260,6 +1259,25 @@ def test_native_copilot_exec_scrubs_inherited_session_markers(tmp_path):
         "COPILOT_LOADER_PID",
     ):
         assert fields[f"env.{name}"] == "<unset>"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
+@pytest.mark.parametrize("frontend", ("claude", "copilot"))
+@pytest.mark.parametrize("marker", (
+    "COPILOT_CLI", "COPILOT_AGENT_SESSION_ID",
+    "RAPTOR_FRONTEND", "RAPTOR_SESSION_SERVICE_POLICY",
+))
+def test_copilot_session_refuses_nested_frontend(tmp_path, frontend, marker):
+    workspace, launcher, capture, env = _native_frontend_argv_harness(
+        tmp_path, frontend,
+    )
+    env[marker] = "copilot" if marker == "RAPTOR_FRONTEND" else "fixture-session"
+    result = _run_native_frontend(
+        launcher, workspace, env, ("--frontend", frontend),
+    )
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert "refuses a nested frontend/harness" in result.stderr
+    assert not capture.exists()
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")

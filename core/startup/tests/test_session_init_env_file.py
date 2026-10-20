@@ -104,6 +104,7 @@ def test_frontend_metadata_roundtrips(
     monkeypatch.setenv("CLAUDE_ENV_FILE", str(env_file))
     monkeypatch.setenv("RAPTOR_FRONTEND", "copilot")
     monkeypatch.setenv("RAPTOR_FRONTEND_MODEL", "gpt-5.6-sol")
+    monkeypatch.setenv("RAPTOR_SESSION_SERVICE_POLICY", "copilot-only")
     monkeypatch.setattr(session_init, "REPO_ROOT", root)
 
     session_init.write_env_file()
@@ -113,7 +114,8 @@ def test_frontend_metadata_roundtrips(
             "bash",
             "-c",
             f"source {str(env_file)!r} && "
-            'printf "%s|%s" "$RAPTOR_FRONTEND" "$RAPTOR_FRONTEND_MODEL"',
+            'printf "%s|%s|%s" "$RAPTOR_FRONTEND" "$RAPTOR_FRONTEND_MODEL" '
+            '"$RAPTOR_SESSION_SERVICE_POLICY"',
         ],
         capture_output=True,
         text=True,
@@ -121,7 +123,18 @@ def test_frontend_metadata_roundtrips(
         timeout=30,
     )
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout == "copilot|gpt-5.6-sol"
+    assert proc.stdout == "copilot|gpt-5.6-sol|copilot-only"
+
+
+def test_copilot_startup_does_not_spawn_sage_warmup(session_init, monkeypatch):
+    from unittest.mock import Mock
+
+    monkeypatch.setenv("COPILOT_CLI", "1")
+    monkeypatch.setenv("SAGE_ENABLED", "1")
+    spawn = Mock(side_effect=AssertionError("must not start another service"))
+    monkeypatch.setattr(subprocess, "Popen", spawn)
+    session_init.warm_sage_embeddings()
+    spawn.assert_not_called()
 
 
 def test_import_does_not_leak_test_module(session_init):

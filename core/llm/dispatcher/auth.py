@@ -257,6 +257,8 @@ class CredentialStore:
     """
 
     def __init__(self) -> None:
+        from core.security.session_services import require_service_authorization
+        require_service_authorization("loading standalone provider credentials")
         # Read each provider's key into private state. Store is
         # mutable so tests can inject fakes without touching env.
         # Pre-read GOOGLE_API_KEY so it's always erased even when
@@ -1394,6 +1396,8 @@ def seed_from_config(store: CredentialStore) -> None:
     Raises:
         WorldReadableModelsConfigError: see above.
     """
+    from core.security.session_services import require_service_authorization
+    require_service_authorization("loading saved provider credentials")
     try:
         from core.json import load_json_with_comments
     except ImportError:

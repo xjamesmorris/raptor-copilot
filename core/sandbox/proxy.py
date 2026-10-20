@@ -1612,6 +1612,8 @@ class EgressProxy:
                  no_proxy: str | None = None,
                  audit_log_only: bool = False,
                  audit_enforce: bool = False) -> None:
+        from core.security.session_services import require_service_authorization
+        require_service_authorization("an outbound service proxy")
         self._hosts_lock = threading.Lock()
         self._allowed_hosts: set[str] = {h.lower() for h in allowed_hosts}
         _warn_doh_hosts(self._allowed_hosts)

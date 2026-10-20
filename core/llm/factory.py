@@ -76,7 +76,8 @@ def get_client(
         return LLMClient(cfg)
     except Exception as e:  # noqa: BLE001
         from core.llm.accounting import LLMPolicyError
-        if isinstance(e, LLMPolicyError):
+        from core.security.session_services import ServiceAuthorizationError
+        if isinstance(e, (LLMPolicyError, ServiceAuthorizationError)):
             raise
         logger.warning("LLM client not available: %s", e)
         return None

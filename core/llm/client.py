@@ -28,6 +28,12 @@ from typing import Any
 
 from core.hash import sha256_string
 from core.logging import get_logger
+from core.security.session_services import (
+    ServiceAuthorizationError,
+    report_session_service_policy,
+    require_service_authorization,
+    session_services_restricted,
+)
 
 from .accounting import (
     AccountingCapability,
@@ -1874,7 +1880,12 @@ class LLMClient:
         # proxy chain, subprocess-env separation).
         from .egress import enable_llm_egress
         try:
-            enable_llm_egress(self.config)
+            if session_services_restricted():
+                report_session_service_policy()
+            else:
+                enable_llm_egress(self.config)
+        except ServiceAuthorizationError:
+            raise
         except Exception as e:                          # noqa: BLE001
             # Fail open: a proxy bring-up failure must not block LLM
             # calls entirely. Log and continue with direct egress.
@@ -2013,6 +2024,7 @@ class LLMClient:
         Provider construction is cheap (no network) so holding the
         lock across `create_provider` is fine.
         """
+        require_service_authorization("a standalone LLM request")
         self._validate_pinned_route(model_config)
         key = f"{model_config.provider}:{model_config.model_name}"
 
@@ -4345,7 +4357,7 @@ class LLMClient:
                         # failed" RuntimeError, losing the typed
                         # contract.
                         raise
-                    except LLMPolicyError as e:
+                    except (LLMPolicyError, ServiceAuthorizationError) as e:
                         if (
                             attempt_ledger is not None
                             and attempt_ledger.settled
@@ -5123,7 +5135,7 @@ class LLMClient:
                         # blanket handler so typed callers see it.
                         # See ``generate`` above for the rationale.
                         raise
-                    except LLMPolicyError as e:
+                    except (LLMPolicyError, ServiceAuthorizationError) as e:
                         if (
                             attempt_ledger is not None
                             and attempt_ledger.settled

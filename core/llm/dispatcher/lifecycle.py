@@ -21,6 +21,8 @@ import os
 import threading
 from pathlib import Path
 
+from core.security.session_services import ServiceAuthorizationError
+
 from .auth import (
     CredentialStore,
     WorldReadableModelsConfigError,
@@ -176,6 +178,8 @@ def ensure_inprocess_dispatcher_env(
     sees the first one's route and no-ops instead of constructing a
     duplicate dispatcher whose env write clobbers the winner's.
     """
+    from core.security.session_services import require_service_authorization
+    require_service_authorization("an LLM dispatcher route")
     with _INPROCESS_ENV_LOCK:
         if os.environ.get("RAPTOR_LLM_SOCKET"):
             return None
@@ -262,7 +266,8 @@ def ensure_route_for_client(
     or none is needed (same gates as
     :func:`ensure_route_for_model_configs`).
 
-    Never raises: callers treat bring-up as fire-and-forget —
+    Service authorization refusals are terminal. Other bring-up errors
+    remain fire-and-forget —
     provider/transport errors surface at call time on the LLM call
     itself, and an oddly-shaped client config must not abort a CLI
     that may never route a dispatcher-only model.
@@ -280,6 +285,8 @@ def ensure_route_for_client(
         configs = [getattr(client.config, "primary_model", None)]
         configs += list(getattr(client.config, "fallback_models", []) or [])
         ensure_route_for_model_configs(configs, label=label, run_dir=run_dir)
+    except ServiceAuthorizationError:
+        raise
     except WorldReadableModelsConfigError as exc:
         import sys
         # The message embeds the config path (operator env) — render
