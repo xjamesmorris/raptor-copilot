@@ -1,6 +1,6 @@
 # Copilot workstream TODO
 
-Updated: October 16, 2026.
+Updated: October 19, 2026.
 
 This is the shared workstream backlog. `local-issues.txt` remains the operator's
 personal observation file; it is not this tracker and is not modified here.
@@ -323,4 +323,14 @@ path; `HANDOFF.md` and `HUMAN-REVIEW.md` are older September 13 snapshots.
 
 ## Phase 2: Post-MVP
 
-No tasks assigned.
+- [ ] **POST-01 - Correct build-system reporting for Rust and non-build languages.**
+
+  An agentic scan of `litebox` on October 19, 2026 warned that no build
+  system detection exists for Rust, assembly, or shell even though the
+  target has Cargo manifests and CodeQL analyzed Rust. The target-shape
+  probe asks `BuildDetector` about languages it cannot classify.
+
+  **Done when:** recognize Cargo for Rust in descriptive build metadata,
+  avoid unsupported-language warnings for assembly and shell, and test
+  mixed-language targets. Preserve the existing no-build CodeQL behavior
+  unless the operator explicitly opts into running repository build scripts.

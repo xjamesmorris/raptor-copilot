@@ -40,6 +40,7 @@ from core.run.output import unique_run_suffix
 from core.run.parent_liveness import maybe_start_orphan_watchdog
 from core.run.safe_io import safe_run_mkdir
 from core.sandbox import SANDBOX_ENGAGE_EXIT_CODE, SandboxSetupError, set_pdeathsig
+from core.security.session_services import session_services_restricted
 
 # Parent-death preexec for detached child spawns, built once at import:
 # the factory primes the libc cache parent-side (find_library may shell
@@ -167,64 +168,69 @@ def _drop_unreachable_registry_packs(
     ]
     if not needs_network:
         return configs
-    import os
-    import socket
-    from urllib.parse import urlsplit
-    # Probe the FIRST HOP semgrep will actually use. On
-    # mandatory-egress-proxy hosts a direct TCP connect to
-    # semgrep.dev:443 always fails even though semgrep (which honours
-    # proxy env) can fetch registry packs fine — pre-fix that
-    # misclassified every proxied host as airgapped and silently
-    # dropped all registry packs. When a proxy is configured for
-    # https (and semgrep.dev isn't no_proxy'd), reachability of the
-    # proxy itself is the meaningful signal.
-    probe_host, probe_port = "semgrep.dev", 443
-    proxy_url = (
-        os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
-        or os.environ.get("all_proxy") or os.environ.get("ALL_PROXY")
-    )
-    if proxy_url:
-        from core.http.urllib_backend import _host_in_no_proxy
-        raw_no = os.environ.get("no_proxy") or os.environ.get("NO_PROXY") or ""
-        no_proxy = tuple(e.strip() for e in raw_no.split(",") if e.strip())
-        if not _host_in_no_proxy("semgrep.dev", no_proxy):
-            parsed = urlsplit(
-                proxy_url if "://" in proxy_url else f"http://{proxy_url}"
-            )
-            if parsed.hostname:
-                probe_host = parsed.hostname
-                probe_port = parsed.port or (
-                    443 if parsed.scheme == "https" else 80
+    restricted = session_services_restricted()
+    if not restricted:
+        import socket
+        from urllib.parse import urlsplit
+        # Probe the FIRST HOP semgrep will actually use. On
+        # mandatory-egress-proxy hosts a direct TCP connect to
+        # semgrep.dev:443 always fails even though semgrep (which honours
+        # proxy env) can fetch registry packs fine — pre-fix that
+        # misclassified every proxied host as airgapped and silently
+        # dropped all registry packs. When a proxy is configured for
+        # https (and semgrep.dev isn't no_proxy'd), reachability of the
+        # proxy itself is the meaningful signal.
+        probe_host, probe_port = "semgrep.dev", 443
+        proxy_url = (
+            os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
+            or os.environ.get("all_proxy") or os.environ.get("ALL_PROXY")
+        )
+        if proxy_url:
+            from core.http.urllib_backend import _host_in_no_proxy
+            raw_no = os.environ.get("no_proxy") or os.environ.get("NO_PROXY") or ""
+            no_proxy = tuple(e.strip() for e in raw_no.split(",") if e.strip())
+            if not _host_in_no_proxy("semgrep.dev", no_proxy):
+                parsed = urlsplit(
+                    proxy_url if "://" in proxy_url else f"http://{proxy_url}"
                 )
-    try:
-        # create_connection iterates every getaddrinfo family — an
-        # AF_INET-only socket misclassified IPv6-only hosts/proxies
-        # as airgapped and dropped every registry pack.
-        sock = socket.create_connection(
-            (probe_host, probe_port), timeout=3,
-        )
-        sock.close()
-        return configs
-    except (TimeoutError, OSError):
-        dropped = [n for n, _ in needs_network]
-        logger.warning(
-            "semgrep.dev unreachable (3 s probe failed) — "
-            "dropping %d uncached registry pack(s): %s",
-            len(dropped), ", ".join(dropped),
-        )
-        for name in dropped:
-            if name not in _dropped_registry_packs:
-                _dropped_registry_packs.append(name)
-        print(
-            f"⚠️  semgrep: {len(dropped)} registry pack(s) dropped "
-            f"({', '.join(dropped)}) — semgrep.dev unreachable and no "
-            "local cache for them. Coverage is reduced for this run; "
-            "populate engine/semgrep/rules/registry-cache/ with "
-            "engine/semgrep/tools/cache-packs.py to scan offline.",
-            file=sys.stderr,
-        )
-        drop_set = {c for _, c in needs_network}
-        return [(n, c) for n, c in configs if c not in drop_set]
+                if parsed.hostname:
+                    probe_host = parsed.hostname
+                    probe_port = parsed.port or (
+                        443 if parsed.scheme == "https" else 80
+                    )
+        try:
+            # create_connection iterates every getaddrinfo family — an
+            # AF_INET-only socket misclassified IPv6-only hosts as airgapped.
+            sock = socket.create_connection(
+                (probe_host, probe_port), timeout=3,
+            )
+            sock.close()
+            return configs
+        except (TimeoutError, OSError):
+            pass
+
+    dropped = [n for n, _ in needs_network]
+    reason = (
+        "Copilot session service policy blocks registry downloads"
+        if restricted else "semgrep.dev unreachable (3 s probe failed)"
+    )
+    logger.warning(
+        "%s — dropping %d uncached registry pack(s): %s",
+        reason, len(dropped), ", ".join(dropped),
+    )
+    for name in dropped:
+        if name not in _dropped_registry_packs:
+            _dropped_registry_packs.append(name)
+    print(
+        f"⚠️  semgrep: {len(dropped)} registry pack(s) dropped "
+        f"({', '.join(dropped)}) — {reason} and no local cache for "
+        "them. Coverage is reduced for this run; populate "
+        "engine/semgrep/rules/registry-cache/ with "
+        "engine/semgrep/tools/cache-packs.py to scan offline.",
+        file=sys.stderr,
+    )
+    drop_set = {c for _, c in needs_network}
+    return [(n, c) for n, c in configs if c not in drop_set]
 
 
 def _resolve_baseline_packs(
@@ -1140,16 +1146,19 @@ def run_single_semgrep(
         # ``static-analysis`` is hyphenated → not importable as a
         # Python package; scanner.py runs as ``__main__`` via
         # subprocess.
-        import importlib.util as _importlib_util
-        _ph_path = (
-            Path(__file__).resolve().parents[1]
-            / "semgrep" / "_proxy_hosts.py"
-        )
-        _ph_spec = _importlib_util.spec_from_file_location(
-            "static_analysis_proxy_hosts", _ph_path,
-        )
-        _ph = _importlib_util.module_from_spec(_ph_spec)
-        _ph_spec.loader.exec_module(_ph)
+        proxy_hosts = None
+        if not session_services_restricted():
+            import importlib.util as _importlib_util
+            _ph_path = (
+                Path(__file__).resolve().parents[1]
+                / "semgrep" / "_proxy_hosts.py"
+            )
+            _ph_spec = _importlib_util.spec_from_file_location(
+                "static_analysis_proxy_hosts", _ph_path,
+            )
+            _ph = _importlib_util.module_from_spec(_ph_spec)
+            _ph_spec.loader.exec_module(_ph)
+            proxy_hosts = _ph.proxy_hosts_for_semgrep()
         # ``fake_home=True``: sandbox layer materialises HOME + four
         # XDG_*_HOME dirs inside ``output``, with symlink-TOCTOU defence,
         # and merges its override into the subprocess env (winning over
@@ -1179,7 +1188,7 @@ def run_single_semgrep(
             # The child's write grant is its work subdir, NOT out_dir
             # (see child_dir above); the fake HOME lands inside it.
             target=str(repo_path), output=str(child_dir),
-            proxy_hosts=_ph.proxy_hosts_for_semgrep(),
+            proxy_hosts=proxy_hosts,
             caller_label="scanner-semgrep",
             fake_home=True,
             readable_paths=_pack_readable or None,

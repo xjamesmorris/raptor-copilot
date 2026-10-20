@@ -126,6 +126,21 @@ def _vendored_stdlib_roots(lang: str) -> list[Path]:
     return []
 
 
+def _installed_cli_pack_roots(codeql_cli: str | None) -> list[Path]:
+    """Return the qlpacks root shipped with the installed CodeQL CLI.
+
+    The standard suite can run entirely from the CLI distribution even when
+    ``~/.codeql/packages`` has no exact version pinned by RAPTOR's older IRIS
+    lockfile. Passing this root through ``--additional-packs`` lets CodeQL
+    resolve compatible locally-installed library packs without a networked
+    ``pack install`` round trip.
+    """
+    if not codeql_cli:
+        return []
+    root = Path(codeql_cli).resolve().parent / "qlpacks"
+    return [root] if root.is_dir() else []
+
+
 def vendored_stdlib_roots(lang: str) -> list[Path]:
     """Public seam over ``_vendored_stdlib_roots`` for out-of-package
     consumers (``core.iris.codeql_runner``): the vendored ``<lang>-all``
@@ -1495,11 +1510,19 @@ class QueryRunner:
     ) -> "QueryResult":
         """Per-language worker for `analyze_iris_packs` — pack install
         followed by analyze."""
+        roots = _vendored_stdlib_roots(lang)
+        if not roots:
+            roots = _installed_cli_pack_roots(self.codeql_cli)
+        extra: tuple[str, ...] = tuple(
+            f"--additional-packs={root}" for root in roots
+        )
         return self._run_local_pack(
             lang, db, pack_dir, out_dir,
             suite_name="raptor-iris-local",
             sarif_name=f"codeql_{lang}_iris.sarif",
             label="IRIS LocalFlowSource",
+            extra_analyze_args=extra,
+            skip_install=bool(roots),
         )
 
     def _run_local_pack(

@@ -390,6 +390,10 @@ Options:
   --frontend HOST    Interactive frontend: claude (default) or copilot
                      (Copilot requires a native Linux executable)
   -m, --model MODEL  Choose the frontend model
+  --max-findings N   Start agentic scan with an analysis cap of N
+                     (0 = no cap; new sessions only)
+  --max-cost-usd USD Start agentic scan with a positive LLM cost cap
+                     (inf uses tuning default or no cap; new sessions only)
   --max-ai-credits N Copilot session limit (installed CLI minimum: 30)
   -p, --project NAME Set the active project
   --yolo             Copilot all-permissions opt-in; passed through unchanged
@@ -633,6 +637,11 @@ _validate_copilot_ai_credits() {
         fi
     fi
 }
+_validate_max_cost_usd() {
+    local value="$1"
+    [[ "$value" =~ ^(inf|([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?)$ ]] || return 1
+    python3 -c 'import math, sys; n = float(sys.argv[1]); sys.exit(not (n > 0 and (math.isfinite(n) or sys.argv[1] == "inf")))' "$value"
+}
 if [[ "$FRONTEND" == "copilot" ]]; then
     # Pin the executable whose device/inode was captured in the strong host
     # claim instead of allowing an auto-update handoff during launch.
@@ -643,6 +652,8 @@ fi
 INITIAL_PROMPT="/raptor"
 TARGET=""
 TRUST_REPO_ARG=""
+MAX_FINDINGS=""
+MAX_COST_USD=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -p|--project)
@@ -777,6 +788,44 @@ while [[ $# -gt 0 ]]; do
             FRONTEND_ARGS+=("$1")
             shift
             ;;
+        --max-findings|--max-findings=*)
+            if [[ "$1" == --max-findings=* ]]; then
+                _findings_value="${1#--max-findings=}"
+                shift
+            else
+                [[ $# -ge 2 ]] || {
+                    echo "raptor: --max-findings requires a non-negative integer" >&2
+                    exit 1
+                }
+                _findings_value="$2"
+                shift 2
+            fi
+            if [[ ! "$_findings_value" =~ ^[0-9]+$ ]]; then
+                echo "raptor: --max-findings requires a non-negative integer" >&2
+                exit 1
+            fi
+            MAX_FINDINGS="$_findings_value"
+            unset _findings_value
+            ;;
+        --max-cost-usd|--max-cost-usd=*)
+            if [[ "$1" == --max-cost-usd=* ]]; then
+                _cost_value="${1#--max-cost-usd=}"
+                shift
+            else
+                [[ $# -ge 2 ]] || {
+                    echo "raptor: --max-cost-usd requires a positive USD amount or inf" >&2
+                    exit 1
+                }
+                _cost_value="$2"
+                shift 2
+            fi
+            if ! _validate_max_cost_usd "$_cost_value"; then
+                echo "raptor: --max-cost-usd requires a positive USD amount or inf" >&2
+                exit 1
+            fi
+            MAX_COST_USD="$_cost_value"
+            unset _cost_value
+            ;;
         --max-ai-credits)
             if [[ "$FRONTEND" == "copilot" ]]; then
                 [[ $# -ge 2 ]] || {
@@ -847,6 +896,14 @@ if [[ "$FRONTEND" == "copilot"
     echo "raptor: --resume cannot be combined with a target" >&2
     exit 1
 fi
+if [[ -n "$MAX_FINDINGS" && "$CONTINUE_SESSION" -eq 1 ]]; then
+    echo "raptor: --max-findings requires a new session (not --continue or --resume)" >&2
+    exit 1
+fi
+if [[ -n "$MAX_COST_USD" && "$CONTINUE_SESSION" -eq 1 ]]; then
+    echo "raptor: --max-cost-usd requires a new session (not --continue or --resume)" >&2
+    exit 1
+fi
 if [[ "$FRONTEND" == "copilot" && "$CONTINUE_SESSION" -eq 0 ]]; then
     FRONTEND_ARGS+=("--name" "RAPTOR")
 fi
@@ -900,6 +957,28 @@ if [ -n "$_target_clean" ] && [ -d "$_target_clean" ]; then
     fi
 elif [ -d "$RAPTOR_CALLER_DIR" ]; then
     CHECK_TARGET="$RAPTOR_CALLER_DIR"
+fi
+if [ -n "$MAX_FINDINGS" ] || [ -n "$MAX_COST_USD" ]; then
+    INITIAL_PROMPT="/agentic"
+    if [ -n "$MAX_FINDINGS" ]; then
+        INITIAL_PROMPT+=" --max-findings $MAX_FINDINGS"
+    fi
+    if [ -n "$MAX_COST_USD" ]; then
+        INITIAL_PROMPT+=" --max-cost-usd $MAX_COST_USD"
+    fi
+    if [ -n "$_target_clean" ]; then
+        if [ ! -d "$_target_clean" ]; then
+            if [ -n "$MAX_FINDINGS" ]; then
+                echo "raptor: --max-findings requires a repository directory target" >&2
+            else
+                echo "raptor: --max-cost-usd requires a repository directory target" >&2
+            fi
+            exit 1
+        fi
+        printf -v _repo_arg '%q' "$CHECK_TARGET"
+        INITIAL_PROMPT+=" --repo $_repo_arg"
+        unset _repo_arg
+    fi
 fi
 unset _target_clean
 

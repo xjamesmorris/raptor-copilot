@@ -1002,6 +1002,337 @@ def test_native_copilot_new_session_orderings_are_unambiguous(
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
 @pytest.mark.parametrize(
+    ("frontend", "cap_args", "target_arg", "cap"),
+    (
+        ("copilot", ("--max-findings", "500"), "{target}", "500"),
+        ("copilot", ("--max-findings=0",), "target", "0"),
+        ("claude", ("--max-findings", "25"), "{target}", "25"),
+    ),
+    ids=("copilot-separated", "copilot-equals-relative", "claude-separated"),
+)
+def test_launcher_max_findings_starts_agentic_in_selected_frontend(
+    tmp_path,
+    frontend,
+    cap_args,
+    target_arg,
+    cap,
+):
+    workspace, launcher, capture, env = _native_frontend_argv_harness(
+        tmp_path,
+        frontend,
+    )
+    _, target = _create_probe_project(workspace)
+    launch_args = (
+        "--frontend", frontend, "--yolo", "--model",
+        "gpt-6-astra" if frontend == "copilot" else "sonnet",
+        *cap_args, target_arg,
+    )
+
+    result = _run_native_frontend(
+        launcher,
+        workspace,
+        env,
+        _expand_target(launch_args, target),
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    argv, fields = _read_native_frontend_capture(capture)
+    prompt = f"/agentic --max-findings {cap} --repo {target}"
+    if frontend == "copilot":
+        assert argv[-2:] == ["-i", prompt]
+    else:
+        assert argv[-1] == prompt
+    assert "--yolo" in argv
+    assert "--max-findings" not in argv
+    assert not any(arg.startswith("--max-findings=") for arg in argv)
+    assert fields["env.RAPTOR_FRONTEND_MODEL"] == (
+        "gpt-6-astra" if frontend == "copilot" else "sonnet"
+    )
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
+def test_native_copilot_max_findings_without_target_uses_default_target(
+    tmp_path,
+):
+    workspace, launcher, capture, env = _native_frontend_argv_harness(
+        tmp_path,
+        "copilot",
+    )
+
+    result = _run_native_frontend(
+        launcher,
+        workspace,
+        env,
+        ("--frontend", "copilot", "--max-findings", "500"),
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    argv, _ = _read_native_frontend_capture(capture)
+    assert argv[-2:] == ["-i", "/agentic --max-findings 500"]
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
+def test_native_copilot_max_findings_preserves_target_with_spaces(tmp_path):
+    workspace, launcher, capture, env = _native_frontend_argv_harness(
+        tmp_path,
+        "copilot",
+    )
+    target = workspace.cwd / "target with spaces"
+    target.mkdir()
+
+    result = _run_native_frontend(
+        launcher,
+        workspace,
+        env,
+        ("--frontend", "copilot", "--max-findings", "500", str(target)),
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    argv, _ = _read_native_frontend_capture(capture)
+    escaped_target = str(target).replace(" ", r"\ ")
+    assert argv[-2:] == [
+        "-i",
+        f"/agentic --max-findings 500 --repo {escaped_target}",
+    ]
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
+@pytest.mark.parametrize(
+    "cap_args",
+    (
+        ("--max-findings",),
+        ("--max-findings", "--yolo"),
+        ("--max-findings=",),
+        ("--max-findings=-1",),
+        ("--max-findings", "five"),
+    ),
+    ids=("missing", "next-option", "empty", "negative", "non-integer"),
+)
+def test_native_copilot_rejects_invalid_max_findings_before_exec(
+    tmp_path,
+    cap_args,
+):
+    workspace, launcher, capture, env = _native_frontend_argv_harness(
+        tmp_path,
+        "copilot",
+    )
+
+    result = _run_native_frontend(
+        launcher,
+        workspace,
+        env,
+        ("--frontend", "copilot", *cap_args),
+    )
+
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert "--max-findings requires a non-negative integer" in result.stderr
+    assert not capture.exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
+@pytest.mark.parametrize(
+    "session_args",
+    (("--continue",), ("--resume", "existing-session")),
+    ids=("continue", "resume"),
+)
+def test_native_copilot_max_findings_rejects_resumed_sessions(
+    tmp_path,
+    session_args,
+):
+    workspace, launcher, capture, env = _native_frontend_argv_harness(
+        tmp_path,
+        "copilot",
+    )
+
+    result = _run_native_frontend(
+        launcher,
+        workspace,
+        env,
+        ("--frontend", "copilot", *session_args, "--max-findings=500"),
+    )
+
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert "--max-findings requires a new session" in result.stderr
+    assert not capture.exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
+def test_native_copilot_max_findings_rejects_non_repo_target(tmp_path):
+    workspace, launcher, capture, env = _native_frontend_argv_harness(
+        tmp_path,
+        "copilot",
+    )
+
+    result = _run_native_frontend(
+        launcher,
+        workspace,
+        env,
+        ("--frontend", "copilot", "--max-findings", "500", "https://example.test"),
+    )
+
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert "--max-findings requires a repository directory target" in result.stderr
+    assert not capture.exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
+@pytest.mark.parametrize(
+    ("frontend", "cost_args", "findings_args", "prompt_flags"),
+    (
+        (
+            "copilot", ("--max-cost-usd", "500"),
+            ("--max-findings", "500"),
+            "--max-findings 500 --max-cost-usd 500",
+        ),
+        (
+            "copilot", ("--max-cost-usd=25.5",), (),
+            "--max-cost-usd 25.5",
+        ),
+        (
+            "claude", ("--max-cost-usd=inf",), (),
+            "--max-cost-usd inf",
+        ),
+    ),
+    ids=("copilot-combined", "copilot-cost-only", "claude-uncapped"),
+)
+def test_launcher_max_cost_usd_reaches_agentic_not_frontend(
+    tmp_path,
+    frontend,
+    cost_args,
+    findings_args,
+    prompt_flags,
+):
+    workspace, launcher, capture, env = _native_frontend_argv_harness(
+        tmp_path,
+        frontend,
+    )
+    _, target = _create_probe_project(workspace)
+
+    result = _run_native_frontend(
+        launcher,
+        workspace,
+        env,
+        ("--frontend", frontend, *cost_args, *findings_args, str(target)),
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    argv, _ = _read_native_frontend_capture(capture)
+    prompt = f"/agentic {prompt_flags} --repo {target}"
+    if frontend == "copilot":
+        assert argv[-2:] == ["-i", prompt]
+    else:
+        assert argv[-1] == prompt
+    assert not any(arg.startswith("--max-cost-usd") for arg in argv)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
+def test_native_copilot_max_cost_without_target_uses_default_target(tmp_path):
+    workspace, launcher, capture, env = _native_frontend_argv_harness(
+        tmp_path,
+        "copilot",
+    )
+
+    result = _run_native_frontend(
+        launcher,
+        workspace,
+        env,
+        ("--frontend", "copilot", "--max-cost-usd", "500"),
+    )
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    argv, _ = _read_native_frontend_capture(capture)
+    assert argv[-2:] == ["-i", "/agentic --max-cost-usd 500"]
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
+@pytest.mark.parametrize(
+    "cost_args",
+    (
+        ("--max-cost-usd",),
+        ("--max-cost-usd", "--yolo"),
+        ("--max-cost-usd=0",),
+        ("--max-cost-usd=-1",),
+        ("--max-cost-usd=NaN",),
+        ("--max-cost-usd=1e309",),
+        ("--max-cost-usd=500 --no-exploits",),
+    ),
+    ids=(
+        "missing", "next-option", "zero", "negative",
+        "nan", "overflow", "injected-flag",
+    ),
+)
+def test_native_copilot_rejects_invalid_max_cost_before_exec(
+    tmp_path,
+    cost_args,
+):
+    workspace, launcher, capture, env = _native_frontend_argv_harness(
+        tmp_path,
+        "copilot",
+    )
+
+    result = _run_native_frontend(
+        launcher,
+        workspace,
+        env,
+        ("--frontend", "copilot", *cost_args),
+    )
+
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert "--max-cost-usd requires a positive USD amount or inf" in result.stderr
+    assert not capture.exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
+@pytest.mark.parametrize(
+    "session_args",
+    (("--continue",), ("--resume", "existing-session")),
+    ids=("continue", "resume"),
+)
+def test_native_copilot_max_cost_rejects_resumed_sessions(
+    tmp_path,
+    session_args,
+):
+    workspace, launcher, capture, env = _native_frontend_argv_harness(
+        tmp_path,
+        "copilot",
+    )
+
+    result = _run_native_frontend(
+        launcher,
+        workspace,
+        env,
+        ("--frontend", "copilot", *session_args, "--max-cost-usd=500"),
+    )
+
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert "--max-cost-usd requires a new session" in result.stderr
+    assert not capture.exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
+def test_native_copilot_max_cost_rejects_non_repo_target(tmp_path):
+    workspace, launcher, capture, env = _native_frontend_argv_harness(
+        tmp_path,
+        "copilot",
+    )
+
+    result = _run_native_frontend(
+        launcher,
+        workspace,
+        env,
+        (
+            "--frontend", "copilot",
+            "--max-cost-usd", "500", "https://example.test",
+        ),
+    )
+
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert "--max-cost-usd requires a repository directory target" in result.stderr
+    assert not capture.exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process identity")
+@pytest.mark.parametrize(
     ("launcher_args", "frontend_args"),
     (
         (

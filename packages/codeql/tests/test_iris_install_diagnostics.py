@@ -182,6 +182,44 @@ def test_install_success_and_skipped_install_have_distinct_health(
     assert not any(cmd[1:3] == ["pack", "install"] for cmd in commands)
 
 
+def test_iris_uses_cli_shipped_packs_without_network_install(
+    runner, tmp_path, monkeypatch,
+):
+    installed = tmp_path / "codeql-root" / "qlpacks"
+    installed.mkdir(parents=True)
+    commands: list[list[str]] = []
+
+    def _success(cmd, **_kwargs):
+        commands.append(list(cmd))
+        _write_empty_sarif(cmd)
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout="", stderr="",
+        )
+
+    monkeypatch.setattr(core.sandbox, "run", _success)
+    monkeypatch.setattr(
+        "packages.codeql.query_runner._vendored_stdlib_roots",
+        lambda _lang: [],
+    )
+    monkeypatch.setattr(
+        "packages.codeql.query_runner._installed_cli_pack_roots",
+        lambda _cli: [installed],
+    )
+
+    result = runner._run_iris_pack(
+        "python",
+        tmp_path / "db",
+        tmp_path / "pack",
+        tmp_path / "out",
+    )
+
+    assert result.success is True
+    assert not any(cmd[1:3] == ["pack", "install"] for cmd in commands)
+    analyze = next(cmd for cmd in commands if cmd[1:3] == ["database", "analyze"])
+    assert f"--additional-packs={installed}" in analyze
+    assert result.enrichment_health["install"]["status"] == "skipped"
+
+
 def test_install_warning_and_query_failure_are_both_preserved(
     runner, tmp_path, monkeypatch,
 ):

@@ -73,6 +73,7 @@ source .venv/bin/activate
 # Start against a target, resume an exact session, or use Copilot's global
 # latest-session selection
 ./bin/raptor --frontend copilot /path/to/code
+./bin/raptor --frontend copilot --max-findings 500 --max-cost-usd 500 /path/to/code
 ./bin/raptor --frontend copilot --resume <session-id-or-name>
 ./bin/raptor --frontend copilot --continue
 
@@ -97,10 +98,25 @@ through unchanged only when the operator supplies it; RAPTOR never enables it
 by default. It is not `--trust-repo`, does not set a RAPTOR project trust
 marker, and does not weaken RAPTOR analysis sandbox policy. With a target,
 project selection remains launcher-owned while Copilot receives `--yolo` and
-the `/raptor <target>` prompt. With `--continue`, Copilot receives both
-`--yolo` and `--continue` without a new initial prompt. These recognized
-launcher options keep the same roles when ordered before or after one another
-or the target; none is reinterpreted as the target or as project trust.
+the `/raptor <target>` prompt (unless `--max-findings` or `--max-cost-usd`
+selects `/agentic`). With `--continue`, Copilot receives both `--yolo` and
+`--continue` without a new initial prompt. These recognized launcher options
+keep the same roles when ordered before or after one another or the target;
+none is reinterpreted as the target or as project trust.
+
+The launcher submits `/raptor` by default, which dispatches the agentic
+pipeline. `--max-findings N` (or `--max-findings=N`) instead submits
+`/agentic --max-findings N --repo <target>`; use `0` to remove the
+finding-count cap. `--max-cost-usd USD` (or `--max-cost-usd=USD`) submits
+`/agentic --max-cost-usd USD --repo <target>` to set a positive per-run
+LLM cost cap. You can combine the two flags; `inf` requests no per-run cap,
+but a `tuning.json` default ceiling can still apply. Both are launcher
+options, not Copilot CLI options. An explicit target must be an existing
+repository directory; without one, `/agentic` resolves the active project
+target or caller directory as usual. Neither option can be combined with
+`--continue` or `--resume`. The launcher `--model` still selects only the
+Copilot session model, not RAPTOR's finding-analysis model. Other analysis
+time and call limits still apply.
 
 Startup reports the frontend on its own line immediately above `llm:`, for
 example with an explicit `--model gpt-6-astra`:

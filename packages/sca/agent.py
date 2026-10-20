@@ -132,15 +132,15 @@ def run_sca_subprocess(
     *,
     sandbox_args: Sequence[str] = (),
     env: dict | None = None,
+    offline: bool = False,
     timeout: int | None = DEFAULT_SCA_SUBPROCESS_TIMEOUT,
     cancel_fd: int | None = None,
 ) -> tuple:
     """Run the SCA agent as a sandboxed subprocess.
 
-    Uses :func:`core.sandbox.run` with ``use_egress_proxy=True`` so the
-    child's outbound HTTPS is funnelled through the in-process proxy
-    with :data:`packages.sca.SCA_ALLOWED_HOSTS` as the hostname
-    allowlist. Landlock confines writes to ``output_dir``.
+    Online requests use the hostname-allowlisted egress proxy. Offline
+    requests keep sandbox network isolation without starting a proxy.
+    Landlock confines writes to ``output_dir``.
 
     Returns ``(returncode, stdout, stderr)``. Timeout/deadline exits use
     ``124``; caller cancellation uses ``130``. The sandbox owns process-tree
@@ -173,6 +173,9 @@ def run_sca_subprocess(
         "--skip-review",
         "--skip-triage",
     ]
+    offline = offline or "--offline" in sandbox_args
+    if offline and "--offline" not in sandbox_args:
+        cmd.append("--offline")
     child_deadline = _child_deadline_seconds(timeout)
     if child_deadline is not None:
         cmd.extend(["--deadline-seconds", str(child_deadline)])
@@ -208,12 +211,18 @@ def run_sca_subprocess(
     if not any(agent_path.is_relative_to(root) for root in source_roots):
         tool_paths.append(str(agent_path))
 
+    network_options = (
+        {"block_network": True}
+        if offline else {
+            "use_egress_proxy": True,
+            "require_proxy_netns": True,
+            "proxy_hosts": _compose_proxy_hosts(target),
+        }
+    )
     try:
         result = sandbox_run(
             cmd,
-            use_egress_proxy=True,
-            require_proxy_netns=True,  # 00015
-            proxy_hosts=_compose_proxy_hosts(target),
+            **network_options,
             caller_label="sca-agent",
             target=str(target),
             output=str(output_dir),
@@ -547,13 +556,19 @@ def _run_sandboxed(
     cache_dir = _sca_cache_root()
     cache_dir.mkdir(parents=True, exist_ok=True)
 
+    network_options = (
+        {"block_network": True}
+        if offline else {
+            "use_egress_proxy": True,
+            "require_proxy_netns": True,
+            "proxy_hosts": _compose_proxy_hosts(target),
+        }
+    )
     with sandbox(
         target=str(target),
         output=str(output_dir),
         profile=profile,
-        use_egress_proxy=True,
-        require_proxy_netns=True,  # 00015
-        proxy_hosts=_compose_proxy_hosts(target),
+        **network_options,
         caller_label="sca-agent",
         writable_paths=[str(cache_dir)],
         audit=audit,

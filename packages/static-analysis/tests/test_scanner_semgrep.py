@@ -39,6 +39,27 @@ class TestRunSingleSemgrep:
     @patch('shutil.which')
     @patch.object(_scanner_mod, "run")
     @patch.object(_scanner_mod, "validate_sarif")
+    def test_copilot_local_rules_do_not_create_egress_proxy(
+        self, mock_validate, mock_run, mock_which, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setattr(_scanner_mod, "session_services_restricted", lambda: True)
+        mock_which.return_value = "/usr/bin/semgrep"
+        mock_run.return_value = (0, '{"runs": []}', "")
+        mock_validate.return_value = True
+        rule_file = tmp_path / "rules.yaml"
+        rule_file.write_text("rules: []\n", encoding="utf-8")
+
+        _, success = run_single_semgrep(
+            name="local", config=str(rule_file),
+            repo_path=tmp_path, out_dir=tmp_path, timeout=10,
+        )
+
+        assert success is True
+        assert mock_run.call_args.kwargs["proxy_hosts"] is None
+
+    @patch('shutil.which')
+    @patch.object(_scanner_mod, "run")
+    @patch.object(_scanner_mod, "validate_sarif")
     def test_creates_output_files(self, mock_validate, mock_run, mock_which, tmp_path):
         """Test that all expected output files are created."""
         mock_which.return_value = "/usr/bin/semgrep"

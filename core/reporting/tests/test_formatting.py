@@ -137,6 +137,13 @@ class TestGetDisplayStatus(unittest.TestCase):
             {"is_true_positive": True, "is_exploitable": False, "ruling": "test_code"}
         ), "Confirmed")
 
+    def test_agentic_true_positive_unreachable_is_not_confirmed(self):
+        self.assertEqual(get_display_status({
+            "is_true_positive": True,
+            "is_exploitable": False,
+            "ruling": "unreachable",
+        }), "Unreachable")
+
     def test_true_positive_with_ruled_out_ruling_renders_ruled_out(self):
         # A real bug whose Stage-D security ruling rules it out (D-4
         # no security impact, D-2 unreachable) must not render as

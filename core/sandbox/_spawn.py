@@ -2607,6 +2607,8 @@ def run_sandboxed(
         from core.sandbox._proxy_bridge import (
             _bring_up_loopback as _loopback_up_fn,
         )
+        from core.security.session_services import session_services_restricted
+        _loopback_allowed = not session_services_restricted()
         # Bridge pairs (listen_port, unix_socket_path): the egress
         # proxy's relay plus any caller-declared extra loopback
         # services (LLM dispatcher for credential-proxy CLI children).
@@ -2985,7 +2987,10 @@ def run_sandboxed(
             # block_network. We own the netns (created by our user-ns)
             # so SIOCSIFFLAGS is permitted even pre-uidmap. Best-effort:
             # on failure the netns behaves exactly as before this fix.
-            if ns_flags & CLONE_NEWNET:
+            # The Copilot session ceiling forbids socket(AF_INET), including
+            # the ioctl socket used solely to raise lo. Leave it down there;
+            # an attempted bring-up would abort namespace setup before exec.
+            if ns_flags & CLONE_NEWNET and _loopback_allowed:
                 try:
                     _loopback_up_fn()
                 except OSError as e:

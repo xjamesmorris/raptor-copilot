@@ -40,6 +40,35 @@ _HAS_GIT = shutil.which("git") is not None
 _HAS_GPG = shutil.which("gpg") is not None
 
 
+def test_copilot_signature_probe_uses_private_writable_gpg_home(
+    tmp_path, monkeypatch,
+):
+    from packages.sca.supply_chain import workflow_signing
+
+    monkeypatch.setattr(
+        workflow_signing, "session_services_restricted", lambda: True,
+    )
+    observed = {}
+
+    def fake_git(cmd, *, env, **kwargs):
+        home = Path(env["GNUPGHOME"])
+        assert env["HOME"] == str(home)
+        assert home.is_dir()
+        assert home.stat().st_mode & 0o777 == 0o700
+        observed["home"] = home
+        return subprocess.CompletedProcess(
+            cmd, 0, "a" * 40 + "\x00E\x00Signer\x00nobody@example.test\x00signed\n", "",
+        )
+
+    monkeypatch.setattr(workflow_signing.subprocess, "run", fake_git)
+    rows = workflow_signing._git_log_signatures(
+        tmp_path, (".github/workflows",),
+    )
+
+    assert rows[0][1] == "E"
+    assert not observed["home"].exists()
+
+
 def _patch_safe_env_for_gnupghome(monkeypatch, gnupghome: str) -> None:
     """Make ``RaptorConfig.get_safe_env()`` include GNUPGHOME.
 

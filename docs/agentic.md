@@ -44,6 +44,11 @@ scan  →  dedup  →  prep  →  analyse (per finding)
 
 1. **Scan** -- Semgrep, with CodeQL in parallel by default (disable with
    `--no-codeql`, or set `codeql_enabled: false` in tuning.json).
+   In Copilot sessions the service boundary keeps scanner workers offline:
+   Semgrep drops uncached registry packs but runs local rules, and the
+   mechanical SCA phase uses cached advisories only. LLM analysis is handed
+   to host-managed Copilot subagents through bounded result parts; repository
+   code never launches another harness or receives session credentials.
    C/C++ CodeQL databases build in buildless mode by default (no repo
    build scripts execute); pass `--traced-build` to opt into
    full-fidelity traced extraction on a repo you trust (see
@@ -210,10 +215,14 @@ Findings are dispatched for analysis one of two ways:
   configured in `models.json` or environment variables.  When both are
   available, the external LLM is preferred; Claude Code is the fallback.
 
-If **neither** is available, the pipeline produces prep-only output (scan,
-dedup, prep, dataflow -- no analysis).  In that mode the findings sit in
-`autonomous_analysis_report.json` with code and dataflow attached, ready for
-manual analysis.
+If **neither** is available outside Copilot, Phase 3 is skipped; the
+aggregate report marks the findings unreviewed. Under Copilot, `/agentic`
+runs Phase 3 mechanically with `--prep-only`, writes a native handoff
+manifest, and the top-level session dispatches managed subagents. Each
+subagent owns one non-overlapping part, and a deterministic finalizer rejects
+missing, duplicate, extra, stale, or schema-invalid results before completing
+the original run. Exploitable native results must carry a bounded PoC and a
+mechanically reviewable unified-diff patch; snippets/prose do not pass lint.
 
 ### Persona injection
 
@@ -333,12 +342,14 @@ or this session's project directory).
 | File | Contents |
 |------|----------|
 | `agentic-report.md` | Human-readable summary |
-| `autonomous_analysis_report.json` | Structured data -- all findings with analysis, verdicts, and metadata |
+| `autonomous_analysis_report.json` | Structured Phase 3 findings (only when Phase 3 runs) |
 | `suppressions.jsonl` | Pre-LLM suppression audit trail (binary oracle, guard dominance, fail-open channel, SAGE prior verdicts) |
 
-The report carries one of three modes:
+When Phase 3 runs, its autonomous report carries one of three modes; without
+an LLM, there is no autonomous report or mode and the aggregate assessment is
+partial.
 
-- **`prep_only`** -- no LLM ran; findings have `code`, `surrounding_context`,
+- **`prep_only`** -- the preparation subprocess ran; findings have `code`, `surrounding_context`,
   `dataflow`, and `feasibility` attached for manual review.
 - **`full`** -- sequential LLM analysis (`--sequential`, or no Claude Code).
 - **`orchestrated`** -- parallel analysis; findings carry `analysed_by`,

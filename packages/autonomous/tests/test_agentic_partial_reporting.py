@@ -34,6 +34,28 @@ def _complete_assessment(count: int = 10) -> dict:
         cap_source="explicit",
     )
 
+def test_cache_only_sca_is_usable_but_keeps_assessment_partial():
+    tools = {
+        "semgrep": _tool_state("completed", requested=True, findings=2),
+        "codeql": _tool_state("skipped", requested=False),
+        "sca": _tool_state(
+            "completed", requested=True, findings=1, degraded=True,
+            offline=True, reason="offline cache-only advisory coverage",
+        ),
+    }
+
+    result = _build_run_result(tools, _complete_assessment())
+    section = _build_tool_execution_report_section(tools).content
+
+    assert result["status"] == "partial"
+    assert result["scanners"]["usable"] == ["semgrep", "sca"]
+    assert any(
+        reason.startswith("SCA degraded: offline cache-only")
+        for reason in result["partial_reasons"]
+    )
+    assert "SCA | Completed" in section
+    assert "offline cache-only" in section
+
 
 def test_dispatch_failure_summary_keeps_failed_review_beside_success():
     summary = _dispatch_failure_summary({
@@ -157,6 +179,23 @@ def test_codeql_enrichment_failure_stays_separate_from_scanner_failure():
     assert codeql["failed"] is False
     assert codeql["enrichment_status"] == "failed"
     assert "enrichment failed" in codeql["reason"]
+
+    result = _build_run_result(
+        {
+            "semgrep": _tool_state("skipped", requested=False),
+            "codeql": _tool_state(
+                "completed", requested=True, reason=codeql["reason"],
+                degraded=codeql["enrichment_status"] == "failed",
+            ),
+            "sca": _tool_state("skipped", requested=False),
+        },
+        _complete_assessment(),
+    )
+    assert result["status"] == "partial"
+    assert any(
+        "CodeQL degraded" in reason
+        for reason in result["partial_reasons"]
+    )
 
 
 def test_tool_artifact_references_are_sanitized_and_aggregate_bounded():

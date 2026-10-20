@@ -284,6 +284,28 @@ def _copilot_program(source: str) -> subprocess.CompletedProcess[str]:
         close_fds=True, timeout=15,
     )
 
+@pytest.mark.linux_native
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux namespace backend")
+def test_offline_sandbox_keeps_mount_namespace_without_loopback_socket():
+    from core.sandbox.probes import check_mount_available
+
+    if not check_mount_available():
+        pytest.skip("mount namespace unavailable on this host")
+    result = _copilot_program(r'''
+import tempfile
+from core.sandbox import run
+with tempfile.TemporaryDirectory() as out:
+    scan = run(
+        ["/usr/bin/true"], block_network=True,
+        target=out, output=out, capture_output=True,
+        text=True, timeout=10,
+    )
+    print("MOUNT", scan.sandbox_info.get("mount_ns_active"), scan.returncode)
+''')
+    assert result.returncode == 0, result.stderr
+    assert "MOUNT True 0" in result.stdout
+    assert "falling back to Landlock-only" not in result.stderr
+
 
 @pytest.mark.linux_native
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux seccomp ceiling")

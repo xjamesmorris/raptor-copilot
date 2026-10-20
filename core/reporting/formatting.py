@@ -171,6 +171,16 @@ def get_display_status(finding: dict[str, Any]) -> str:
         # keeps priority here rather than guessing which side lied.
         if ex is True:
             return "Exploitable"
+        if tp is True:
+            # Agentic can confirm that a dangerous pattern is real while
+            # ruling practical exploitation out because it is unreachable,
+            # dead code, or already mitigated. Preserve that typed ruling
+            # instead of flattening every real-but-non-exploitable bug to
+            # "Confirmed". ``test_code`` remains provenance-only and keeps
+            # the historical boolean behavior below.
+            negative = _agentic_negative_ruling(finding)
+            if negative in {"Unreachable", "Dead Code", "Mitigated"}:
+                return negative
         # is_true_positive means "real bug", not "security-confirmed":
         # a validate finding can be a true positive whose Stage-D
         # ruling still rules it out (D-4 no security impact, D-2

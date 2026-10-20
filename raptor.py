@@ -859,6 +859,17 @@ def _run_with_lifecycle(command: str, script_path: Path, args: list,
 
 
     if rc == 0:
+        # Some child-owned workflows intentionally pause the SAME run for a
+        # host-managed continuation. Copilot-native /agentic marks the run
+        # interrupted after mechanical prep; completing it here would erase
+        # the resumable handoff state before managed subagents can return.
+        from core.run.metadata import load_run_metadata
+        child_metadata = load_run_metadata(out_dir)
+        if (
+            isinstance(child_metadata, dict)
+            and child_metadata.get("status") == "interrupted"
+        ):
+            return 0
         # Engine versions + deterministically_reproducible are filled by the
         # lifecycle itself now (core.run.complete_run), uniformly for every
         # command — no per-command manifest wiring here.

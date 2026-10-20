@@ -132,7 +132,14 @@ def check_self_contradiction(results_by_id: dict[str, dict]) -> int:
             # same phrases would otherwise sail past this self-QA
             # heuristic (fewer targeted retries, not a gate bypass).
             reasoning = unicodedata.normalize("NFKC", reasoning)
-            if is_tp:
+            if is_tp and ruling not in {
+                "unreachable", "dead_code", "test_code", "mitigated",
+            }:
+                # A typed non-FP ruling can legitimately contrast itself
+                # with "false positive" in prose ("unreachable rather than
+                # a false positive"). The structured ruling is higher-signal
+                # than this substring heuristic, so do not manufacture a
+                # contradiction from that explanatory comparison.
                 for signal, pat in _SIGNAL_PATTERNS["false_positive"]:
                     if pat.search(reasoning):
                         contradictions.append(

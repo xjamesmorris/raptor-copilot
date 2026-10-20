@@ -123,7 +123,8 @@ directory you launched from (so commands like `/scan` default to it), runs the
 pre-flight trust and project checks, loads the coverage-tracking plugin, and
 sanitises the environment before handing off to the selected frontend. It also
 takes an optional target path and flags like `--project`, `--continue`,
-Copilot's exact-session `--resume ID`, and `--model` -- see
+Copilot's exact-session `--resume ID`, `--model`, `--max-findings N`, and
+`--max-cost-usd USD` to start an agentic scan with explicit limits -- see
 `raptor --help`.
 
 Running plain `copilot` from inside the repo loads RAPTOR's compatible

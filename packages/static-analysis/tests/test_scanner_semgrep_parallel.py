@@ -808,6 +808,7 @@ class TestDropUnreachableRegistryPacks:
         _scanner_mod._dropped_registry_packs.clear()
 
     def test_unreachable_drops_records_and_prints(self, capsys, monkeypatch):
+        monkeypatch.setattr(_scanner_mod, "session_services_restricted", lambda: False)
         monkeypatch.setattr(
             "socket.create_connection", _failing_probe,
         )
@@ -823,6 +824,7 @@ class TestDropUnreachableRegistryPacks:
         assert "cache-packs.py" in err
 
     def test_drops_accumulate_without_duplicates(self, monkeypatch):
+        monkeypatch.setattr(_scanner_mod, "session_services_restricted", lambda: False)
         monkeypatch.setattr(
             "socket.create_connection", _failing_probe,
         )
@@ -833,6 +835,7 @@ class TestDropUnreachableRegistryPacks:
         ]
 
     def test_reachable_keeps_everything_quietly(self, capsys, monkeypatch):
+        monkeypatch.setattr(_scanner_mod, "session_services_restricted", lambda: False)
         monkeypatch.setattr(
             "socket.create_connection", _connecting_probe,
         )
@@ -842,6 +845,23 @@ class TestDropUnreachableRegistryPacks:
         assert kept == list(self.CONFIGS)
         assert _scanner_mod._dropped_registry_packs == []
         assert "dropped" not in capsys.readouterr().err
+
+    def test_copilot_drops_uncached_packs_without_network_probe(
+        self, capsys, monkeypatch,
+    ):
+        monkeypatch.setattr(_scanner_mod, "session_services_restricted", lambda: True)
+
+        def _boom(*_a, **_k):
+            raise AssertionError("Copilot session must not probe network access")
+
+        monkeypatch.setattr("socket.create_connection", _boom)
+        kept = _scanner_mod._drop_unreachable_registry_packs(list(self.CONFIGS))
+
+        assert kept == [self.CONFIGS[2]]
+        assert _scanner_mod._dropped_registry_packs == [
+            "semgrep_security_audit", "semgrep_secrets",
+        ]
+        assert "Copilot session service policy" in capsys.readouterr().err
 
     def test_local_only_configs_skip_probe(self, monkeypatch):
         def _boom(*_a, **_k):

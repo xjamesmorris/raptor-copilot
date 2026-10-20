@@ -15,6 +15,7 @@
       "Bash(libexec/raptor-build-checklist *)",
       "Bash(libexec/raptor-build-cpg-cache *)",
       "Bash(libexec/raptor-clone-repo *)",
+      "Bash(libexec/raptor-copilot-agentic *)",
       "Bash(libexec/raptor-coverage-summary *)",
       "Bash(libexec/raptor-cve-checker *)",
       "Bash(libexec/raptor-cve-diff *)",

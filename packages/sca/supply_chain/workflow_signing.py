@@ -98,9 +98,12 @@ from __future__ import annotations
 import logging
 import shutil
 import subprocess
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
+from core.security.session_services import session_services_restricted
 from ..models import Confidence, Dependency, Manifest, PinStyle
 
 logger = logging.getLogger(__name__)
@@ -293,11 +296,21 @@ def _git_log_signatures(
     try:
         from core.config import RaptorConfig
         from core.sandbox.preexec import set_pdeathsig
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=30,
-            check=False, env=RaptorConfig.get_safe_env(),
-            preexec_fn=set_pdeathsig(),
+        env = RaptorConfig.get_safe_env()
+        private_home = (
+            TemporaryDirectory(prefix="raptor-sca-gpg-", dir="/tmp")
+            if session_services_restricted() and "GNUPGHOME" not in env
+            else nullcontext(None)
         )
+        with private_home as home:
+            if home:
+                env["GNUPGHOME"] = home
+                env["HOME"] = home
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=30,
+                check=False, env=env,
+                preexec_fn=set_pdeathsig(),
+            )
     except (OSError, subprocess.TimeoutExpired) as e:
         logger.debug(
             "sca.supply_chain.workflow_signing: git log failed: %s", e,

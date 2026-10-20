@@ -91,6 +91,7 @@ class RunDigest:
     last_call_ts: str | None = None
     # findings
     findings_total: int | None = None
+    unreviewed_findings: int | None = None
     verified: list[dict[str, Any]] = field(default_factory=list)
     exploitable_unverified: list[dict[str, Any]] = field(
         default_factory=list)
@@ -171,12 +172,22 @@ def _read_lifecycle(digest: RunDigest) -> None:
         digest.target_path = target
     extra = meta.get("extra")
     if isinstance(extra, dict):
+        if (digest.command == "agentic" and digest.status == "completed"
+                and extra.get("result_status") == "partial"):
+            digest.status = "partial"
         err = extra.get("error")
         if isinstance(err, str) and err:
             digest.error = err
         fc = extra.get("findings_count")
         if isinstance(fc, int) and not isinstance(fc, bool):
             digest.findings_total = fc
+        assessment = extra.get("assessment")
+        if isinstance(assessment, dict):
+            unreviewed = assessment.get("unreviewed")
+            if (isinstance(unreviewed, int)
+                    and not isinstance(unreviewed, bool)
+                    and unreviewed >= 0):
+                digest.unreviewed_findings = unreviewed
     if digest.status == "running":
         digest.heartbeat_age_s = last_activity_age_s(digest.run_dir)
 
@@ -757,7 +768,16 @@ def render_run_digest(digest: RunDigest) -> str:
 
     if not digest.verified and not digest.exploitable_unverified:
         lines.append("")
-        if digest.residue_counts:
+        if digest.unreviewed_findings:
+            noun = (
+                "finding"
+                if digest.unreviewed_findings == 1 else "findings"
+            )
+            lines.append(
+                "  No verified or exploitable-unverified findings — "
+                f"{digest.unreviewed_findings} {noun} unreviewed."
+            )
+        elif digest.residue_counts:
             # Never imply all-clear while residue exists — the
             # qualified line hands off to the residue section below.
             lines.append("  No verified or exploitable-unverified "

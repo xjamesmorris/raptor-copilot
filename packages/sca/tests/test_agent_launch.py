@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import subprocess
 from unittest.mock import patch
@@ -70,6 +71,59 @@ def test_external_agent_grants_file_not_parent(tmp_path):
 
     assert str(agent) in captured["tool_paths"]
     assert str(agent.parent) not in captured["tool_paths"]
+
+def test_offline_agent_uses_network_blocked_sandbox(tmp_path, monkeypatch):
+    monkeypatch.delenv("RAPTOR_SCA_AGENT", raising=False)
+    target = tmp_path / "target"
+    target.mkdir()
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured.update(cmd=cmd, kwargs=kwargs)
+        return subprocess.CompletedProcess(cmd, 0, "{}", "")
+
+    with patch("core.sandbox.run", fake_run):
+        rc, _, _ = run_sca_subprocess(
+            _find_sca_agent(), target, tmp_path / "out", offline=True,
+        )
+
+    assert rc == 0
+    assert "--offline" in captured["cmd"]
+    assert captured["kwargs"]["block_network"] is True
+    assert "use_egress_proxy" not in captured["kwargs"]
+    assert "proxy_hosts" not in captured["kwargs"]
+
+
+def test_offline_nested_sandbox_does_not_create_proxy(tmp_path, monkeypatch):
+    from packages.sca.agent import _run_sandboxed
+
+    target = tmp_path / "target"
+    target.mkdir()
+    output = tmp_path / "out"
+    output.mkdir()
+    captured = {}
+
+    @contextmanager
+    def fake_sandbox(**kwargs):
+        captured.update(kwargs)
+        yield
+
+    monkeypatch.setattr("core.sandbox.context.sandbox", fake_sandbox)
+    monkeypatch.setattr(
+        "packages.sca.api.analyse", lambda **kwargs: kwargs,
+    )
+
+    result = _run_sandboxed(
+        target=target, output_dir=output, offline=True,
+        no_cache=False, sarif_dirs=None, profile="full",
+        audit=False, audit_verbose=False, enable_llm_review=False,
+        enable_triage=False,
+    )
+
+    assert result["offline"] is True
+    assert captured["block_network"] is True
+    assert "use_egress_proxy" not in captured
+    assert "proxy_hosts" not in captured
 
 
 @pytest.mark.linux_native

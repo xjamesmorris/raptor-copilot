@@ -696,6 +696,10 @@ def _build_run_result(
             reason = state.get("skip_reason") or state.get("reason")
             suffix = f": {reason}" if reason else ""
             reasons.append(f"{display_names.get(name, name)} skipped{suffix}")
+        elif state.get("requested") and state.get("degraded"):
+            reason = state.get("reason")
+            suffix = f": {reason}" if reason else ""
+            reasons.append(f"{display_names.get(name, name)} degraded{suffix}")
 
     unreviewed = int(assessment.get("unreviewed", 0) or 0)
     if assessment.get("status") != "complete" and unreviewed:
@@ -2739,6 +2743,18 @@ Examples:
         help="Skip per-finding journal emission (default: emit)",
     )
     parser.add_argument(
+        "--copilot-native",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--copilot-native-batch-size",
+        type=int,
+        default=8,
+        metavar="N",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--max-cost-usd", dest="max_cost_usd", type=float, default=None,
         help="Per-run USD budget cap; overrides LLMConfig.max_cost_per_scan "
              "so CostTracker enforces the cap during LLM calls",
@@ -3375,6 +3391,31 @@ def main() -> int:
         args.phase_timeout = RaptorConfig.DEFAULT_TIMEOUT
 
     apply_cli_args(args, parser=parser)
+
+    if args.copilot_native:
+        incompatible = []
+        for enabled, flag in (
+            (args.sequential, "--sequential"),
+            (args.validate, "--validate"),
+            (args.gap_audit, "--gap-audit"),
+            (args.understand, "--understand"),
+            (args.threat_model, "--threat-model"),
+            (bool(getattr(args, "model", None)), "--model"),
+            (bool(getattr(args, "consensus", None)), "--consensus"),
+            (bool(getattr(args, "judge", None)), "--judge"),
+            (bool(getattr(args, "aggregate", None)), "--aggregate"),
+        ):
+            if enabled:
+                incompatible.append(flag)
+        if incompatible:
+            parser.error(
+                "--copilot-native cannot currently combine with "
+                + ", ".join(incompatible)
+                + "; the host-managed workflow owns model dispatch and "
+                "post-analysis passes",
+            )
+        if not 1 <= args.copilot_native_batch_size <= 50:
+            parser.error("--copilot-native-batch-size must be between 1 and 50")
 
     # --openant-only replaces the pattern scanners entirely, so pairing
     # it with an explicit CodeQL request is contradictory. Refuse at
@@ -4505,10 +4546,18 @@ def main() -> int:
                 semgrep_artifacts.extend(semgrep_sarifs)
                 semgrep_result_artifacts.extend(semgrep_sarifs)
             if semgrep_result_artifacts:
+                dropped_packs = semgrep_metrics.get("dropped_registry_packs")
+                dropped_count = len(dropped_packs) if isinstance(dropped_packs, list) else 0
                 semgrep_tool_state = _tool_state(
                     "completed",
                     requested=True,
                     artifacts=semgrep_artifacts,
+                    reason=(
+                        f"{dropped_count} uncached registry pack(s) dropped; "
+                        "rule coverage reduced"
+                        if dropped_count else ""
+                    ),
+                    degraded=bool(dropped_count),
                 )
             else:
                 reason = (
@@ -4675,6 +4724,9 @@ def main() -> int:
                     "completed",
                     requested=True,
                     reason=enrichment_reason,
+                    degraded=(
+                        enrichment_fields.get("enrichment_status") == "failed"
+                    ),
                     artifacts=codeql_artifacts,
                     sarif_file_references_truncated=bool(
                         sarif_fields.get("artifact_references_truncated")
@@ -4730,6 +4782,16 @@ def main() -> int:
         read_sca_diagnostic = None
 
     run_mechanical_sca = _should_run_mechanical_sca(sca_agent, args.sca)
+    from core.security.session_services import session_services_restricted
+    sca_offline = run_mechanical_sca and session_services_restricted()
+    sca_host_refresh = None
+    if sca_offline:
+        from packages.sca import sca_cache_root
+        from packages.sca.host_refresh import fresh_receipt
+        sca_host_refresh = fresh_receipt(
+            original_repo_path,
+            cache_root=sca_cache_root(),
+        )
     sca_requested = bool(args.sca or sca_agent)
     if args.sca:
         sca_skip_reason = "deferred to deep SCA"
@@ -4759,6 +4821,16 @@ def main() -> int:
         print("SOFTWARE COMPOSITION ANALYSIS")
         print("=" * 70)
         print("\n[*] Running SCA (dependencies, supply chain, reachability)...")
+        if sca_offline:
+            if sca_host_refresh:
+                print(
+                    "✓ Copilot session: SCA uses anonymously host-refreshed "
+                    "OSV/KEV/EPSS/Vulnrichment data; repository networking "
+                    "remains disabled.",
+                )
+            else:
+                print("⚠️  Copilot session: SCA uses cached advisories only; "
+                      "fresh OSV/KEV/EPSS and registry lookups are unavailable.")
         try:
             # Route via sandbox egress proxy so SCA's HTTP calls are
             # hostname-allowlisted when --sandbox is active. The allowlist
@@ -4768,6 +4840,7 @@ def main() -> int:
                 original_repo_path,
                 sca_out,
                 sandbox_args=sandbox_passthrough,
+                offline=sca_offline,
                 timeout=_sca_subprocess_timeout(
                     args.phase_timeout,
                     explicitly_set=args.phase_timeout_explicit,
@@ -4820,6 +4893,30 @@ def main() -> int:
                 sca_tool_state = _tool_state(
                     "completed",
                     requested=True,
+                    reason=(
+                        (
+                            "host-refreshed public vulnerability feeds; "
+                            "repository networking disabled"
+                        )
+                        if sca_host_refresh
+                        else (
+                            "offline cache-only advisory coverage; "
+                            "fresh vulnerability feeds unavailable"
+                            if sca_offline else ""
+                        )
+                    ),
+                    degraded=bool(sca_offline and not sca_host_refresh),
+                    offline=sca_offline,
+                    host_refresh=(
+                        {
+                            "schema": sca_host_refresh.get("schema"),
+                            "refreshed_at": sca_host_refresh.get(
+                                "refreshed_at",
+                            ),
+                            "sources": sca_host_refresh.get("sources"),
+                        }
+                        if sca_host_refresh else None
+                    ),
                     artifacts=sca_artifacts,
                     **_sca_diagnostic_tool_fields(
                         sca_diagnostic,
@@ -5554,14 +5651,26 @@ def main() -> int:
     analysis = {}
     autonomous_out = None
     analysis_report = None
-    if not llm_env.llm_available:
-        print("\n⚠️  Phase 3 skipped - No LLM provider available")
-        print("    To enable autonomous analysis, either:")
-        print("    1. Set ANTHROPIC_API_KEY environment variable, OR")
-        print("    2. Set OPENAI_API_KEY / GEMINI_API_KEY / MISTRAL_API_KEY, OR")
-        print("    3. Run Ollama locally (https://ollama.ai), OR")
-        print("    4. Run inside Claude Code (claude)")
-        logger.warning("Phase 3 skipped - No LLM provider configured")
+    if not llm_env.llm_available and not args.copilot_native:
+        if session_services_restricted():
+            print("\n⚠️  Phase 3 skipped - Copilot session service policy "
+                  "blocks standalone LLM transports.")
+            print("    RAPTOR has no verified bridge to this session's "
+                  "authenticated model service.")
+            print("    Saved API keys, another CLI, or a local sidecar "
+                  "cannot enable analysis in this session.")
+            logger.warning(
+                "Phase 3 skipped - authenticated Copilot model transport "
+                "unavailable to RAPTOR",
+            )
+        else:
+            print("\n⚠️  Phase 3 skipped - No LLM provider available")
+            print("    To enable autonomous analysis, either:")
+            print("    1. Set ANTHROPIC_API_KEY environment variable, OR")
+            print("    2. Set OPENAI_API_KEY / GEMINI_API_KEY / MISTRAL_API_KEY, OR")
+            print("    3. Run Ollama locally (https://ollama.ai), OR")
+            print("    4. Run inside Claude Code (claude)")
+            logger.warning("Phase 3 skipped - No LLM provider configured")
     else:
         autonomous_out = out_dir / "autonomous"
         autonomous_out.mkdir(exist_ok=True)
@@ -5663,7 +5772,9 @@ def main() -> int:
                 )
 
         # Phase 3 preps data; Phase 4 handles LLM work (unless --sequential)
-        if (llm_env.claude_code or llm_env.external_llm) and not args.sequential:
+        if args.copilot_native:
+            analysis_cmd.append("--prep-only")
+        elif (llm_env.claude_code or llm_env.external_llm) and not args.sequential:
             analysis_cmd.append("--prep-only")
 
         rc, _stdout, stderr = run_command_streaming(
@@ -5825,9 +5936,49 @@ def main() -> int:
                     )
         else:
             print("\n  No analysis report from Phase 3 — skipping orchestration")
+    elif args.copilot_native:
+        print(
+            "\n  Findings prepared for host-managed Copilot subagents. "
+            "Repository LLM transports remain disabled.",
+        )
     elif not llm_env.llm_available:
-        print("\n  No LLM available. Findings prepared for manual review.")
-        print("  For automated analysis, set an API key or install Claude Code.")
+        if session_services_restricted():
+            print("\n  Findings retained without autonomous analysis. "
+                  "No provider or prep-only report was run.")
+        else:
+            print("\n  No LLM available. Findings retained for manual review.")
+            print("  For automated analysis, configure an LLM provider.")
+
+    copilot_native_manifest = None
+    if args.copilot_native:
+        if (
+            analysis_report is None
+            or not analysis_report.exists()
+            or analysis.get("mode") != "prep_only"
+        ):
+            raise RuntimeError(
+                "Copilot-native handoff requires a prep_only analysis report",
+            )
+        from packages.llm_analysis.copilot_native import prepare_handoff
+        copilot_native_manifest = prepare_handoff(
+            run_dir=out_dir,
+            repo_path=original_repo_path,
+            prep_report_path=analysis_report,
+            max_findings=args.max_findings,
+            batch_size=args.copilot_native_batch_size,
+            no_exploits=args.no_exploits,
+            no_patches=args.no_patches,
+            no_journal=args.no_journal,
+            max_parallel=args.max_parallel,
+            max_cost_usd=args.max_cost_usd,
+        )
+        print(f"\nCOPILOT_NATIVE_MANIFEST={copilot_native_manifest}")
+        if args.max_cost_usd is not None:
+            print(
+                "⚠️  --max-cost-usd cannot meter host-managed Copilot AI "
+                "credits; use the Copilot session's /limits controls.",
+                file=sys.stderr,
+            )
 
     # ========================================================================
     # POST-PASS: /audit (opt-in via --gap-audit)
@@ -6024,15 +6175,15 @@ def main() -> int:
         extra_failures=extra_partial_failures,
     )
 
-    scanner_failed = any(
-        tool_states[name].get("failed")
+    scanner_incomplete = any(
+        tool_states[name].get("failed") or tool_states[name].get("degraded")
         for name in ("semgrep", "codeql")
     ) or bool(openant_hard_error) or bool(taint_metrics.get("hard_error"))
     if run_result.get("failed"):
         scan_phase_status = "failed"
     elif skip_scan:
         scan_phase_status = "skipped"
-    elif scanner_failed:
+    elif scanner_incomplete:
         scan_phase_status = "partial"
     else:
         scan_phase_status = "completed"
@@ -6121,17 +6272,25 @@ def main() -> int:
                 and analysis.get("mode") != "prep_only",
                 "prepared": analysis.get("mode") == "prep_only",
                 "mode": analysis.get("mode"),
-                "skipped": not llm_env.llm_available,
+                "skipped": not llm_env.llm_available
+                and not args.copilot_native,
                 "exploitable": analysis.get('exploitable', 0),
                 "exploits_generated": analysis.get('exploits_generated', 0),
                 "patches_generated": analysis.get('patches_generated', 0),
                 "dataflow_validated": analysis.get('dataflow_validated', 0) if (args.codeql or args.codeql_only) else 0,
                 "assessment": assessment,
             },
-            "orchestration": orchestration_result.get("orchestration", {}) if orchestration_result else {
-                "completed": False,
-                "mode": "none",
-            },
+            "orchestration": (
+                orchestration_result.get("orchestration", {})
+                if orchestration_result
+                else {
+                    "completed": False,
+                    "mode": (
+                        "copilot_native_pending"
+                        if args.copilot_native else "none"
+                    ),
+                }
+            ),
             "audit": audit_postpass,
         },
         "outputs": {
@@ -6165,6 +6324,10 @@ def main() -> int:
             "validation_report": str(out_dir / "validation" / "findings.json") if validation_result else None,
             "autonomous_report": str(analysis_report) if analysis_report and analysis_report.exists() else None,
             "orchestrated_report": str(out_dir / "orchestrated_report.json") if orchestration_result else None,
+            "copilot_native_manifest": (
+                str(copilot_native_manifest)
+                if copilot_native_manifest else None
+            ),
             "aggregation_report": str(out_dir / "aggregation.json") if orchestration_result and orchestration_result.get("aggregation") else None,
             "exploits_directory": str(autonomous_out / "exploits") if autonomous_out else None,
             "patches_directory": str(autonomous_out / "patches") if autonomous_out else None,
@@ -6704,7 +6867,7 @@ def main() -> int:
         )
     if codeql_metrics:
         print("   ✓ Scanned with CodeQL")
-        if codeql_metrics.get('total_findings', 0) > 0:
+        if analysis.get("dataflow_validated", 0) > 0:
             print("   ✓ Validated dataflow paths")
     elif tool_states["codeql"].get("failed"):
         print(
@@ -7011,15 +7174,30 @@ def main() -> int:
                 tool_states,
             ),
         }
-        _finalize_run_lifecycle(
-            out_dir,
-            run_result,
-            extra=lifecycle_extra,
-            manifest=_build_completion_manifest(
-                orch_meta, import_result, import_sarif_files,
-                reanalyze_dir=getattr(args, "reanalyze", None),
-            ),
-        )
+        if copilot_native_manifest is not None:
+            from core.run.metadata import interrupt_run
+            interrupt_run(
+                out_dir,
+                reason="awaiting host-managed Copilot analysis",
+                extra={
+                    **lifecycle_extra,
+                    "copilot_native_manifest": str(
+                        copilot_native_manifest,
+                    ),
+                    "result_status": "prepared",
+                },
+                expected_command="agentic",
+            )
+        else:
+            _finalize_run_lifecycle(
+                out_dir,
+                run_result,
+                extra=lifecycle_extra,
+                manifest=_build_completion_manifest(
+                    orch_meta, import_result, import_sarif_files,
+                    reanalyze_dir=getattr(args, "reanalyze", None),
+                ),
+            )
     except Exception as e:  # noqa: BLE001
         logger.debug("Run metadata: %s", e)  # Optional — don't fail the pipeline
 

@@ -51,6 +51,28 @@ class TestReader:
         assert d.findings_total == 7
         assert d.heartbeat_age_s is None  # terminal runs: no heartbeat
 
+    def test_agentic_partial_result_is_not_rendered_as_completed(self, tmp_path):
+        _meta(tmp_path, extra={
+            "result_status": "partial",
+            "assessment": {"unreviewed": 143},
+        })
+        digest = read_run_digest(tmp_path)
+
+        assert digest.status == "partial"
+        assert digest.unreviewed_findings == 143
+        assert "agentic run, Partial" in render_run_digest(digest)
+        assert "143 findings unreviewed" in render_run_digest(digest)
+
+    def test_single_unreviewed_finding_is_grammatical(self, tmp_path):
+        _meta(tmp_path, extra={
+            "result_status": "partial",
+            "assessment": {"unreviewed": 1},
+        })
+
+        assert "1 finding unreviewed" in render_run_digest(
+            read_run_digest(tmp_path),
+        )
+
     def test_running_run_reports_heartbeat_age(self, tmp_path):
         _meta(tmp_path, status="running")
         d = read_run_digest(tmp_path)

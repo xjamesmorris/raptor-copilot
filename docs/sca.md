@@ -158,6 +158,22 @@ rows never matched an advisory, so re-scan rather than merge.
                           and the project's `config` trust marker
 ```
 
+In a Copilot session, the `/agentic` mechanical SCA worker uses this
+offline mode in a network-blocked sandbox rather than creating an
+unauthorised egress proxy. Its results are marked partial because
+uncached or stale vulnerability feeds cannot be refreshed. A standalone
+`/sca` scan also supports explicit `--offline`; live feed requests remain
+blocked by the session service policy. Workflow-history signing checks
+use an empty, private GPG home in that sandbox: presence of a signature
+is distinguishable from an unsigned commit, but keys unavailable to the
+worker cannot verify the signature's validity.
+
+The Copilot host may refresh public OSV/KEV/EPSS/Vulnrichment cache entries
+after an explicit operation-scoped approval. A fresh anonymous receipt at
+`~/.raptor/cache/sca/host-refresh-receipt.json`, bound to the exact target,
+lets `/agentic` distinguish approved fresh feed data from an arbitrary stale
+offline cache; repository networking remains disabled either way.
+
 Repo trust is gated: on untrusted runs a repo-shipped suppression
 overlay (`.raptor-sca-suppress.yml`) and license-policy file are
 reported but ignored. Precedence: `--no-trust-repo` > `--trust-repo`
