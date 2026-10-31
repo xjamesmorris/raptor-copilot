@@ -83,13 +83,14 @@ jobs:
     timeout-minutes: 2
     outputs:
       should_skip: ${{ steps.dup.outputs.should_skip }}
-      # true for same-repo events (push / merge_group / schedule / dispatch
-      # / branch PRs); false only for fork PRs, whose read-only token can't
-      # pull the private GHCR images. Tiers pass this to _tier.yml to
-      # choose the image (fast) vs runner (fallback) path; the
-      # sandbox-feature-matrix job uses it the same way to pick pull vs
-      # build-on-runner for the matrix image.
-      pkg_access: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      # Private repos use the linked private GHCR image for same-repo events.
+      # Public repos default to the runner path: packages:read alone does not
+      # grant a newly public repo access to an existing private package, and a
+      # denied job container cannot fall back after startup. Owners that have
+      # explicitly linked the package may opt back in with the repository
+      # variable RAPTOR_CI_USE_PRIVATE_DEPS_IMAGE=true. Fork PRs always use the
+      # runner because their read-only token cannot pull private packages.
+      pkg_access: ${{ (github.event.repository.private || vars.RAPTOR_CI_USE_PRIVATE_DEPS_IMAGE == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     steps:
       - id: dup
         env:
@@ -1206,4 +1207,3 @@ jobs:
           done
           [ "$ok" -eq 1 ] || exit 1
           echo "All tiers passed or were legitimately skipped."
-

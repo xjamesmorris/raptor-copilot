@@ -5,6 +5,9 @@
   "substrate_dumps_flows_to_hash:core/inventory/__init__.py:_write_sharded_checklist": {
    "note": "shard-file integrity checksum: sha256 over the EXACT bytes written to the shard file, verified against the same on-disk bytes at read — a file checksum, not a content address, so encoder-dependence is immaterial (hash and file always come from the one serialization instance)"
   },
+  "dumps_flows_to_hash:core/orchestration/agentic_passes.py:_json_sha256": {
+   "note": "Copilot-native context/audit request and pointer identity hash (sort_keys, compact separators, ensure_ascii=False, strict types) persisted in handoff artifacts; changing to dumps_canonical would fork every non-ASCII identity and invalidate existing receipts — frozen"
+  },
   "dumps_flows_to_hash:core/project/report.py:_finding_fingerprint": {
    "note": "sha256[:12] finding ids persisted in manifest.json/findings.jsonl; pinned form uses ensure_ascii=False, so dumps_canonical would change every id — frozen"
   },
