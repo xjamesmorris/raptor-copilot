@@ -38,6 +38,7 @@ PROMPT = b"Synthetic prompt content."
 SECRET_ENV = "COPILOT_GITHUB_TOKEN"
 
 pytestmark = [
+    pytest.mark.slow,
     pytest.mark.skipif(sys.platform != "linux", reason="Linux probe sandbox"),
     requires_landlock,
     requires_mount,
@@ -146,6 +147,48 @@ def _encoded_variants(value: bytes) -> tuple[bytes, ...]:
         base64.b64encode(value),
         base64.urlsafe_b64encode(value),
     )
+
+
+def test_probe_declares_python_runtime_tool_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    copilot_synthetic_transport_enabled,
+) -> None:
+    _workspace, capability, plan = _make(
+        tmp_path,
+        stdout=COMPLETE.read_text(encoding="utf-8"),
+        mode=CopilotProbeCaptureMode.CANDIDATE_ADMISSION,
+    )
+    captured: dict[str, object] = {}
+
+    def fake_run(*args, **kwargs):
+        captured.update(kwargs)
+        return _synthetic_result(COMPLETE.read_bytes())
+
+    monkeypatch.setattr(
+        probe_module,
+        "python_runtime_tool_paths",
+        lambda: ["/opt/hosted-python", "/opt/hosted-python/lib"],
+    )
+    monkeypatch.setattr(
+        probe_module,
+        "run_untrusted_networked",
+        fake_run,
+    )
+    copilot_synthetic_transport_enabled(capability)
+
+    execution = execute_copilot_probe(
+        plan,
+        prompt=PROMPT,
+        synthetic_capability=capability,
+    )
+
+    assert execution.status is CopilotProbeStatus.CANDIDATE_ADMITTED
+    assert captured["tool_paths"] == [
+        str(capability.path),
+        "/opt/hosted-python",
+        "/opt/hosted-python/lib",
+    ]
 
 
 def test_candidate_execution_uses_real_strict_sandbox_and_private_stdin(

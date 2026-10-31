@@ -225,6 +225,7 @@ def test_python_audit_blocks_direct_sdk_dns_and_socket_paths(monkeypatch):
     {"disabled": True},
     {"use_egress_proxy": True, "proxy_hosts": ["example.test"]},
 ))
+@pytest.mark.slow
 def test_networked_subprocess_options_are_not_consent(monkeypatch, kwargs):
     from core.sandbox import sandbox
 

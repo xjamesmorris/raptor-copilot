@@ -38,6 +38,7 @@ from core.llm.copilot_protocol import (
 from core.sandbox import (
     SandboxCancelled,
     SandboxSetupError,
+    python_runtime_tool_paths,
     run_untrusted_networked,
 )
 from core.security.fake_executable import (
@@ -1533,7 +1534,10 @@ def execute_copilot_probe(
             text=False,
             input=prompt,
             caller_label="copilot-synthetic-probe",
-            tool_paths=[str(capability.path)],
+            tool_paths=[
+                str(capability.path),
+                *python_runtime_tool_paths(),
+            ],
             cancel_fd=cancel_fd,
             bind_source_identities=bind_identities,
             no_degrade=True,

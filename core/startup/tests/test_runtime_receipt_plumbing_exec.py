@@ -464,6 +464,7 @@ def test_descendant_close_ack_precedes_ready_and_group_drain(
         ),
     ),
 )
+@pytest.mark.slow
 def test_native_protocol_and_mapping_failures_are_typed_and_cleaned(
     owned_root: Path,
     monkeypatch: pytest.MonkeyPatch,

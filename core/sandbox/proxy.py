@@ -2138,6 +2138,7 @@ class EgressProxy:
         if self._loop is not None and self._loop.is_running():
             async def _close() -> None:
                 srv.close()
+                await srv.wait_closed()
             # Loop may shut down between the is_running() check and
             # scheduling (RuntimeError); a wedged loop times out the
             # future (TimeoutError).
@@ -2224,6 +2225,7 @@ class EgressProxy:
         if self._loop is not None and self._loop.is_running():
             async def _close() -> None:
                 srv.close()
+                await srv.wait_closed()
             # Same failure modes as close_tcp_lane: loop shutdown race
             # (RuntimeError) or a wedged loop (TimeoutError).
             with contextlib.suppress(RuntimeError, TimeoutError):

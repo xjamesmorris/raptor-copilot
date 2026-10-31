@@ -468,13 +468,12 @@ jobs:
       - name: Run unit tests (batch ${{ matrix.batch }})
         env:
           TEST_FILES: ${{ matrix.files }}
-          # `-n auto` can exceed the hosted runner's concurrent local-socket
-          # capacity: strict-sandbox/proxy tests then fail at setup before
-          # their assertions, and owned-runtime protocol tests can observe
-          # teardown races from unrelated workers. Four workers passed the
-          # combined contention corpus repeatedly while preserving parallel
-          # speed. Larger runners may opt up explicitly.
-          PYTEST_WORKERS: ${{ vars.RAPTOR_FAST_WORKERS || '4' }}
+          # Public hosted runners execute the complete broad-push corpus
+          # without the private deps image. Serial batches avoid cross-worker
+          # proxy/socket and owned-runtime protocol interference there; the
+          # eight matrix batches still run in parallel. Private repos retain
+          # the measured `auto` fast path. Either may override explicitly.
+          PYTEST_WORKERS: ${{ vars.RAPTOR_FAST_WORKERS || (github.event.repository.private && 'auto' || '1') }}
         run: |
           source $VENV_PATH/bin/activate
           # File list comes from test_scope.py's import-graph analysis.
@@ -1166,6 +1165,47 @@ jobs:
       test_path: ${{ needs.changes.outputs.orchestration_files }}
       use_container: ${{ needs.pre_check.outputs.pkg_access == 'true' }}
 
+  # Fresh-process lane for real-sandbox sentinels that deliberately exercise
+  # global proxy, audit-hook and owned-runtime process state. Running these
+  # after thousands of unrelated tests in one worker can convert resource
+  # exhaustion or test pollution into misleading protocol verdicts. They stay
+  # mandatory on every Python-impacting change, but get a clean process.
+  python-runtime-isolation:
+    needs: [pre_check, changes, deps]
+    if: |
+      needs.pre_check.outputs.should_skip != 'true' &&
+      needs.changes.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Enable unprivileged user namespaces
+        uses: ./.github/actions/enable-userns
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Restore or rebuild venv
+        uses: ./.github/actions/setup-venv
+
+      - name: Run runtime-isolation sentinels
+        env:
+          RAPTOR_MAX_TEST_SECONDS: ""
+        run: |
+          source $VENV_PATH/bin/activate
+          python -m pytest -m slow \
+            core/llm/tests/test_copilot_probe_sandbox.py
+          python -m pytest -m slow \
+            core/startup/tests/test_runtime_receipt_plumbing_exec.py
+          python -m pytest -m slow \
+            core/security/tests/test_session_services.py
+
   # Single aggregate gate over the whole suite. `needs:` every job and
   # `if: always()` so it still runs when an upstream tier is path-filtered
   # out (skipped) or fails. This is the one check to pin in a future
@@ -1196,6 +1236,7 @@ jobs:
       - python-unit-tests-fuzzing
       - python-unit-tests-sage
       - python-unit-tests-orchestration
+      - python-runtime-isolation
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
