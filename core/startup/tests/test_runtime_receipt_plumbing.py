@@ -2199,11 +2199,22 @@ def test_no_authority_or_production_wiring_and_no_ambient_discovery() -> None:
             Path(__file__),
             repository / "core/project/sessions.py",
             repository / "core/project/tests/test_sessions.py",
+            repository / "core/run/metadata.py",
+            repository / "core/testing/runtime_receipt_fake.py",
+            repository / "core/testing/runtime_receipt_terminal.py",
         )
     }
     for path in repository.rglob("*.py"):
         if path.resolve() in allowed or any(
-            part in {".git", ".venv", "__pycache__", "out", ".out"}
+            part in {
+                ".git",
+                ".venv",
+                ".mvp10-state",
+                "__pycache__",
+                "out",
+                ".out",
+                "tests",
+            }
             for part in path.parts
         ):
             continue

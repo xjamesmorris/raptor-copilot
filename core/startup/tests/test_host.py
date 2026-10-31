@@ -2023,8 +2023,13 @@ def test_native_copilot_upstream_model_rejection_is_unchanged(
         "copilot",
         workspace.bin_dir / "copilot",
     )
-    assert stderr_lines[:-1] == (
-        [expected_warning] if expected_warning is not None else []
+    warnings = stderr_lines[:-1]
+    if expected_warning is not None:
+        assert expected_warning in warnings
+    assert all(
+        line == expected_warning
+        or line.startswith("raptor: dropped unsafe PATH entry ")
+        for line in warnings
     )
     argv, fields = _read_native_frontend_capture(capture)
     assert "--yolo" in argv

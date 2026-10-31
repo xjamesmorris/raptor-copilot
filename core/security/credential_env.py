@@ -1014,9 +1014,9 @@ CONFIG_HOME_REDIRECT_ENV_VARS: frozenset[str] = frozenset({
 # census closure test walks the inventory against this map, so adding
 # a build system WITHOUT adjudicating its env surface fails CI —
 # ecosystem coverage is structural, not a per-name chase. Surfaces
-# with no BUILD_SYSTEMS row (cargo, composer) cover lanes outside the
-# detector (sca resolvers, corpus builds); extra surfaces are fine,
-# missing ones are not. The map itself is trusted adjudication: the
+# with no BUILD_SYSTEMS row (composer) cover lanes outside the detector
+# (sca resolvers, corpus builds); extra surfaces are fine, missing ones
+# are not. The map itself is trusted adjudication: the
 # census can verify totality in both directions, but pointing a build
 # system at a semantically WRONG surface is a review-time judgement no
 # mechanical check catches — change rows deliberately.
@@ -1031,6 +1031,7 @@ BUILD_SYSTEM_ECOSYSTEM_MAP: dict[str, str] = {
     "yarn": "npm",
     "pnpm": "npm",
     "gomod": "go",
+    "cargo": "cargo",
     "cmake": "native",
     "autotools": "native",
     "meson": "native",

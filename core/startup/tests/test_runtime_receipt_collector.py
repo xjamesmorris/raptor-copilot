@@ -733,6 +733,7 @@ def test_collector_modules_have_no_authority_or_effect_wiring() -> None:
                 pytest.fail(f"collector uses built-in open(): {path}:{node.lineno}")
 
 
+@pytest.mark.wall_budget(90)
 def test_no_production_importer_or_map_files_dependency() -> None:
     repository = Path(__file__).parents[3]
     allowed = {

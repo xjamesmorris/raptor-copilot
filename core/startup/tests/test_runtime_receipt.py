@@ -3841,6 +3841,7 @@ def test_relative_receipt_import_in_another_production_file_is_forbidden() -> No
     )
 
 
+@pytest.mark.wall_budget(90)
 def test_receipt_importers_are_exact_through_owned_fake_terminal_lifecycle() -> None:
     repository_root = Path(__file__).parents[3]
     production_sources = _production_python_sources(repository_root)

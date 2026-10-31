@@ -186,9 +186,9 @@ def test_sandbox_audit_engages_proxy_audit_log_mode(
 
     Fix in ``packages/sca/agent.py::_run_sandboxed`` to wire
     ``audit=`` / ``audit_verbose=`` / ``audit_run_dir=`` through.
-    Post-fix, the canonical proxy banner ``"AUDIT-LOG mode"``
-    appears in stderr confirming the audit gate engaged. This
-    test pins the wiring by asserting the banner shows.
+    Post-fix, the canonical ``"Sandbox audit mode engaged via
+    --audit"`` warning appears in stderr confirming the audit gate
+    engaged. This test pins the wiring by asserting the warning shows.
 
     Works offline because the banner fires at sandbox setup
     (when the audit ref-count is acquired), not on traffic."""
@@ -205,13 +205,9 @@ def test_sandbox_audit_engages_proxy_audit_log_mode(
             "sandbox composition not supported in CI; "
             "audit-banner assertion deferred"
         )
-    # Banner format (proxy.py:564): "...switched to AUDIT-LOG
-    # mode (CONNECT to non-allowlisted ...)". Substring check on
-    # the canonical phrase — robust to surrounding log formatting
-    # changes.
-    assert "AUDIT-LOG mode" in proc.stderr, (
+    assert "Sandbox audit mode engaged via --audit" in proc.stderr, (
         "agent.py --audit didn't engage the proxy audit gate; "
-        "expected 'AUDIT-LOG mode' in stderr.\n"
+        "expected the audit-engagement warning in stderr.\n"
         f"stderr (last 2k):\n{proc.stderr[-2000:]}"
     )
 
