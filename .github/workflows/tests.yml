@@ -468,6 +468,13 @@ jobs:
       - name: Run unit tests (batch ${{ matrix.batch }})
         env:
           TEST_FILES: ${{ matrix.files }}
+          # `-n auto` can exceed the hosted runner's concurrent local-socket
+          # capacity: strict-sandbox/proxy tests then fail at setup before
+          # their assertions, and owned-runtime protocol tests can observe
+          # teardown races from unrelated workers. Four workers passed the
+          # combined contention corpus repeatedly while preserving parallel
+          # speed. Larger runners may opt up explicitly.
+          PYTEST_WORKERS: ${{ vars.RAPTOR_FAST_WORKERS || '4' }}
         run: |
           source $VENV_PATH/bin/activate
           # File list comes from test_scope.py's import-graph analysis.
@@ -481,7 +488,7 @@ jobs:
           # its file-per-worker grouping is what bounds module/class
           # fixture instantiation under the seeded shuffle.
           set -f  # word-split $TEST_FILES without glob expansion
-          pytest -n auto --dist worksteal $TEST_FILES
+          pytest -n "$PYTEST_WORKERS" --dist worksteal $TEST_FILES
 
       # Note: the CLI smoke tests for raptor.py used to live at
       # test/test_cli_smoke.py with a dedicated group-1 step (to dodge

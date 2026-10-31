@@ -687,6 +687,7 @@ def test_t10_concurrent_starts_same_dir_have_one_atomic_winner(
     assert _snapshot_bytes(meta) == serialize_snapshot(receipt_env.snapshot)
 
 
+@pytest.mark.wall_budget(30)
 def test_t10_concurrent_exact_resumes_have_one_atomic_winner(
     receipt_env: _ReceiptEnvironment,
     tmp_path: Path,
@@ -732,6 +733,7 @@ def test_t10_concurrent_exact_resumes_have_one_atomic_winner(
         assert lineage["entries"][0]["relation"] == "exact"
 
 
+@pytest.mark.wall_budget(30)
 def test_concurrent_distinct_session_resumes_have_one_cas_winner_128_times(
     receipt_env: _ReceiptEnvironment,
     tmp_path: Path,
